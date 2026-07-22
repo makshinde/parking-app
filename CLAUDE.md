@@ -70,3 +70,31 @@ individually. A single function can have both kinds of input.
   SpotHero/Neighbor.com model). This data only exists inside private
   marketplace platforms, not public datasets, and would require a paid
   API integration. Revisit only if this moves beyond a hobby project.
+
+## Git workflow
+
+After completing a meaningful, working change (a new feature, a bug 
+fix, a refactor, or a completed step in a larger task), do the 
+following automatically without waiting to be asked:
+
+1. Run `git status` and `git diff` to review what changed.
+2. Stage only the relevant files with `git add`, never use `git add .` 
+   blindly if unrelated or unfinished files are also present.
+3. Write a commit message that describes what changed and why, in 
+   this format:
+   - First line: a short summary (under 60 characters), imperative 
+     mood, e.g. "Add rate table validation for pay stations"
+   - If needed, a blank line followed by 1-3 lines of additional 
+     context
+4. Commit with that message.
+5. Push to GitHub.
+
+Do NOT commit after every small edit. Batch related changes into one 
+logical commit that represents a complete, working unit of work.
+
+Before every commit, confirm no .env files, API keys, Supabase 
+credentials, or other secrets are included in the staged changes. If 
+anything suspicious is staged, stop and flag it instead of committing.
+
+If a change leaves the app in a broken or non-functional state, do 
+not commit it yet. Wait until it's working again.
