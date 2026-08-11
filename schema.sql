@@ -111,7 +111,7 @@ CREATE TABLE off_street_facilities (
 
   -- Source dataset's own identifier, so re-imports can upsert instead of
   -- accumulating duplicate rows.
-  source_facility_id text NOT NULL,
+  source_facility_id text NOT NULL UNIQUE,
 
   name text NOT NULL,
 
