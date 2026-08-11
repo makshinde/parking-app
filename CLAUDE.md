@@ -95,6 +95,7 @@ logical commit that represents a complete, working unit of work.
 Before every commit, confirm no .env files, API keys, Supabase 
 credentials, or other secrets are included in the staged changes. If 
 anything suspicious is staged, stop and flag it instead of committing.
+This repo is public, so anything committed is visible immediately, not just for this session, always.
 
 If a change leaves the app in a broken or non-functional state, do 
 not commit it yet. Wait until it's working again.
