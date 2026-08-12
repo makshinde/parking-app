@@ -36,9 +36,16 @@ function calculateSeasonalComponent(ageInDays: number): number {
 }
 
 // Probabilistic-OR combination (1 - (1-a)(1-b), rearranged to a+b-ab) instead
-// of max(a, b), so two moderately-supportive signals reinforce each other
-// into a higher combined weight than either alone, rather than one signal
-// simply overriding the other. Always stays within [0, 1] when a and b do.
+// of max(a, b), so this reading's own recency and seasonal signals reinforce
+// each other rather than one simply overriding the other. Always stays
+// within [0, 1] when a and b do.
+//
+// This only combines the two signals for a single reading. The broader
+// reinforcement this function is meant to enable -- a ~7-day-old reading and
+// a separate ~365-day-old reading both contributing meaningfully to a
+// prediction -- happens when their individual weights are combined during
+// aggregation (e.g. a weighted average across readings), not inside this
+// function.
 function combineWeights(a: number, b: number): number {
   return a + b - a * b;
 }

@@ -23,14 +23,19 @@ describe("calculateRecencyWeight", () => {
     expect(calculateRecencyWeight(365)).toBeCloseTo(0.75, 2);
   });
 
-  it("combines moderate recency and moderate seasonal alignment into something higher than either alone", () => {
+  it("combines this reading's own recency and seasonal signals instead of taking the max", () => {
     // At 30 days: recency = 2^(-30/30) = 0.5, seasonal = 0.75 * 2^(-30/15) = 0.1875
-    // (distance to the day-0 anniversary is 30 days). Neither is dominant on
-    // its own, which is exactly the case the combined formula is meant for.
+    // (day 30 sits 30 days from the day-0 anniversary, since 0 is itself a
+    // multiple of 365). Both signals being non-trivial here is a coincidence
+    // of the math at small ages, NOT a demonstration of "recent evidence plus
+    // genuinely-year-old evidence" reinforcing each other -- that cross-reading
+    // case (a ~7-day-old reading and a separate ~365-day-old reading both
+    // feeding a weighted average) happens at the aggregation layer, not within
+    // one call to this function. What this test verifies is narrower but still
+    // real: combineWeights implements a+b-ab, not max(a, b).
     const weight = calculateRecencyWeight(30);
     expect(weight).toBeCloseTo(0.59375, 5);
-    // The whole point of a+b-ab over max(a,b): this must beat the larger
-    // component (recency, 0.5) alone, not just match it.
+    // If this were max(a, b) instead of a+b-ab, the result would be exactly 0.5.
     expect(weight).toBeGreaterThan(0.5);
   });
 
