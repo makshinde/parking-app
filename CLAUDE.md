@@ -63,6 +63,16 @@ individually. A single function can have both kinds of input.
   on payment_type. Capacity (99%) and address (97%) are reliable. Any code
   using this table must handle rate/operator as legitimately absent for
   most rows, not treat nulls as a bug.
+- parkingspacecount for a given blockface (sourceelementkey) is not stable
+  across years in the Paid Parking Occupancy data (verified example:
+  element 1029 was 8 spaces in 2020, 7 in 2025). Any occupancy aggregation
+  MUST use the parkingspacecount from the same row being aggregated, never
+  a cached or separately-joined value, or ratios will be silently wrong.
+- There is a real, verified data gap in 2026 Paid Parking Occupancy data
+  between 2026-04-01 and 2026-07-02 (roughly 3 months), plus smaller
+  ~34-hour gaps at every year boundary between archives. Aggregation logic
+  and confidence scoring must account for genuinely missing coverage, not
+  assume continuous data.
 
 ## Out of scope (v1)
 
