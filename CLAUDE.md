@@ -47,8 +47,21 @@ Two categories, handled differently:
   clamping, since there's no meaningful "nearest valid value" and an
   out-of-range value signals a real bug upstream, not imprecision.
 
+The clamp-vs-throw split isn't strictly about data type, though: a
+continuous/estimated input still throws instead of clamping when the value
+is structurally invalid (NaN, Infinity, or anything else with no meaningful
+"nearest valid" interpretation), as opposed to merely out-of-range (a
+days_in_future of 30, or a std_dev of 1.5). A structurally invalid value has
+nothing sensible to clamp toward, same reasoning as the discrete/categorical
+case, just triggered by the kind of invalidity rather than the kind of data.
+reprojectCoordinates.ts's RangeError on non-finite x/y is the first example
+of this: x and y are continuous (any finite number could be a real
+coordinate), but NaN/Infinity get rejected, not clamped.
+
 When adding a new function, decide which category each input falls into
-individually. A single function can have both kinds of input.
+individually, and within continuous/estimated inputs, whether an invalid
+value is out-of-range (clamp) or structurally invalid (throw). A single
+function can have multiple kinds of input.
 
 ## Known open questions
 
