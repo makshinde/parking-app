@@ -1,0 +1,29 @@
+# Runs the test suite on every PR and every push to main, and reports (but
+# does not block on) npm audit findings -- some flagged issues are dev-only
+# transitive risks that are fine to accept after human judgment, not
+# something that should auto-fail the build. See CLAUDE.md's git workflow
+# section for when a change needs a branch/PR in the first place.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+
+      - run: npm install
+
+      - run: npm test
+
+      - name: npm audit (report only, does not fail the build)
+        run: npm audit || true
