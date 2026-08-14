@@ -101,6 +101,14 @@ individually. A single function can have both kinds of input.
 
 ## Git workflow
 
+Use a branch and PR for anything that changes logic, either going forward
+(new or modified functions, schema or migration changes, new conventions
+future code must follow) or retrospectively (changing how existing code
+behaves). Commit directly to main for documentation-only changes that don't
+affect behavior, like adding a "known open question" or "future idea" note,
+typo fixes, or comment clarifications. When in doubt about which category a
+change falls into, ask rather than assume.
+
 After completing a meaningful, working change (a new feature, a bug 
 fix, a refactor, or a completed step in a larger task), do the 
 following automatically without waiting to be asked:
