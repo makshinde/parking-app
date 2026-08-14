@@ -86,6 +86,25 @@ function can have multiple kinds of input.
   ~34-hour gaps at every year boundary between archives. Aggregation logic
   and confidence scoring must account for genuinely missing coverage, not
   assume continuous data.
+- The Seattle Streets FeatureServer (the source for street name and cross
+  streets) has no SEGKEY field at all -- it's keyed by COMPKEY. Verified
+  live that Streets.COMPKEY equals the SEGKEY used in Paid Area Curb Spaces
+  and SDOT Pay Stations (e.g. SEGKEY 3018 matches COMPKEY 3018 = "20TH AVE
+  NW between NW MARKET ST and NW 56TH ST", consistent with curb-spaces'
+  BLOCKID "NW20-55"; SEGKEY 2535 matches COMPKEY 2535 = "18TH AVE between E
+  JEFFERSON ST and E CHERRY ST", consistent with that pay station's
+  PAIDAREA "Cherry Hill"). Code joining these datasets must match
+  Streets.COMPKEY against the parking datasets' SEGKEY, not look for a
+  SEGKEY field on Streets.
+- SDOT Pay Stations records can have up to 3 rate tiers per day-type (WKD,
+  SAT, SUN), each with its own rate/start/end (WKD_RATE1..3,
+  WKD_START1/END1..3, and equivalents for SAT_*/SUN_*, start/end given as
+  minutes since midnight). A day-type with no paid parking there has all
+  its RATE fields null (e.g. SUN_RATE1-3 null at a location with no Sunday
+  charge) -- that's normal, not missing data. This is modeled by the
+  rate_tiers table (see migrations/003_add_rate_tiers.sql), not by
+  blockfaces.hourly_rate_usd alone, which only holds a representative
+  summary (the first weekday tier's rate) for quick display/filtering.
 
 ## Out of scope (v1)
 
