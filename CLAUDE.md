@@ -81,6 +81,24 @@ individually. A single function can have both kinds of input.
   marketplace platforms, not public datasets, and would require a paid
   API integration. Revisit only if this moves beyond a hobby project.
 
+## Future ideas (not in scope for v1)
+
+- Computer-vision-based live occupancy detection using SDOT's public traffic
+  camera feeds (~200 cameras citywide via the "Traffic Cameras" dataset on
+  Seattle GIS). Would require an object detection model (e.g. YOLO, either
+  off-the-shelf for general car detection or fine-tuned on labeled parking
+  images), inference infrastructure, and a reliable refresh cycle. Not
+  pursued for v1 because camera coverage (~200 cameras, positioned for
+  traffic/congestion monitoring) is much sparser than the ~1,500+ blockfaces
+  already covered by the verified SDOT parking datasets, and cameras aren't
+  necessarily angled to see curb-side parking clearly. Worth revisiting only
+  if scope narrows to a small, specific area with confirmed good camera
+  coverage of the actual parking spaces, where it could offer real-time
+  ground truth the statistical approach can't. A lighter-weight interim
+  idea: link to the nearest traffic camera image next to a predicted block,
+  so a person can visually spot-check the prediction themselves before
+  walking over.
+
 ## Git workflow
 
 After completing a meaningful, working change (a new feature, a bug 
