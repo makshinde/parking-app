@@ -41,10 +41,14 @@ describe("reprojectLine", () => {
     ];
 
     const result = reprojectLine(coordinates);
+    const [firstCoordinate, secondCoordinate] = coordinates;
+    if (!firstCoordinate || !secondCoordinate) {
+      throw new Error("expected two coordinate pairs in this test's fixture");
+    }
 
     expect(result).toHaveLength(2);
-    expect(result[0]).toEqual(reprojectPoint(coordinates[0][0], coordinates[0][1]));
-    expect(result[1]).toEqual(reprojectPoint(coordinates[1][0], coordinates[1][1]));
+    expect(result[0]).toEqual(reprojectPoint(firstCoordinate[0], firstCoordinate[1]));
+    expect(result[1]).toEqual(reprojectPoint(secondCoordinate[0], secondCoordinate[1]));
     // Confirms the two points didn't collapse to the same output.
     expect(result[0]).not.toEqual(result[1]);
   });
