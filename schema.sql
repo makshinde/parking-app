@@ -23,8 +23,12 @@ CREATE TABLE blockfaces (
   side_of_street text NOT NULL CHECK (side_of_street IN ('N', 'S', 'E', 'W')),
 
   is_paid boolean NOT NULL DEFAULT false,
-  -- Only meaningful when is_paid is true; enforced below rather than making
-  -- the column NOT NULL, since free blockfaces simply have no rate.
+  -- Null when the block is free (is_paid = false), or when it's paid but the
+  -- rate genuinely isn't known yet (a DATA_GAP side -- see
+  -- resolveBlockfaceSides.ts -- where curb-spaces evidence says a pay
+  -- station belongs here but its record is missing). Enforced below: a free
+  -- block must never have a rate attached, but a paid block's rate may be
+  -- temporarily unknown.
   hourly_rate_usd numeric(6, 2),
 
   -- Days the posted restrictions/rates apply, using ISO 8601 numbering
@@ -36,9 +40,12 @@ CREATE TABLE blockfaces (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
 
+  -- A rate implies the block is paid, but not the reverse: is_paid = true
+  -- with a null rate is allowed (DATA_GAP -- paid, rate unknown). Only
+  -- is_paid = false with a non-null rate is rejected -- a free block should
+  -- never have a rate attached.
   CONSTRAINT hourly_rate_requires_paid CHECK (
-    (is_paid AND hourly_rate_usd IS NOT NULL) OR
-    (NOT is_paid AND hourly_rate_usd IS NULL)
+    is_paid OR hourly_rate_usd IS NULL
   )
 );
 
