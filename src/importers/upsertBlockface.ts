@@ -1,4 +1,5 @@
 import type { AssembledBlockface, AssembledRateTier } from "./assembleBlockface";
+import { formatLineForPostgis } from "./formatLineForPostgis";
 
 // Minimal structural subset of the @supabase/supabase-js client used here --
 // deliberately not the real library's types, so this module (and its tests)
@@ -46,13 +47,11 @@ function describeBlockface(
   return `source_element_key=${blockface.source_element_key}, side_of_street=${blockface.side_of_street}${idPart}`;
 }
 
-// blockfaces.location (PostGIS geography, NOT NULL) isn't included here.
-// AssembledBlockface.raw_line_coordinates is unprojected SRID 2926 data, not
-// a real column -- reprojecting it into a location value is
-// reprojectCoordinates.ts's job and isn't wired up yet. Omitting it here
-// (rather than sending it as a bogus field) means a real upsert fails
-// clearly on the NOT NULL constraint instead of erroring on an unknown
-// column or silently inserting a row with no geometry.
+// blockfaces.location is a PostGIS geography column (NOT NULL), not a raw
+// coordinates array -- AssembledBlockface.raw_line_coordinates (unprojected
+// SRID 2926) is reprojected and formatted as SRID=4326 WKT via
+// formatLineForPostgis before being sent, closing the gap flagged in PR #16
+// where this field was previously omitted entirely.
 function buildBlockfaceRow(blockface: AssembledBlockface & { source_element_key: number }): Record<string, unknown> {
   return {
     source_element_key: blockface.source_element_key,
@@ -65,6 +64,7 @@ function buildBlockfaceRow(blockface: AssembledBlockface & { source_element_key:
     operating_days: blockface.operating_days,
     operating_hours_start: blockface.operating_hours_start,
     operating_hours_end: blockface.operating_hours_end,
+    location: formatLineForPostgis(blockface.raw_line_coordinates),
   };
 }
 
