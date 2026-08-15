@@ -237,9 +237,12 @@ export function assembleBlockface(
     );
   }
 
-  // UNPAID_CONFIRMED and DATA_GAP both have no pay-station record, so there's
-  // no rate/hours data to assemble either way -- they differ only in
-  // is_paid.
+  // UNPAID_CONFIRMED and DATA_GAP both have no pay-station record, so
+  // there's no rate/hours data to assemble either way -- but they differ in
+  // is_paid AND in operating_days, for the same underlying reason: one is a
+  // confirmed finding, the other is unresolved uncertainty.
+  const isDataGap = sideResolution.status === "DATA_GAP";
+
   return {
     blockface: {
       street_name,
@@ -257,9 +260,16 @@ export function assembleBlockface(
       // UNPAID_CONFIRMED, by contrast, reflects genuine confirmed evidence
       // (curb-spaces shows zero SPACETYPE='PS' rows for this side), not a
       // guess, so is_paid = false there is a real finding, not a default.
-      is_paid: sideResolution.status === "DATA_GAP",
+      is_paid: isDataGap,
       hourly_rate_usd: null,
-      operating_days: [...ISO_DAYS_WEEKDAY, ISO_DAY_SATURDAY, ISO_DAY_SUNDAY],
+      // operating_days means "days the posted rate applies" (see
+      // schema.sql). UNPAID_CONFIRMED has confirmed evidence there's no rate
+      // at all, so the correct value is [] -- zero days have a posted rate,
+      // not "all of them." DATA_GAP is different: is_paid = true there means
+      // we believe a rate exists, we just don't know which days it applies
+      // to, so [1..7] ("don't rule out any day") is honest uncertainty
+      // rather than a specific wrong claim.
+      operating_days: isDataGap ? [...ISO_DAYS_WEEKDAY, ISO_DAY_SATURDAY, ISO_DAY_SUNDAY] : [],
       operating_hours_start: UNKNOWN_HOURS_START,
       operating_hours_end: UNKNOWN_HOURS_END,
       raw_line_coordinates,
