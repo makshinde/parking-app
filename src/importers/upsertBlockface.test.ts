@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AssembledBlockface, AssembledRateTier } from "./assembleBlockface";
+import { formatLineForPostgis } from "./formatLineForPostgis";
 import type { SupabaseClientLike, SupabaseQueryResult } from "./upsertBlockface";
 import { upsertBlockface } from "./upsertBlockface";
 
@@ -100,11 +101,16 @@ describe("upsertBlockface", () => {
         source_element_key: 70501,
         side_of_street: "W",
         street_name: "1ST AVE",
+        // location is the reprojected/WKT-formatted form of
+        // raw_line_coordinates -- formatLineForPostgis is exercised in
+        // detail in its own test file, so this just confirms upsertBlockface
+        // actually calls it and sends the result under the right key.
+        location: formatLineForPostgis(blockface.raw_line_coordinates),
       }),
       { onConflict: "source_element_key,side_of_street" },
     );
-    // raw_line_coordinates isn't a real blockfaces column (see
-    // buildBlockfaceRow's comment); it must not be sent to Supabase.
+    // raw_line_coordinates itself isn't a real blockfaces column; only its
+    // formatted `location` form should be sent to Supabase.
     expect(mock.upsert.mock.calls[0]?.[0]).not.toHaveProperty("raw_line_coordinates");
   });
 
