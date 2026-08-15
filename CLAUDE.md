@@ -141,6 +141,12 @@ affect behavior, like adding a "known open question" or "future idea" note,
 typo fixes, or comment clarifications. When in doubt about which category a
 change falls into, ask rather than assume.
 
+When deciding whether to bundle two related changes into one PR or keep them
+as separate PRs, the deciding factor is shared purpose, not shared file or
+timing. If two changes are independently motivated -- each would make sense
+to review or revert on its own -- keep them as separate PRs even if they
+touch the same file in the same session.
+
 After completing a meaningful, working change (a new feature, a bug 
 fix, a refactor, or a completed step in a larger task), do the 
 following automatically without waiting to be asked:
