@@ -129,18 +129,22 @@ describe("assembleBlockface", () => {
     ]);
   });
 
-  it("assembles an UNPAID_CONFIRMED side with no rate", () => {
+  it("assembles an UNPAID_CONFIRMED side with no rate and no operating days", () => {
     const result = assembleBlockface([makeCurbSpace("W", "RPZ")], makeStreetsRecord(), null, resolution("UNPAID_CONFIRMED"));
 
     expect(result.blockface.is_paid).toBe(false);
     expect(result.blockface.hourly_rate_usd).toBeNull();
-    expect(result.blockface.operating_days).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    // UNPAID_CONFIRMED is confirmed evidence there's no rate at all, so
+    // operating_days ("days the posted rate applies") is correctly empty --
+    // not "all 7 days," which would misrepresent a confirmed absence as
+    // "always in effect."
+    expect(result.blockface.operating_days).toEqual([]);
     expect(result.blockface.operating_hours_start).toBe("00:00:00");
     expect(result.blockface.operating_hours_end).toBe("23:59:00");
     expect(result.rateTiers).toEqual([]);
   });
 
-  it("assembles a DATA_GAP side using the documented is_paid default", () => {
+  it("assembles a DATA_GAP side using the documented is_paid and operating_days defaults", () => {
     const result = assembleBlockface([makeCurbSpace("W", "PS")], makeStreetsRecord(), null, resolution("DATA_GAP"));
 
     // Documented judgment call: DATA_GAP defaults to is_paid = true, since
@@ -148,6 +152,10 @@ describe("assembleBlockface", () => {
     // its record is missing -- see the comment in assembleBlockface.ts.
     expect(result.blockface.is_paid).toBe(true);
     expect(result.blockface.hourly_rate_usd).toBeNull();
+    // Unlike UNPAID_CONFIRMED, DATA_GAP doesn't know which days the
+    // (believed-to-exist) rate applies to, so operating_days stays [1..7] --
+    // honest uncertainty ("don't rule out any day"), not a specific claim.
+    expect(result.blockface.operating_days).toEqual([1, 2, 3, 4, 5, 6, 7]);
     expect(result.rateTiers).toEqual([]);
 
     // is_paid = true with a null rate used to violate
