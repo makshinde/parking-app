@@ -5,13 +5,17 @@
   "type": "module",
   "scripts": {
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "import:blockfaces": "node src/importers/import-blockfaces.ts"
   },
   "devDependencies": {
+    "@types/node": "^26.2.0",
     "typescript": "^5.5.4",
     "vitest": "^4.1.10"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.112.3",
+    "dotenv": "^17.4.2",
     "proj4": "^2.21.0"
   }
 }
