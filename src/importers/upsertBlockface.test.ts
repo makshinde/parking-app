@@ -153,7 +153,7 @@ describe("upsertBlockface", () => {
     });
 
     await expect(upsertBlockface(mock.client, makeBlockface(), makeRateTiers())).rejects.toThrow(
-      /blockfaces upsert succeeded \(id=blockface-1\).*rate_tiers.*connection reset/s,
+      /blockfaces upsert succeeded \(source_element_key=70501, side_of_street=W, id=blockface-1\).*rate_tiers.*connection reset/s,
     );
   });
 
@@ -164,7 +164,7 @@ describe("upsertBlockface", () => {
     });
 
     await expect(upsertBlockface(mock.client, makeBlockface(), makeRateTiers())).rejects.toThrow(
-      /blockfaces upsert succeeded \(id=blockface-1\).*deleting.*permission denied/s,
+      /blockfaces upsert succeeded \(source_element_key=70501, side_of_street=W, id=blockface-1\).*deleting.*permission denied/s,
     );
     // The failed delete must stop the flow before ever attempting insert.
     expect(mock.insert).not.toHaveBeenCalled();

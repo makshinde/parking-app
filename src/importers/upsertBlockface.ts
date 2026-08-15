@@ -33,6 +33,19 @@ export interface UpsertBlockfaceResult {
   blockfaceId: string;
 }
 
+// Used in every thrown error so a batch import (hundreds of blockfaces) can
+// be grepped for exactly which source row a failure belongs to.
+// source_element_key/side_of_street are the source's own identifiers, known
+// before any DB round-trip; the Supabase id is only available once the
+// blockfaces upsert itself has succeeded.
+function describeBlockface(
+  blockface: { source_element_key: number; side_of_street: string },
+  blockfaceId?: string,
+): string {
+  const idPart = blockfaceId !== undefined ? `, id=${blockfaceId}` : "";
+  return `source_element_key=${blockface.source_element_key}, side_of_street=${blockface.side_of_street}${idPart}`;
+}
+
 // blockfaces.location (PostGIS geography, NOT NULL) isn't included here.
 // AssembledBlockface.raw_line_coordinates is unprojected SRID 2926 data, not
 // a real column -- reprojecting it into a location value is
@@ -89,7 +102,7 @@ export async function upsertBlockface(
 
   if (blockfaceError !== null || upsertedBlockface === null) {
     throw new Error(
-      `upsertBlockface: blockfaces upsert failed for source_element_key=${blockface.source_element_key}, side_of_street=${blockface.side_of_street}: ${blockfaceError?.message ?? "no row returned"}`,
+      `upsertBlockface: blockfaces upsert failed for ${describeBlockface(blockface)}: ${blockfaceError?.message ?? "no row returned"}`,
     );
   }
 
@@ -99,7 +112,7 @@ export async function upsertBlockface(
 
   if (deleteError !== null) {
     throw new Error(
-      `upsertBlockface: blockfaces upsert succeeded (id=${blockfaceId}) but deleting its existing rate_tiers failed: ${deleteError.message}. Partial failure -- the blockfaces row was written but rate_tiers may still hold stale data; re-run the import for this blockface.`,
+      `upsertBlockface: blockfaces upsert succeeded (${describeBlockface(blockface, blockfaceId)}) but deleting its existing rate_tiers failed: ${deleteError.message}. Partial failure -- the blockfaces row was written but rate_tiers may still hold stale data; re-run the import for this blockface.`,
     );
   }
 
@@ -113,7 +126,7 @@ export async function upsertBlockface(
 
   if (insertError !== null) {
     throw new Error(
-      `upsertBlockface: blockfaces upsert succeeded (id=${blockfaceId}) and its old rate_tiers were deleted, but inserting the new rate_tiers failed: ${insertError.message}. Partial failure -- the blockfaces row now has zero rate_tiers; re-run the import for this blockface.`,
+      `upsertBlockface: blockfaces upsert succeeded (${describeBlockface(blockface, blockfaceId)}) and its old rate_tiers were deleted, but inserting the new rate_tiers failed: ${insertError.message}. Partial failure -- the blockfaces row now has zero rate_tiers; re-run the import for this blockface.`,
     );
   }
 
