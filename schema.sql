@@ -22,6 +22,13 @@ CREATE TABLE blockfaces (
   -- two blockfaces that share the same street/cross-street pair.
   side_of_street text NOT NULL CHECK (side_of_street IN ('N', 'S', 'E', 'W')),
 
+  -- ELMNTKEY of the source street segment this blockface was assembled from
+  -- (see assembleBlockface.ts), matching the source_facility_id pattern on
+  -- off_street_facilities. One ELMNTKEY covers both sides of a segment, so
+  -- uniqueness is enforced on the pair with side_of_street below, not on
+  -- this column alone.
+  source_element_key integer NOT NULL,
+
   is_paid boolean NOT NULL DEFAULT false,
   -- Null when the block is free (is_paid = false), or when it's paid but the
   -- rate genuinely isn't known yet (a DATA_GAP side -- see
@@ -46,7 +53,13 @@ CREATE TABLE blockfaces (
   -- never have a rate attached.
   CONSTRAINT hourly_rate_requires_paid CHECK (
     is_paid OR hourly_rate_usd IS NULL
-  )
+  ),
+
+  -- One ELMNTKEY identifies a segment, not a single blockfaces row -- each
+  -- side of that segment is its own row -- so uniqueness is the pair, not
+  -- source_element_key alone.
+  CONSTRAINT blockfaces_source_element_key_side_unique
+    UNIQUE (source_element_key, side_of_street)
 );
 
 COMMENT ON TABLE blockfaces IS
@@ -55,6 +68,8 @@ COMMENT ON COLUMN blockfaces.location IS
   'Blockface centerline geometry, used for nearest-blockface and radius queries around a destination.';
 COMMENT ON COLUMN blockfaces.operating_days IS
   'ISO 8601 day-of-week numbers (1=Monday..7=Sunday) the posted hours/rate apply on.';
+COMMENT ON COLUMN blockfaces.source_element_key IS
+  'ELMNTKEY of the source street segment this blockface was assembled from (see assembleBlockface.ts). Paired with side_of_street for uniqueness, since one ELMNTKEY covers both sides of a segment.';
 
 -- Spatial index (GiST) so "find blockfaces within N meters of this point"
 -- queries stay fast as the table grows past a handful of streets.
