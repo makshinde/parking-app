@@ -94,6 +94,16 @@ describe("resolveBlockfaceSides", () => {
     expect(warnSpy).not.toHaveBeenCalled();
   });
 
+  it("resolves an intercardinal side (e.g. NE) the same as a cardinal one -- diagonal streets are real, common data, not invalid input", () => {
+    const paidStations: PayStationRecord[] = [{ side: "NE" }];
+    const curbSpaces: CurbSpaceRecord[] = [{ side: "NE", spaceType: "PS" }];
+
+    const result = resolveBlockfaceSides("SEG10", paidStations, curbSpaces);
+
+    expect(result).toEqual([{ side: "NE", status: "PAID" }]);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
   it("throws for an invalid side on a pay-station record", () => {
     const paidStations = [{ side: "X" as unknown as Side }];
     expect(() => resolveBlockfaceSides("SEG7", paidStations, [])).toThrow(RangeError);
