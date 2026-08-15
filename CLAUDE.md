@@ -105,6 +105,15 @@ function can have multiple kinds of input.
   rate_tiers table (see migrations/003_add_rate_tiers.sql), not by
   blockfaces.hourly_rate_usd alone, which only holds a representative
   summary (the first weekday tier's rate) for quick display/filtering.
+- SIDE values in Paid Area Curb Spaces and SDOT Pay Stations are not limited
+  to the 4 cardinal directions (N/S/E/W). Live-verified: a 2,000-record
+  curb-spaces sample and the full ~1,600-row pay-stations dataset both show
+  roughly 40-50% of records reporting an intercardinal side (NE/NW/SE/SW),
+  reflecting Seattle's many diagonal streets (e.g. downtown's diagonal grid,
+  Ballard Ave) -- not rare outliers. blockfaces.side_of_street and
+  resolveBlockfaceSides.ts's Side type model all 8 directions (see
+  migrations/006_expand_side_of_street_directions.sql); code must not assume
+  only 4 are possible.
 
 ## Out of scope (v1)
 

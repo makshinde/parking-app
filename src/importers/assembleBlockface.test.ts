@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ArcGisFeature } from "../utils/fetchArcGisFeatures";
 import { assembleBlockface } from "./assembleBlockface";
-import type { BlockfaceSideResolution } from "./resolveBlockfaceSides";
+import type { BlockfaceSideResolution, Side } from "./resolveBlockfaceSides";
 
 // Real, verified street segment (1ST AVE between CHERRY ST and COLUMBIA ST,
 // COMPKEY 1001) from the Seattle Streets FeatureServer.
@@ -85,11 +85,11 @@ function makeSingleTierPayStationRecord(): ArcGisFeature {
   });
 }
 
-function makeCurbSpace(side: "N" | "S" | "E" | "W", spaceType: string): ArcGisFeature {
+function makeCurbSpace(side: Side, spaceType: string): ArcGisFeature {
   return { attributes: { ELMNTKEY: 70501, SIDE: side, SPACETYPE: spaceType } };
 }
 
-function resolution(status: BlockfaceSideResolution["status"], side: "N" | "S" | "E" | "W" = "W"): BlockfaceSideResolution {
+function resolution(status: BlockfaceSideResolution["status"], side: Side = "W"): BlockfaceSideResolution {
   return { side, status };
 }
 
