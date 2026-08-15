@@ -93,6 +93,13 @@ function resolution(status: BlockfaceSideResolution["status"], side: "N" | "S" |
   return { side, status };
 }
 
+// Mirrors blockfaces' hourly_rate_requires_paid CHECK constraint (see
+// migrations/004_loosen_hourly_rate_check.sql): is_paid OR hourly_rate_usd
+// IS NULL. Only is_paid = false with a non-null rate violates it.
+function satisfiesHourlyRateCheckConstraint(isPaid: boolean, hourlyRateUsd: number | null): boolean {
+  return isPaid || hourlyRateUsd === null;
+}
+
 describe("assembleBlockface", () => {
   it("assembles a fully PAID side with a single weekday tier", () => {
     const result = assembleBlockface(
@@ -142,6 +149,13 @@ describe("assembleBlockface", () => {
     expect(result.blockface.is_paid).toBe(true);
     expect(result.blockface.hourly_rate_usd).toBeNull();
     expect(result.rateTiers).toEqual([]);
+
+    // is_paid = true with a null rate used to violate
+    // hourly_rate_requires_paid; migrations/004_loosen_hourly_rate_check.sql
+    // loosens it specifically so this DATA_GAP row is a valid insert.
+    expect(
+      satisfiesHourlyRateCheckConstraint(result.blockface.is_paid, result.blockface.hourly_rate_usd),
+    ).toBe(true);
   });
 
   it("handles multiple weekday and Saturday rate tiers, with no Sunday tiers", () => {
