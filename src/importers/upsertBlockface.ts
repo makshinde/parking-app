@@ -1,5 +1,5 @@
-import type { AssembledBlockface, AssembledRateTier } from "./assembleBlockface";
-import { formatLineForPostgis } from "./formatLineForPostgis";
+import type { AssembledBlockface, AssembledRateTier } from "./assembleBlockface.ts";
+import { formatLineForPostgis } from "./formatLineForPostgis.ts";
 
 // Minimal structural subset of the @supabase/supabase-js client used here --
 // deliberately not the real library's types, so this module (and its tests)

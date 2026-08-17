@@ -1,5 +1,5 @@
-import type { ArcGisFeature } from "../utils/fetchArcGisFeatures";
-import type { BlockfaceSideResolution, Side } from "./resolveBlockfaceSides";
+import type { ArcGisFeature } from "../utils/fetchArcGisFeatures.ts";
+import type { BlockfaceSideResolution, Side } from "./resolveBlockfaceSides.ts";
 
 // Pure assembly: takes already-fetched real-source records for one side of
 // one block segment and shapes them into a blockfaces row (plus its

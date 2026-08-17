@@ -1,12 +1,13 @@
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
-import type { ArcGisFeature } from "../utils/fetchArcGisFeatures";
-import { fetchArcGisFeatures } from "../utils/fetchArcGisFeatures";
-import { assembleBlockface } from "./assembleBlockface";
-import type { CurbSpaceRecord, PayStationRecord, Side } from "./resolveBlockfaceSides";
-import { resolveBlockfaceSides } from "./resolveBlockfaceSides";
-import type { SupabaseQueryResult, SupabaseTableBuilder } from "./upsertBlockface";
-import { upsertBlockface } from "./upsertBlockface";
+import { pathToFileURL } from "node:url";
+import type { ArcGisFeature } from "../utils/fetchArcGisFeatures.ts";
+import { fetchArcGisFeatures } from "../utils/fetchArcGisFeatures.ts";
+import { assembleBlockface } from "./assembleBlockface.ts";
+import type { CurbSpaceRecord, PayStationRecord, Side } from "./resolveBlockfaceSides.ts";
+import { resolveBlockfaceSides } from "./resolveBlockfaceSides.ts";
+import type { SupabaseQueryResult, SupabaseTableBuilder } from "./upsertBlockface.ts";
+import { upsertBlockface } from "./upsertBlockface.ts";
 
 // Live-verified live FeatureServer endpoints (see CLAUDE.md's Known open
 // questions -- field names and SIDE's real value set were cross-checked
@@ -388,7 +389,12 @@ export async function main(): Promise<void> {
 // Only run main() when this file is executed directly (e.g. `node
 // import-blockfaces.ts`), not when it's imported by test files -- otherwise
 // every test run would try to read real env vars and hit live endpoints.
-const isRunDirectly = process.argv[1] !== undefined && import.meta.url === `file://${process.argv[1]}`;
+// Must go through pathToFileURL, not a naive `file://${path}` template
+// string: import.meta.url percent-encodes special characters (this repo's
+// own path contains a space -- ".../Parking App/..." becomes
+// ".../Parking%20App/..."), so a plain string concatenation never matches
+// and this guard would silently always evaluate false.
+const isRunDirectly = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isRunDirectly) {
   main().catch((error: unknown) => {
     console.error("import-blockfaces: fatal error:", error);
