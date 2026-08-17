@@ -18,7 +18,7 @@ const ISO_DAY_SUNDAY = 7;
 
 // blockfaces.operating_hours_start/end are NOT NULL columns (DEFAULT
 // '00:00'/'23:59' in schema.sql), so a genuine null isn't a valid value even
-// when the hours truly aren't known -- unlike hourly_rate_usd, which IS
+// when the hours truly aren't known -- unlike starting_rate_usd, which IS
 // nullable and stays genuinely null in that case. This sentinel represents
 // "applies all day" as the closest honest stand-in for "unknown."
 const UNKNOWN_HOURS_START = "00:00:00";
@@ -30,7 +30,11 @@ export interface AssembledBlockface {
   cross_street_to: string;
   side_of_street: Side;
   is_paid: boolean;
-  hourly_rate_usd: number | null;
+  // ONLY the first weekday morning tier's rate -- not a representative or
+  // average price across the full posted schedule. See CLAUDE.md's
+  // Conventions section: never show this alone as "the" rate for a
+  // blockface; the full schedule lives in rateTiers/rate_tiers.
+  starting_rate_usd: number | null;
   operating_days: number[];
   operating_hours_start: string;
   operating_hours_end: string;
@@ -217,11 +221,11 @@ export function assembleBlockface(
         cross_street_to,
         side_of_street: sideResolution.side,
         is_paid: true,
-        // Only the first weekday tier's rate is surfaced as a single
-        // representative number for quick display/filtering; the full
+        // Only the first weekday tier's rate is surfaced here -- NOT a
+        // representative or average number for display/filtering. The full
         // multi-tier/multi-day-type schedule lives in rateTiers, not
         // squeezed into one column (see rate_tiers in schema.sql).
-        hourly_rate_usd: firstWeekdayTier?.rate_usd ?? null,
+        starting_rate_usd: firstWeekdayTier?.rate_usd ?? null,
         operating_days: deriveOperatingDays(rateTiers),
         operating_hours_start: startTime ?? UNKNOWN_HOURS_START,
         operating_hours_end: endTime ?? UNKNOWN_HOURS_END,
@@ -261,7 +265,7 @@ export function assembleBlockface(
       // (curb-spaces shows zero SPACETYPE='PS' rows for this side), not a
       // guess, so is_paid = false there is a real finding, not a default.
       is_paid: isDataGap,
-      hourly_rate_usd: null,
+      starting_rate_usd: null,
       // operating_days means "days the posted rate applies" (see
       // schema.sql). UNPAID_CONFIRMED has confirmed evidence there's no rate
       // at all, so the correct value is [] -- zero days have a posted rate,

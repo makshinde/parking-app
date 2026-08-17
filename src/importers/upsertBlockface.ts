@@ -68,7 +68,7 @@ function buildBlockfaceRow(blockface: AssembledBlockface & { source_element_key:
     cross_street_to: blockface.cross_street_to,
     side_of_street: blockface.side_of_street,
     is_paid: blockface.is_paid,
-    hourly_rate_usd: blockface.hourly_rate_usd,
+    starting_rate_usd: blockface.starting_rate_usd,
     operating_days: blockface.operating_days,
     operating_hours_start: blockface.operating_hours_start,
     operating_hours_end: blockface.operating_hours_end,

@@ -32,6 +32,27 @@ written to a production-quality standard, not throwaway hobby code.
   `allowImportingTsExtensions` permits this alongside the project's
   `moduleResolution: "Bundler"` setting.
 
+## Pricing data — read before touching anything rate-related
+
+**`blockfaces.starting_rate_usd` is ONLY the first weekday morning tier's
+rate.** It is NOT a representative price, NOT an average, and NOT "the" rate
+for a blockface. A paid blockface can have up to 3 rate tiers per day-type
+(WKD/SAT/SUN), each with its own time window and rate (see `rate_tiers`,
+`migrations/003_add_rate_tiers.sql`) -- e.g. $2.50 8-11am, $1.50 11am-5pm, $1
+5-8pm on weekdays, with a completely different Saturday schedule and no
+Sunday charge at all. `starting_rate_usd` only ever captures the first of
+those numbers.
+
+**Any future frontend or API work that displays or otherwise surfaces
+pricing to an end user MUST pull and show the full schedule from
+`rate_tiers` for the relevant day/time, never `starting_rate_usd` alone.**
+Showing `starting_rate_usd` by itself as "the" rate would be actively
+misleading -- a user could see "$2.50" and park expecting that price at
+5pm, when the real rate then is $1. `starting_rate_usd` exists only for
+quick display/filtering/sorting use cases (e.g. "blocks starting under $2"),
+never as a final price shown to a user without the full schedule alongside
+it.
+
 ## Architecture
 
 - Frontend: built separately in Lovable

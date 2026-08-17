@@ -93,11 +93,14 @@ function resolution(status: BlockfaceSideResolution["status"], side: Side = "W")
   return { side, status };
 }
 
-// Mirrors blockfaces' hourly_rate_requires_paid CHECK constraint (see
-// migrations/004_loosen_hourly_rate_check.sql): is_paid OR hourly_rate_usd
-// IS NULL. Only is_paid = false with a non-null rate violates it.
-function satisfiesHourlyRateCheckConstraint(isPaid: boolean, hourlyRateUsd: number | null): boolean {
-  return isPaid || hourlyRateUsd === null;
+// Mirrors blockfaces' starting_rate_requires_paid CHECK constraint (logic
+// introduced in migrations/004_loosen_hourly_rate_check.sql as
+// hourly_rate_requires_paid, renamed in
+// migrations/007_rename_hourly_rate_to_starting_rate.sql): is_paid OR
+// starting_rate_usd IS NULL. Only is_paid = false with a non-null rate
+// violates it.
+function satisfiesStartingRateCheckConstraint(isPaid: boolean, startingRateUsd: number | null): boolean {
+  return isPaid || startingRateUsd === null;
 }
 
 describe("assembleBlockface", () => {
@@ -115,7 +118,7 @@ describe("assembleBlockface", () => {
       cross_street_to: "COLUMBIA ST",
       side_of_street: "W",
       is_paid: true,
-      hourly_rate_usd: 2.5,
+      starting_rate_usd: 2.5,
       operating_days: [1, 2, 3, 4, 5],
       operating_hours_start: "08:00:00",
       operating_hours_end: "10:59:00",
@@ -133,7 +136,7 @@ describe("assembleBlockface", () => {
     const result = assembleBlockface([makeCurbSpace("W", "RPZ")], makeStreetsRecord(), null, resolution("UNPAID_CONFIRMED"));
 
     expect(result.blockface.is_paid).toBe(false);
-    expect(result.blockface.hourly_rate_usd).toBeNull();
+    expect(result.blockface.starting_rate_usd).toBeNull();
     // UNPAID_CONFIRMED is confirmed evidence there's no rate at all, so
     // operating_days ("days the posted rate applies") is correctly empty --
     // not "all 7 days," which would misrepresent a confirmed absence as
@@ -151,7 +154,7 @@ describe("assembleBlockface", () => {
     // curb-spaces evidence suggests a pay station belongs here even though
     // its record is missing -- see the comment in assembleBlockface.ts.
     expect(result.blockface.is_paid).toBe(true);
-    expect(result.blockface.hourly_rate_usd).toBeNull();
+    expect(result.blockface.starting_rate_usd).toBeNull();
     // Unlike UNPAID_CONFIRMED, DATA_GAP doesn't know which days the
     // (believed-to-exist) rate applies to, so operating_days stays [1..7] --
     // honest uncertainty ("don't rule out any day"), not a specific claim.
@@ -159,10 +162,11 @@ describe("assembleBlockface", () => {
     expect(result.rateTiers).toEqual([]);
 
     // is_paid = true with a null rate used to violate
-    // hourly_rate_requires_paid; migrations/004_loosen_hourly_rate_check.sql
-    // loosens it specifically so this DATA_GAP row is a valid insert.
+    // hourly_rate_requires_paid (now starting_rate_requires_paid);
+    // migrations/004_loosen_hourly_rate_check.sql loosens it specifically so
+    // this DATA_GAP row is a valid insert.
     expect(
-      satisfiesHourlyRateCheckConstraint(result.blockface.is_paid, result.blockface.hourly_rate_usd),
+      satisfiesStartingRateCheckConstraint(result.blockface.is_paid, result.blockface.starting_rate_usd),
     ).toBe(true);
   });
 
@@ -179,9 +183,9 @@ describe("assembleBlockface", () => {
     expect(result.rateTiers.filter((tier) => tier.day_type === "SAT")).toHaveLength(3);
     expect(result.rateTiers.filter((tier) => tier.day_type === "SUN")).toHaveLength(0);
 
-    // hourly_rate_usd is only the first weekday tier's rate, not an average
-    // or the peak/off-peak rate -- the full schedule is in rateTiers.
-    expect(result.blockface.hourly_rate_usd).toBe(2.5);
+    // starting_rate_usd is only the first weekday tier's rate, not an
+    // average or the peak/off-peak rate -- the full schedule is in rateTiers.
+    expect(result.blockface.starting_rate_usd).toBe(2.5);
 
     // Spans the earliest tier start (WKD/SAT_START1 = 480 = 08:00) to the
     // latest tier end (WKD/SAT_END3 = 1199 = 19:59) across all tiers.
