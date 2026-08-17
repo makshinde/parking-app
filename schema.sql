@@ -40,7 +40,13 @@ CREATE TABLE blockfaces (
   -- station belongs here but its record is missing). Enforced below: a free
   -- block must never have a rate attached, but a paid block's rate may be
   -- temporarily unknown.
-  hourly_rate_usd numeric(6, 2),
+  --
+  -- Named starting_rate_usd, not hourly_rate_usd: this is ONLY the first
+  -- weekday morning tier's rate (see rate_tiers), not a representative or
+  -- average price across the full posted schedule. See CLAUDE.md's
+  -- Conventions section -- this must never be shown to an end user as "the"
+  -- rate without also pulling the full schedule from rate_tiers.
+  starting_rate_usd numeric(6, 2),
 
   -- Days the posted restrictions/rates apply, using ISO 8601 numbering
   -- (1 = Monday ... 7 = Sunday) so it lines up with occupancy_stats.day_of_week.
@@ -55,8 +61,8 @@ CREATE TABLE blockfaces (
   -- with a null rate is allowed (DATA_GAP -- paid, rate unknown). Only
   -- is_paid = false with a non-null rate is rejected -- a free block should
   -- never have a rate attached.
-  CONSTRAINT hourly_rate_requires_paid CHECK (
-    is_paid OR hourly_rate_usd IS NULL
+  CONSTRAINT starting_rate_requires_paid CHECK (
+    is_paid OR starting_rate_usd IS NULL
   ),
 
   -- One ELMNTKEY identifies a segment, not a single blockfaces row -- each
@@ -70,6 +76,8 @@ COMMENT ON TABLE blockfaces IS
   'Static reference data for each parking blockface: where it is and what the posted rules are. Does not change based on observed occupancy.';
 COMMENT ON COLUMN blockfaces.location IS
   'Blockface centerline geometry, used for nearest-blockface and radius queries around a destination.';
+COMMENT ON COLUMN blockfaces.starting_rate_usd IS
+  'ONLY the first weekday morning tier''s rate -- not a representative or average price. Never show this alone as "the" rate for a blockface; pull the full schedule from rate_tiers for the relevant day/time instead.';
 COMMENT ON COLUMN blockfaces.operating_days IS
   'ISO 8601 day-of-week numbers (1=Monday..7=Sunday) the posted hours/rate apply on.';
 COMMENT ON COLUMN blockfaces.source_element_key IS
@@ -84,9 +92,9 @@ ALTER TABLE blockfaces ENABLE ROW LEVEL SECURITY;
 -- Detailed rate schedule for a paid blockface, one row per day-type/tier. A
 -- single pay station can have up to 3 rate tiers per day-type (WKD/SAT/SUN),
 -- each with its own time window and rate -- e.g. $2.50 8-11am, $1.50
--- 11am-5pm, $1 5-8pm on weekdays. blockfaces.hourly_rate_usd only holds a
--- single representative summary rate (the first weekday tier); this table
--- holds the full real schedule.
+-- 11am-5pm, $1 5-8pm on weekdays. blockfaces.starting_rate_usd only holds
+-- the first weekday morning tier's rate, not a representative summary or
+-- average; this table holds the full real schedule.
 CREATE TABLE rate_tiers (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
 
@@ -112,7 +120,7 @@ CREATE TABLE rate_tiers (
 );
 
 COMMENT ON TABLE rate_tiers IS
-  'Detailed rate schedule for a paid blockface, one row per day-type (WKD/SAT/SUN) and tier (up to 3 per day-type), sourced from SDOT Pay Stations. blockfaces.hourly_rate_usd is only a representative summary; this table is the authoritative detail.';
+  'Detailed rate schedule for a paid blockface, one row per day-type (WKD/SAT/SUN) and tier (up to 3 per day-type), sourced from SDOT Pay Stations. blockfaces.starting_rate_usd is only the first weekday morning tier''s rate, not a representative summary; this table is the authoritative detail.';
 COMMENT ON COLUMN rate_tiers.day_type IS
   'WKD (Monday-Friday), SAT, or SUN -- matches the source data''s own day-type grouping, not individual ISO days.';
 COMMENT ON COLUMN rate_tiers.tier_number IS

@@ -320,7 +320,7 @@ describe("processElement", () => {
 
     expect(summary.dataGapCount).toBe(1);
     expect(summary.created).toEqual([{ sourceElementKey: 70501, side: "W" }]);
-    expect(upsertCalls[0]).toMatchObject({ source_element_key: 70501, side_of_street: "W", is_paid: true, hourly_rate_usd: null });
+    expect(upsertCalls[0]).toMatchObject({ source_element_key: 70501, side_of_street: "W", is_paid: true, starting_rate_usd: null });
   });
 
   it("skips the element when no Streets record matches its SEGKEY", async () => {

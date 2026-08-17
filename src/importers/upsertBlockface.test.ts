@@ -11,7 +11,7 @@ function makeBlockface(overrides: Partial<AssembledBlockface> = {}): AssembledBl
     cross_street_to: "COLUMBIA ST",
     side_of_street: "W",
     is_paid: true,
-    hourly_rate_usd: 2.5,
+    starting_rate_usd: 2.5,
     operating_days: [1, 2, 3, 4, 5],
     operating_hours_start: "08:00:00",
     operating_hours_end: "18:00:00",
@@ -146,7 +146,7 @@ describe("upsertBlockface", () => {
   it("skips the rate_tiers insert entirely when there are no tiers to write", async () => {
     const mock = createMockClient({ blockfaceResult: { data: { id: "blockface-1" }, error: null } });
 
-    await upsertBlockface(mock.client, makeBlockface({ is_paid: false, hourly_rate_usd: null }), []);
+    await upsertBlockface(mock.client, makeBlockface({ is_paid: false, starting_rate_usd: null }), []);
 
     expect(mock.rateTiersDelete).toHaveBeenCalledTimes(1);
     expect(mock.insert).not.toHaveBeenCalled();
