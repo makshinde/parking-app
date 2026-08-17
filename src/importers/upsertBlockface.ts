@@ -5,6 +5,14 @@ import { formatLineForPostgis } from "./formatLineForPostgis";
 // deliberately not the real library's types, so this module (and its tests)
 // don't require an actual Supabase project or the real dependency. Any
 // client exposing this shape (the real one included) can be passed in.
+//
+// Builder methods are typed as PromiseLike, not Promise: the real client's
+// query builders (PostgrestBuilder) are thenable/awaitable but don't declare
+// the full Promise interface (.catch()/.finally()/etc.), which this module
+// never calls directly -- only ever `await`s. Typing these as Promise (as
+// an earlier version of this file did) is stricter than what's actually
+// used and made the real client fail to structurally satisfy this interface
+// the first time it was actually plugged in (import-blockfaces.ts).
 export interface SupabaseQueryResult<T = unknown> {
   data: T | null;
   error: { message: string } | null;
@@ -12,18 +20,18 @@ export interface SupabaseQueryResult<T = unknown> {
 
 export interface SupabaseUpsertBuilder {
   select(columns: string): {
-    single(): Promise<SupabaseQueryResult<{ id: string }>>;
+    single(): PromiseLike<SupabaseQueryResult<{ id: string }>>;
   };
 }
 
 export interface SupabaseDeleteBuilder {
-  eq(column: string, value: unknown): Promise<SupabaseQueryResult>;
+  eq(column: string, value: unknown): PromiseLike<SupabaseQueryResult>;
 }
 
 export interface SupabaseTableBuilder {
   upsert(values: Record<string, unknown>, options: { onConflict: string }): SupabaseUpsertBuilder;
   delete(): SupabaseDeleteBuilder;
-  insert(values: Record<string, unknown>[]): Promise<SupabaseQueryResult>;
+  insert(values: Record<string, unknown>[]): PromiseLike<SupabaseQueryResult>;
 }
 
 export interface SupabaseClientLike {
