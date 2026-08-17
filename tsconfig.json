@@ -7,7 +7,16 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "noUncheckedIndexedAccess": true
+    "noUncheckedIndexedAccess": true,
+    // Scripts meant to run directly via `node` (e.g. import-blockfaces.ts)
+    // need explicit .ts extensions on relative imports -- Node's ESM
+    // resolver, unlike Vite/Vitest's bundler-style resolution, does no
+    // extension-guessing. allowImportingTsExtensions requires noEmit (this
+    // project never emits compiled output; tsc only ever runs as a
+    // type-check via --noEmit, and Vite/Vitest/Node handle actual execution
+    // directly from .ts source).
+    "noEmit": true,
+    "allowImportingTsExtensions": true
   },
   "include": ["src"]
 }

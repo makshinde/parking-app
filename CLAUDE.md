@@ -23,6 +23,14 @@ written to a production-quality standard, not throwaway hobby code.
   returns 0=Sunday..6=Saturday, so any code converting a JS Date into a
   day-of-week for querying the database MUST use the shared
   jsDayToIsoDay() helper (see src/utils/dateHelpers.ts), never inline math.
+- Relative imports in src/ MUST include the explicit `.ts` extension (e.g.
+  `from "./assembleBlockface.ts"`, not `from "./assembleBlockface"`). Vite/
+  Vitest resolve extensionless imports fine, so this is easy to miss, but
+  standalone scripts run directly via `node` (e.g. import-blockfaces.ts) use
+  Node's native ESM resolver, which does no extension-guessing and fails
+  with ERR_MODULE_NOT_FOUND on an extensionless specifier. tsconfig.json's
+  `allowImportingTsExtensions` permits this alongside the project's
+  `moduleResolution: "Bundler"` setting.
 
 ## Architecture
 

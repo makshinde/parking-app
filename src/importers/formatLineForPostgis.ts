@@ -1,4 +1,4 @@
-import { reprojectLine } from "../utils/reprojectCoordinates";
+import { reprojectLine } from "../utils/reprojectCoordinates.ts";
 
 // A WKT LineString needs at least 2 points to be a valid line -- a single
 // point or an empty list isn't a degraded-but-usable line, it's structurally
