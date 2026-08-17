@@ -19,8 +19,12 @@ CREATE TABLE blockfaces (
   cross_street_to text NOT NULL,
 
   -- Compass side of the street this blockface's curb is on. Distinguishes the
-  -- two blockfaces that share the same street/cross-street pair.
-  side_of_street text NOT NULL CHECK (side_of_street IN ('N', 'S', 'E', 'W')),
+  -- two blockfaces that share the same street/cross-street pair. Includes
+  -- intercardinal directions (NE/NW/SE/SW), not just the 4 cardinal ones --
+  -- live-verified against the source data that roughly 40-50% of real
+  -- records are on diagonal streets and report an intercardinal side (see
+  -- resolveBlockfaceSides.ts).
+  side_of_street text NOT NULL CHECK (side_of_street IN ('N', 'S', 'E', 'W', 'NE', 'NW', 'SE', 'SW')),
 
   -- ELMNTKEY of the source street segment this blockface was assembled from
   -- (see assembleBlockface.ts), matching the source_facility_id pattern on

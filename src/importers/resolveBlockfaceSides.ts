@@ -9,9 +9,15 @@
 // API responses -- mapping the source datasets' actual field names onto
 // `side`/`spaceType` is the import layer's job, not this decision logic's.
 
-export type Side = "N" | "S" | "E" | "W";
+// Live-verified against Paid_Area_Curb_Spaces and SDOT_Pay_Stations
+// (services.arcgis.com/ZOyb2t4B0UYuYNYH): SIDE is not limited to the 4
+// cardinal directions -- roughly 40-50% of real records report an
+// intercardinal side (NE/NW/SE/SW), reflecting Seattle's many diagonal
+// streets (e.g. downtown's diagonal grid, Ballard Ave). All 8 are real,
+// meaningfully-represented values, not rare/invalid outliers.
+export type Side = "N" | "S" | "E" | "W" | "NE" | "NW" | "SE" | "SW";
 
-const VALID_SIDES: readonly Side[] = ["N", "S", "E", "W"];
+const VALID_SIDES: readonly Side[] = ["N", "S", "E", "W", "NE", "NW", "SE", "SW"];
 
 export interface PayStationRecord {
   side: Side;
