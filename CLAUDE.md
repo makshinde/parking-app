@@ -89,7 +89,26 @@ it.
      reading's own real date), calculateWeightedStats (weighted mean/stdDev
      across that bucket's full year of matching readings),
      calculateOccupancyRatio, and jsDayToIsoDay.
-  3. Writes the resulting mean/stdDev/sample_count into occupancy_stats.
+  3. Writes the resulting mean/stdDev/sample_count into occupancy_stats --
+     but only when that bucket's reading count is at least
+     MIN_READINGS_PER_BUCKET (30); below that, no row is written for the
+     bucket at all, rather than writing a mean/stdDev backed by too little
+     data. This number comes from live-querying the real distribution of
+     readings-per-bucket (2025 archive, several real blockface/day/hour
+     combinations, both a common bucket -- Monday 9am, 1529 blockfaces --
+     and a rarer one -- Monday 8pm, 258 blockfaces): the distribution is
+     essentially bimodal, not a smooth taper. A bucket either has zero
+     readings (the blockface genuinely doesn't operate that day/hour -- e.g.
+     confirmed zero Sunday readings for several elements) or, if it operates
+     at all, has at least 60 readings in the common bucket and 120 in the
+     rarer one, with the bulk of buckets in the 400-2760+ range and fewer
+     than 1% of non-empty buckets falling below 150. 30 sits comfortably
+     below every real non-empty bucket actually observed (roughly half the
+     lowest one seen), leaving margin for a blockface with only partial-year
+     coverage (e.g. newly added mid-year, or affected by one of the
+     documented Socrata data gaps) to still clear the bar, while still
+     rejecting a handful of stray readings from a data glitch as
+     insufficient to write a confident statistic from.
 
   Deliberately no hard window (e.g. "only readings within N days of the
   seasonal anniversary") -- a hard cutoff would arbitrarily discard
