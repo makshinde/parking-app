@@ -135,7 +135,7 @@ function can have multiple kinds of input.
   its RATE fields null (e.g. SUN_RATE1-3 null at a location with no Sunday
   charge) -- that's normal, not missing data. This is modeled by the
   rate_tiers table (see migrations/003_add_rate_tiers.sql), not by
-  blockfaces.hourly_rate_usd alone, which only holds a representative
+  blockfaces.starting_rate_usd alone, which only holds a representative
   summary (the first weekday tier's rate) for quick display/filtering.
 - SIDE values in Paid Area Curb Spaces and SDOT Pay Stations are not limited
   to the 4 cardinal directions (N/S/E/W). Live-verified: a 2,000-record
