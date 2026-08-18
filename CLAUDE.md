@@ -232,6 +232,18 @@ function can have multiple kinds of input.
   to calculateOccupancyRatio.ts or calculateRecencyWeight.ts, both of which
   expect real numbers, not numeric strings -- do not assume Socrata's JSON
   API returns numbers already.
+- resolveYearlyArchiveDatasetId (src/aggregation/resolveYearlyArchive.ts)
+  only has live-verified Socrata dataset IDs for 2020 ("wtpb-jp8d") and
+  2025 ("7c2e-uany"). The live on-demand prediction flow's "5-day window
+  centered on the same date one year prior" (see Architecture section)
+  only works today for requests where that prior year is 2020 or 2025 --
+  any other year throws rather than guessing. Real time will require
+  adding more years going forward (2026 becomes "last year" starting in
+  2027, and so on); each new year's dataset ID MUST be live-verified
+  directly against the real Socrata catalog before being added to the
+  map, never guessed or assumed to follow the same naming pattern as an
+  existing year -- Socrata dataset IDs are opaque codes with no
+  relationship to the year they cover.
 
 ## Out of scope (v1)
 
