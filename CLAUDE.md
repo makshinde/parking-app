@@ -62,6 +62,35 @@ it.
   Nominatim (geocoding) and Overpass API (off-street lots)
 - LLM: used only for final synthesis of structured results into
   plain language, not for any core calculation
+- Predictions are computed live, on demand, at request time inside the
+  Edge Function -- NOT precomputed. This is a deliberate pivot away from
+  an earlier plan to run a periodic batch aggregation job. For a given
+  blockface and target date/time, the request-time flow:
+  1. Live-queries Socrata for a narrow window: roughly the most recent 26
+     days, plus a 5-day window centered on the same date one year prior
+     (so a Saturday-in-July prediction can draw on both recent trend and
+     the same season last year, without pulling the entire historical
+     dataset per request).
+  2. Normalizes and weights those raw readings using the already-built
+     aggregation functions: normalizeReading (blockface matching,
+     isoDay/hour/ageInDays/occupancyRatio per reading), calculateRecencyWeight
+     (recency + seasonal weighting per reading), calculateWeightedStats
+     (weighted mean/stdDev across the window), calculateOccupancyRatio,
+     and jsDayToIsoDay.
+  3. Computes a fresh confidence score from that weighted result and
+     returns it -- nothing about the response is read from a precomputed
+     table.
+
+  occupancy_stats (schema.sql, migrations/002's comment references it as
+  predating the migrations/ tracking system) remains in the schema as a
+  documented, **optional future caching layer only** -- if live-query
+  latency or Socrata rate-limit pressure ever become a real problem at
+  scale, it could be populated by a periodic batch job and read from
+  instead of live-querying on every request. As of this note, nothing
+  writes to occupancy_stats and no aggregation script exists or is
+  planned for v1. It is intentionally unused schema, not a forgotten or
+  half-built feature -- a future session should not assume it needs
+  populating before predictions can work.
 
 ## Handling invalid input
 
