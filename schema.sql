@@ -134,13 +134,12 @@ CREATE INDEX idx_rate_tiers_blockface_id ON rate_tiers (blockface_id);
 ALTER TABLE rate_tiers ENABLE ROW LEVEL SECURITY;
 
 -- Historical occupancy stats, bucketed per blockface / day-of-week /
--- hour-of-day. NOT currently used: predictions are computed live at request
--- time from a narrow live Socrata query instead of a precomputed table --
--- see CLAUDE.md's Architecture section for the full request-time flow. This
--- table remains as a documented, optional future caching layer only, in
--- case live-query latency or Socrata rate limits ever become a real problem
--- at scale. Nothing writes to it and no aggregation script exists or is
--- planned for v1.
+-- hour-of-day. This is the actively-used, primary storage for precomputed
+-- predictions -- populated by a periodic batch aggregation job (see
+-- CLAUDE.md's Architecture section) and read directly by the Edge Function
+-- at request time, for fast, millisecond-level responses rather than a
+-- live Socrata query per request. That batch job has not yet been built as
+-- of this note, so this table needs populating before predictions can work.
 CREATE TABLE occupancy_stats (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
 
@@ -172,7 +171,7 @@ CREATE TABLE occupancy_stats (
 );
 
 COMMENT ON TABLE occupancy_stats IS
-  'Historical occupancy statistics per blockface, bucketed by day-of-week and hour-of-day. NOT currently used -- predictions are computed live at request time from a narrow live Socrata query instead (see CLAUDE.md''s Architecture section). Kept as a documented, optional future caching layer only; nothing writes to this table and no aggregation script exists or is planned for v1.';
+  'Historical occupancy statistics per blockface, bucketed by day-of-week and hour-of-day. Primary storage for precomputed predictions, populated by a periodic batch aggregation job and read directly by the Edge Function at request time (see CLAUDE.md''s Architecture section). That batch job has not yet been built as of this note.';
 COMMENT ON COLUMN occupancy_stats.mean_occupancy IS
   'Average fraction of capacity occupied in this bucket, 0 (empty) to 1 (full).';
 COMMENT ON COLUMN occupancy_stats.std_dev IS
