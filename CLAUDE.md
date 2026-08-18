@@ -138,7 +138,23 @@ it.
   unauthenticated requests are much more aggressively rate-limited. The job
   should also be resumable rather than requiring a full restart if
   interrupted partway through, given how long a full run across all
-  blockfaces and years of history is likely to take.
+  blockfaces and years of history is likely to take -- the table
+  occupancy_stats_backfill_progress (schema.sql, migrations/009) exists for
+  exactly this: one row per (iso_day, hour) bucket tracking
+  pending/in_progress/complete/failed status, so a re-run can skip
+  completed buckets and retry only the ones that didn't finish, instead of
+  reprocessing everything from scratch.
+
+  occupancy_stats_backfill_progress deliberately has RLS enabled with NO
+  policies at all, not even public read -- unlike every other table in this
+  schema (which gets a public-read policy added manually via the Supabase
+  dashboard, outside these tracked files). It holds no parking data of any
+  public interest, only this project's own job-scheduling state (timing,
+  status, failure messages); a public read policy here would serve no
+  purpose while needlessly exposing internal operational details to anyone
+  with API access. With RLS enabled and zero policies, only the
+  service-role key (used server-side by the batch job) can read or write
+  it.
 
 ## Handling invalid input
 
