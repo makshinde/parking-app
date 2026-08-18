@@ -173,6 +173,28 @@ function can have multiple kinds of input.
      in assembleBlockface.ts currently throws on exactly this shape (rate
      without start/end), which is why it's skipped rather than assembled
      with a guessed time window.
+- The Public Garages and Parking Lots FeatureServer has two overlapping name
+  fields, DEA_FACILITY_NAME and FAC_NAME, not one. Live-verified against a
+  700-record sample (the full live dataset): DEA_FACILITY_NAME is populated
+  for 99.7% of records, FAC_NAME for 98.9%, and zero records are missing
+  both. Where the two disagree (22 of 700 records), the difference is almost
+  always cosmetic formatting (e.g. "AMAZON PHASE 1B - 81866" vs "AMAZON
+  PHASE 1B #81866"), not a substantive naming conflict. import-off-street-
+  facilities.ts's mapFeatureToFacility() prefers DEA_FACILITY_NAME, falling
+  back to FAC_NAME only when it's absent, since DEA_FACILITY_NAME has
+  slightly higher coverage and reads as the more canonical business-license
+  name in the cases where they differ.
+- BUSLIC_LOCATION_ID (used as off_street_facilities.source_facility_id, see
+  schema.sql) is 100% populated in that same 700-record sample but not
+  always unique -- only 685 of 700 records have a distinct value. Every
+  duplicate found was verified to be the same physical facility recorded
+  twice in the source data (identical name, address, and geometry; only
+  OBJECTID/GlobalID differ), not two different facilities sharing an ID.
+  This is harmless under import-off-street-facilities.ts's upsert pattern
+  (ON CONFLICT (source_facility_id) DO UPDATE): re-upserting a duplicate
+  under the same key just overwrites the row with identical data, so 700
+  raw records correctly collapse into 685 real rows. Not deduplicated in
+  code, since the upsert already produces the correct result on its own.
 
 ## Out of scope (v1)
 
