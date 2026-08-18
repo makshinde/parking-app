@@ -62,35 +62,51 @@ it.
   Nominatim (geocoding) and Overpass API (off-street lots)
 - LLM: used only for final synthesis of structured results into
   plain language, not for any core calculation
-- Predictions are computed live, on demand, at request time inside the
-  Edge Function -- NOT precomputed. This is a deliberate pivot away from
-  an earlier plan to run a periodic batch aggregation job. For a given
-  blockface and target date/time, the request-time flow:
-  1. Live-queries Socrata for a narrow window: roughly the most recent 26
-     days, plus a 5-day window centered on the same date one year prior
-     (so a Saturday-in-July prediction can draw on both recent trend and
-     the same season last year, without pulling the entire historical
-     dataset per request).
+- Predictions are precomputed by a periodic batch aggregation job that
+  populates occupancy_stats; the Edge Function reads directly from that
+  table at request time, giving fast, millisecond-level responses rather
+  than live-querying Socrata per request.
+
+  occupancy_stats (schema.sql, migrations/002's comment references it as
+  predating the migrations/ tracking system) is the actively-used,
+  **primary storage for these precomputed predictions** -- not an unused
+  or optional layer. It does need populating via the batch job described
+  below before predictions can work; that batch job has not yet been
+  built as of this note.
+
+  For each blockface/day-of-week/hour bucket, the batch job:
+  1. Pulls that bucket's full year of matching readings using server-side
+     day-of-week and hour filtering (Socrata's date_extract_dow and
+     date_extract_hh), not a narrow date window -- live-verified to work
+     correctly, including combined with a date-range and sourceelementkey
+     filter in a single $where clause, across all three relevant datasets
+     (rke9-rsvs, wtpb-jp8d, and 7c2e-uany). 91 queries per year cover
+     every day-of-week/hour bucket combination in scope.
   2. Normalizes and weights those raw readings using the already-built
      aggregation functions: normalizeReading (blockface matching,
      isoDay/hour/ageInDays/occupancyRatio per reading), calculateRecencyWeight
-     (recency + seasonal weighting per reading), calculateWeightedStats
-     (weighted mean/stdDev across the window), calculateOccupancyRatio,
-     and jsDayToIsoDay.
-  3. Computes a fresh confidence score from that weighted result and
-     returns it -- nothing about the response is read from a precomputed
-     table.
+     (recency + seasonal weighting per reading, computed from each
+     reading's own real date), calculateWeightedStats (weighted mean/stdDev
+     across that bucket's full year of matching readings),
+     calculateOccupancyRatio, and jsDayToIsoDay.
+  3. Writes the resulting mean/stdDev/sample_count into occupancy_stats.
 
-  occupancy_stats (schema.sql, migrations/002's comment references it as
-  predating the migrations/ tracking system) remains in the schema as a
-  documented, **optional future caching layer only** -- if live-query
-  latency or Socrata rate-limit pressure ever become a real problem at
-  scale, it could be populated by a periodic batch job and read from
-  instead of live-querying on every request. As of this note, nothing
-  writes to occupancy_stats and no aggregation script exists or is
-  planned for v1. It is intentionally unused schema, not a forgotten or
-  half-built feature -- a future session should not assume it needs
-  populating before predictions can work.
+  Deliberately no hard window (e.g. "only readings within N days of the
+  seasonal anniversary") -- a hard cutoff would arbitrarily discard
+  meaningful nearby-season data and flatten everything inside the window to
+  equal weight, when calculateRecencyWeight's existing seasonal decay
+  already handles "closer to the anniversary matters more" more precisely,
+  per each reading's actual date: live-verified, a reading 30 days from the
+  seasonal anniversary still retains about 25% of peak seasonal weight, not
+  zero, so it's still meaningfully counted at a reduced weight rather than
+  discarded outright by an arbitrary cutoff.
+
+  The batch job needs a Socrata app token (free, registered at
+  data.seattle.gov), given the real request volume involved --
+  unauthenticated requests are much more aggressively rate-limited. The job
+  should also be resumable rather than requiring a full restart if
+  interrupted partway through, given how long a full run across all
+  blockfaces and years of history is likely to take.
 
 ## Handling invalid input
 
