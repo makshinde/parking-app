@@ -160,7 +160,12 @@ CREATE TABLE occupancy_stats (
 
   -- Number of historical observations behind this bucket's stats; feeds the
   -- "sample size" term of the confidence score, so low-data buckets don't
-  -- overstate how reliable the prediction is.
+  -- overstate how reliable the prediction is. The batch job only writes a
+  -- row at all when this would be >= 30 (MIN_READINGS_PER_BUCKET) -- see
+  -- CLAUDE.md's Architecture section for the live-verified reasoning behind
+  -- that number. A CHECK of >= 0 rather than >= 30 here since that
+  -- minimum is an application-level aggregation decision, not a database
+  -- invariant every row must satisfy for its own sake.
   sample_count integer NOT NULL CHECK (sample_count >= 0),
 
   updated_at timestamptz NOT NULL DEFAULT now(),

@@ -13,9 +13,26 @@ function buildQueryUrl(datasetUrl: string, whereClause: string, offset: number):
   return url.toString();
 }
 
+// Socrata heavily rate-limits unauthenticated requests, shared across every
+// anonymous caller hitting their API at once -- fine for occasional
+// one-off imports, but not for the volume of requests the occupancy batch
+// aggregation job makes (see CLAUDE.md's Architecture section). An app
+// token is free (register at data.seattle.gov) and moves requests onto
+// their own per-token limit instead of the shared anonymous one. Entirely
+// optional: requests still succeed without one, just against that lower,
+// shared limit -- so this returns an empty headers object rather than
+// throwing when the env var isn't set.
+function buildRequestHeaders(): HeadersInit {
+  const token = process.env.SOCRATA_APP_TOKEN;
+  if (token === undefined || token.trim() === "") {
+    return {};
+  }
+  return { "X-App-Token": token };
+}
+
 async function fetchPage(datasetUrl: string, whereClause: string, offset: number): Promise<SocrataRecord[]> {
   const url = buildQueryUrl(datasetUrl, whereClause, offset);
-  const response = await fetch(url);
+  const response = await fetch(url, { headers: buildRequestHeaders() });
 
   // A partial result set here would be silently wrong data, not a usable
   // best-effort answer -- there's no meaningful "partial success" to return,

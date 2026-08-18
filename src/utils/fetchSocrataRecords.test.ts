@@ -106,4 +106,39 @@ describe("fetchSocrataRecords", () => {
     expect(result).toEqual([]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  describe("SOCRATA_APP_TOKEN", () => {
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it("sends the X-App-Token header when SOCRATA_APP_TOKEN is set", async () => {
+      vi.stubEnv("SOCRATA_APP_TOKEN", "test-token-123");
+      fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(1)));
+
+      await fetchSocrataRecords(DATASET_URL, "1=1");
+
+      const call = fetchMock.mock.calls[0];
+      if (!call) {
+        throw new Error("expected fetch to have been called");
+      }
+      const [, init] = call as [string, RequestInit];
+      expect(init.headers).toEqual({ "X-App-Token": "test-token-123" });
+    });
+
+    it("still succeeds without a token, sending no X-App-Token header (just at Socrata's lower shared rate limit)", async () => {
+      vi.stubEnv("SOCRATA_APP_TOKEN", "");
+      fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(2)));
+
+      const result = await fetchSocrataRecords(DATASET_URL, "1=1");
+
+      expect(result).toHaveLength(2);
+      const call = fetchMock.mock.calls[0];
+      if (!call) {
+        throw new Error("expected fetch to have been called");
+      }
+      const [, init] = call as [string, RequestInit];
+      expect(init.headers).toEqual({});
+    });
+  });
 });
