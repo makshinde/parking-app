@@ -102,13 +102,26 @@ it.
      confirmed zero Sunday readings for several elements) or, if it operates
      at all, has at least 60 readings in the common bucket and 120 in the
      rarer one, with the bulk of buckets in the 400-2760+ range and fewer
-     than 1% of non-empty buckets falling below 150. 30 sits comfortably
-     below every real non-empty bucket actually observed (roughly half the
-     lowest one seen), leaving margin for a blockface with only partial-year
-     coverage (e.g. newly added mid-year, or affected by one of the
-     documented Socrata data gaps) to still clear the bar, while still
-     rejecting a handful of stray readings from a data glitch as
-     insufficient to write a confident statistic from.
+     than 1% of non-empty buckets falling below 150.
+
+     30 is a safe, empirically-grounded noise-rejection line sitting in that
+     observed gap between 0 and 60 -- **not** a margin calculated for a
+     specific scenario. An earlier version of this note claimed it left
+     "margin for partial-year coverage" (e.g. a blockface newly added
+     mid-year); that claim was checked directly against the real archive and
+     didn't hold up. The most extreme late-starting element found (first
+     reading 2025-10-21, nothing later exists in the archive) still lands at
+     120 for that bucket, not near 30. The shortest-lived element found
+     (only 8 days of coverage total) lands at exactly 0, not a small nonzero
+     number, because its window happened not to include a populated
+     occurrence of that bucket at all. Every real partial-coverage case
+     actually found rounds either up into the 60+ range or down to 0 -- none
+     landed between 1 and 59. A genuinely sparse partial-year case (e.g. a
+     blockface live for only 2-3 weeks, extrapolating the ~11-12
+     readings-per-occurrence rate seen on the sparser real elements) remains
+     a plausible scenario that could someday land near 30, but it's
+     unverified, not something actually observed -- worth revisiting if real
+     data ever surfaces one.
 
   Deliberately no hard window (e.g. "only readings within N days of the
   seasonal anniversary") -- a hard cutoff would arbitrarily discard
