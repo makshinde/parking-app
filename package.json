@@ -6,7 +6,8 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "import:blockfaces": "node src/importers/import-blockfaces.ts"
+    "import:blockfaces": "node src/importers/import-blockfaces.ts",
+    "import:off-street-facilities": "node src/importers/import-off-street-facilities.ts"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
