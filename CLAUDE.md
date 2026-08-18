@@ -94,12 +94,15 @@ function can have multiple kinds of input.
 
 ## Known open questions
 
-- 418 of the pay-station SEGKEYs have only one recorded side, meaning
-  we don't yet know whether the other side of those blocks genuinely
-  has no paid parking, or whether it's a real gap in the source data.
-  Must be resolved when writing the import/aggregation script, don't
-  silently assume "no paid parking" for missing sides without checking
-  against curb-spaces SPACETYPE='PS' rows for that ELMNTKEY first.
+- RESOLVED (was: "418 of the pay-station SEGKEYs have only one recorded
+  side"): the full live import run (import-blockfaces.ts, no --limit)
+  resolved this. Of the single-sided segments, only 29 were genuine
+  DATA_GAP cases (curb-spaces shows SPACETYPE='PS' evidence but no matching
+  pay-station record); the rest resolved cleanly as either UNPAID_CONFIRMED
+  (confirmed no paid parking on that side) or PAID (a pay station did exist,
+  just not flagged by the original 418 estimate's method). 29 is the real,
+  current count of unresolved DATA_GAP blockfaces -- see
+  resolveBlockfaceSides.ts's console.warn output for exactly which ones.
 - off_street_facilities data (Public Garages and Parking Lots dataset) has
   only ~2-4% coverage on rate, operator, and facility_type fields, and 0%
   on payment_type. Capacity (99%) and address (97%) are reliable. Any code
@@ -143,6 +146,33 @@ function can have multiple kinds of input.
   resolveBlockfaceSides.ts's Side type model all 8 directions (see
   migrations/006_expand_side_of_street_directions.sql); code must not assume
   only 4 are possible.
+- The full live import run (import-blockfaces.ts, no --limit) skipped 48
+  ELMNTKEYs. None of these are in scope to fix right now -- documented here
+  as known, small, real gaps, not silently dropped data:
+  1. The majority are duplicate pay-station records for the same
+     ELMNTKEY/side. resolveBlockfaceSides.ts's assertNoDuplicatePayStationSides
+     currently rejects any duplicate outright (throws), on the reasoning that
+     a segment should have at most one pay-station record per side and more
+     than one signals a bad join. But earlier live analysis of duplicates
+     showed that, for a given ELMNTKEY, duplicate pay-station records tend to
+     have matching rates -- i.e. often genuinely the same real-world pay
+     station appearing twice in the source data, not a join bug. Worth
+     considering relaxing this check to accept duplicates when their rates
+     agree, and only reject when they genuinely conflict (different rates for
+     the same ELMNTKEY/side). Not done yet -- these ELMNTKEYs are still
+     skipped as-is.
+  2. A handful of ELMNTKEYs have a SEGKEY with no matching Streets record.
+     This is a genuine small gap in the source city data (Seattle Streets
+     simply doesn't have a row for that COMPKEY) -- not something fixable in
+     our code, since there's no street name/cross-streets/geometry to
+     assemble a blockface from.
+  3. Two one-off anomalies worth a closer look eventually, but not urgent:
+     one record with SIDE="C", which isn't one of the 8 valid compass
+     directions; and one record with a rate set but no matching time window
+     (SAT_RATE1 present, SAT_START1/SAT_END1 both null) -- extractRateTiers
+     in assembleBlockface.ts currently throws on exactly this shape (rate
+     without start/end), which is why it's skipped rather than assembled
+     with a guessed time window.
 
 ## Out of scope (v1)
 
