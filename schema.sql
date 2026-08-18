@@ -133,9 +133,14 @@ CREATE INDEX idx_rate_tiers_blockface_id ON rate_tiers (blockface_id);
 
 ALTER TABLE rate_tiers ENABLE ROW LEVEL SECURITY;
 
--- Precomputed historical occupancy stats, bucketed per blockface / day-of-week
--- / hour-of-day. This is the aggregate the confidence-score and prediction
--- logic reads from — raw observations live elsewhere and are rolled up here.
+-- Historical occupancy stats, bucketed per blockface / day-of-week /
+-- hour-of-day. NOT currently used: predictions are computed live at request
+-- time from a narrow live Socrata query instead of a precomputed table --
+-- see CLAUDE.md's Architecture section for the full request-time flow. This
+-- table remains as a documented, optional future caching layer only, in
+-- case live-query latency or Socrata rate limits ever become a real problem
+-- at scale. Nothing writes to it and no aggregation script exists or is
+-- planned for v1.
 CREATE TABLE occupancy_stats (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
 
@@ -167,7 +172,7 @@ CREATE TABLE occupancy_stats (
 );
 
 COMMENT ON TABLE occupancy_stats IS
-  'Precomputed historical occupancy statistics per blockface, bucketed by day-of-week and hour-of-day. Rebuilt periodically from raw historical observations; not written to per-request.';
+  'Historical occupancy statistics per blockface, bucketed by day-of-week and hour-of-day. NOT currently used -- predictions are computed live at request time from a narrow live Socrata query instead (see CLAUDE.md''s Architecture section). Kept as a documented, optional future caching layer only; nothing writes to this table and no aggregation script exists or is planned for v1.';
 COMMENT ON COLUMN occupancy_stats.mean_occupancy IS
   'Average fraction of capacity occupied in this bucket, 0 (empty) to 1 (full).';
 COMMENT ON COLUMN occupancy_stats.std_dev IS
