@@ -195,6 +195,14 @@ function can have multiple kinds of input.
   under the same key just overwrites the row with identical data, so 700
   raw records correctly collapse into 685 real rows. Not deduplicated in
   code, since the upsert already produces the correct result on its own.
+- Socrata's Paid Parking Occupancy dataset (rke9-rsvs and its yearly
+  archives) returns numeric fields -- paidoccupancy, parkingspacecount,
+  and others -- as strings, not numbers (live-verified, e.g.
+  "paidoccupancy": "1"). Whatever code eventually reads raw rows from this
+  dataset must explicitly parse these fields to numbers before passing them
+  to calculateOccupancyRatio.ts or calculateRecencyWeight.ts, both of which
+  expect real numbers, not numeric strings -- do not assume Socrata's JSON
+  API returns numbers already.
 
 ## Out of scope (v1)
 
