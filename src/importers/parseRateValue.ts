@@ -3,9 +3,11 @@ export interface ParsedRateValue {
   note: string | null;
 }
 
-// off_street_facilities' rate field (Public Garages and Parking Lots
-// dataset) is a free-text string, not a structured number -- most values are
-// plain numeric strings ("3", "4.9"), but some are genuine non-numeric text
+// Each of the Public Garages and Parking Lots dataset's 4 duration-based
+// rate fields (RTE_1HR/2HR/3HR/ALLDAY, one row per duration_type in
+// off_street_rate_tiers -- see migrations/008_add_off_street_rate_tiers.sql)
+// is a free-text string, not a structured number -- most values are plain
+// numeric strings ("3", "4.9"), but some are genuine non-numeric text
 // ("Permit only", "Call for rates") that describes real pricing information
 // which shouldn't be discarded just because it doesn't parse as a number.
 //
