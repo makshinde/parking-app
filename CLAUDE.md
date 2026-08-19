@@ -156,6 +156,28 @@ it.
   service-role key (used server-side by the batch job) can read or write
   it.
 
+  A bucket can fail during the main 91-combo run for reasons that have
+  nothing to do with the data itself -- a transient Socrata timeout, a
+  dropped connection to Supabase -- so a single failure shouldn't abort the
+  whole run or silently drop that bucket's result. Instead, failures are
+  logged durably as they happen, to occupancy_stats_backfill_failures
+  (schema.sql, migrations/010), one row per (blockface_id, iso_day, hour)
+  bucket. After the main run finishes, a final retry pass re-attempts every
+  row still in that table: a successful retry deletes its row (the failure
+  is resolved, nothing left to track), while a retry that fails again
+  updates that row's error_message and increments retry_count in place,
+  rather than accumulating duplicate rows for the same bucket. This keeps
+  the main run's failure handling durable (a crash mid-run doesn't lose
+  track of what already failed, the same motivation behind
+  occupancy_stats_backfill_progress) without making every individual
+  bucket failure block progress on the rest of the run.
+
+  occupancy_stats_backfill_failures has the same deliberately-zero-policy
+  RLS as occupancy_stats_backfill_progress and for the same reason: it
+  holds no parking data of public interest, only this project's own
+  job-failure bookkeeping, so only the service-role key can read or write
+  it.
+
 ## Handling invalid input
 
 Two categories, handled differently:
