@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildBlockfaceLookup,
   buildLookupKey,
+  extractIsoDayAndHour,
   normalizeReading,
 } from "./blockfaceLookup";
 import type { BlockfaceLookupRow, BlockfaceLookupSupabaseClient, RawReading } from "./blockfaceLookup";
@@ -159,5 +160,31 @@ describe("normalizeReading", () => {
     const reading = makeReading({ parkingSpaceCount: 0 });
 
     expect(() => normalizeReading(reading, lookup, new Date())).toThrow(/parkingSpaceCount must be a positive number/);
+  });
+});
+
+describe("extractIsoDayAndHour", () => {
+  it("matches the isoDay/hour normalizeReading computes for the same occupancyDateTime", () => {
+    const lookup = new Map([["81189:NW", "blockface-1"]]);
+    const reading = makeReading({ occupancyDateTime: "2026-07-30T17:38:00.000" });
+
+    const result = normalizeReading(reading, lookup, new Date("2026-08-02T17:38:00.000-07:00"));
+    const extracted = extractIsoDayAndHour(reading.occupancyDateTime);
+
+    expect(result.matched).toBe(true);
+    expect(extracted).toEqual({
+      isoDay: (result as { isoDay: number }).isoDay,
+      hour: (result as { hour: number }).hour,
+    });
+  });
+
+  // Same hand-verified Sunday=7 edge case as normalizeReading's own test
+  // above, exercised directly through this smaller entry point.
+  it("matches a hand-verified Sunday (2026-08-02, via Zeller's congruence)", () => {
+    expect(extractIsoDayAndHour("2026-08-02T09:00:00.000")).toEqual({ isoDay: 7, hour: 9 });
+  });
+
+  it("throws for a malformed occupancyDateTime, same as normalizeReading", () => {
+    expect(() => extractIsoDayAndHour("not-a-date")).toThrow(/does not match the expected/);
   });
 });

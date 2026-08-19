@@ -7,7 +7,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "import:blockfaces": "node src/importers/import-blockfaces.ts",
-    "import:off-street-facilities": "node src/importers/import-off-street-facilities.ts"
+    "import:off-street-facilities": "node src/importers/import-off-street-facilities.ts",
+    "backfill:occupancy-stats": "node src/aggregation/backfill-occupancy-stats.ts"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
