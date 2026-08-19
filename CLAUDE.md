@@ -312,12 +312,14 @@ function can have multiple kinds of input.
   code, since the upsert already produces the correct result on its own.
 - Socrata's Paid Parking Occupancy dataset (rke9-rsvs and its yearly
   archives) returns numeric fields -- paidoccupancy, parkingspacecount,
-  and others -- as strings, not numbers (live-verified, e.g.
-  "paidoccupancy": "1"). Whatever code eventually reads raw rows from this
-  dataset must explicitly parse these fields to numbers before passing them
-  to calculateOccupancyRatio.ts or calculateRecencyWeight.ts, both of which
-  expect real numbers, not numeric strings -- do not assume Socrata's JSON
-  API returns numbers already.
+  sourceelementkey, and others -- as strings, not numbers (live-verified,
+  e.g. "paidoccupancy": "1", "sourceelementkey": "9477"). Whatever code
+  eventually reads raw rows from this dataset must explicitly parse these
+  fields to numbers before passing them to calculateOccupancyRatio.ts or
+  calculateRecencyWeight.ts (which expect real numbers, not numeric
+  strings) or matching sourceelementkey against blockfaces.source_element_key
+  (an integer column) -- do not assume Socrata's JSON API returns numbers
+  already.
 - resolveYearlyArchiveDatasetId (src/aggregation/resolveYearlyArchive.ts)
   only has live-verified Socrata dataset IDs for 2020 ("wtpb-jp8d") and
   2025 ("7c2e-uany"). The live on-demand prediction flow's "5-day window
