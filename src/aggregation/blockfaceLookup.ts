@@ -121,6 +121,17 @@ function getIsoDayOfWeek(components: OccupancyDateTimeComponents): number {
   return jsDayToIsoDay(new Date(utcMidnightMillis).getUTCDay());
 }
 
+// Lightweight companion to normalizeReading for callers that only need a
+// reading's isoDay/hour bucket -- e.g. partitioning a large batch of raw
+// readings by bucket before matching each one to a blockface -- without
+// paying for blockface lookup or the DST-aware ageInDays resolution below.
+// Reuses the same parsing/day-of-week logic normalizeReading itself uses,
+// so the two can never drift out of sync with each other.
+export function extractIsoDayAndHour(occupancyDateTime: string): { isoDay: number; hour: number } {
+  const components = parseOccupancyDateTimeComponents(occupancyDateTime);
+  return { isoDay: getIsoDayOfWeek(components), hour: components.hour };
+}
+
 const SOURCE_TIME_ZONE = "America/Los_Angeles";
 const MS_PER_MINUTE = 60_000;
 const MS_PER_DAY = 24 * 60 * MS_PER_MINUTE;
