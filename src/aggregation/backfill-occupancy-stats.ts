@@ -588,9 +588,24 @@ export async function runMainPass(combos: BucketCombo[], deps: RunMainPassDeps):
 
 // --- Final retry pass over occupancy_stats_backfill_failures ---------------
 
+// A row that has already failed this many times is far more likely a
+// persistent problem (a bad blockface_id, a schema mismatch) than a
+// transient one (a dropped connection) -- retrying it indefinitely every
+// run would just spend requests re-confirming the same failure. Left in
+// occupancy_stats_backfill_failures untouched once past this limit, so a
+// human can find and investigate it rather than it silently retrying
+// forever.
+export const MAX_RETRY_COUNT = 10;
+
 export interface RetryPassSummary {
   retriedSuccessfully: number;
+  // Failed again this pass (or had no stats to retry with), but still
+  // under MAX_RETRY_COUNT -- eligible to be retried again next run.
   remainingFailures: number;
+  // Not attempted this pass at all, because retry_count was already >=
+  // MAX_RETRY_COUNT -- a persistent failure that needs manual investigation,
+  // tracked separately so it doesn't read as just another transient one.
+  exceededRetryLimit: number;
 }
 
 export interface RetryPassClients {
@@ -602,7 +617,9 @@ export interface RetryPassClients {
 // its already-stored statistics -- no re-fetching from Socrata or
 // re-aggregating. A successful retry deletes the row (resolved, nothing
 // left to track); a repeat failure updates error_message and increments
-// retry_count in place rather than accumulating duplicates.
+// retry_count in place rather than accumulating duplicates. A row already
+// at or past MAX_RETRY_COUNT is skipped entirely (not attempted, not
+// updated) rather than retried indefinitely.
 export async function runRetryPass(clients: RetryPassClients): Promise<RetryPassSummary> {
   const { data: rows, error } = await clients.failuresClient
     .from("occupancy_stats_backfill_failures")
@@ -614,8 +631,14 @@ export async function runRetryPass(clients: RetryPassClients): Promise<RetryPass
 
   let retriedSuccessfully = 0;
   let remainingFailures = 0;
+  let exceededRetryLimit = 0;
 
   for (const row of rows ?? []) {
+    if (row.retry_count >= MAX_RETRY_COUNT) {
+      exceededRetryLimit += 1;
+      continue;
+    }
+
     // The schema allows null stats for a failure logged before aggregation
     // ever completed (schema.sql's own column comment); this orchestration
     // script never actually produces one (logBucketFailure is only called
@@ -663,7 +686,7 @@ export async function runRetryPass(clients: RetryPassClients): Promise<RetryPass
     }
   }
 
-  return { retriedSuccessfully, remainingFailures };
+  return { retriedSuccessfully, remainingFailures, exceededRetryLimit };
 }
 
 // --- Overall summary --------------------------------------------------------
@@ -674,15 +697,17 @@ export interface OverallSummary {
   skippedInsufficientData: number;
   unmatched: number;
   remainingFailures: number;
+  exceededRetryLimit: number;
 }
 
 function logOverallSummary(summary: OverallSummary): void {
   console.log("\n=== backfill-occupancy-stats overall summary ===");
-  console.log(`Combinations processed:          ${summary.combosProcessed}`);
-  console.log(`Blocks written:                  ${summary.written}`);
-  console.log(`Skipped (insufficient data):     ${summary.skippedInsufficientData}`);
-  console.log(`Unmatched readings:              ${summary.unmatched}`);
-  console.log(`Failures remaining after retry:  ${summary.remainingFailures}`);
+  console.log(`Combinations processed:            ${summary.combosProcessed}`);
+  console.log(`Blocks written:                    ${summary.written}`);
+  console.log(`Skipped (insufficient data):       ${summary.skippedInsufficientData}`);
+  console.log(`Unmatched readings:                ${summary.unmatched}`);
+  console.log(`Failures still eligible for retry: ${summary.remainingFailures}`);
+  console.log(`Failures needing manual investigation (>= ${MAX_RETRY_COUNT} retries): ${summary.exceededRetryLimit}`);
   console.log("==================================================\n");
 }
 
@@ -787,7 +812,9 @@ export async function main(): Promise<void> {
 
   console.log("\nRunning final retry pass over occupancy_stats_backfill_failures...");
   const retryPassSummary = await runRetryPass({ occupancyStatsClient, failuresClient });
-  console.log(`Retry pass: ${retryPassSummary.retriedSuccessfully} succeeded, ${retryPassSummary.remainingFailures} still failing.`);
+  console.log(
+    `Retry pass: ${retryPassSummary.retriedSuccessfully} succeeded, ${retryPassSummary.remainingFailures} still eligible for retry, ${retryPassSummary.exceededRetryLimit} exceeded the retry limit (>= ${MAX_RETRY_COUNT}) and need manual investigation.`,
+  );
 
   logOverallSummary({
     combosProcessed: combosToRun.length,
@@ -795,6 +822,7 @@ export async function main(): Promise<void> {
     skippedInsufficientData: mainPassSummary.skippedInsufficientData,
     unmatched: mainPassSummary.unmatched,
     remainingFailures: retryPassSummary.remainingFailures,
+    exceededRetryLimit: retryPassSummary.exceededRetryLimit,
   });
 }
 

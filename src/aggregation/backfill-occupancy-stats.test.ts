@@ -10,6 +10,7 @@ import {
   fetchProgressStatuses,
   logBucketFailure,
   markComboStatus,
+  MAX_RETRY_COUNT,
   parseCliOptions,
   parseRawReading,
   parseRawReadings,
@@ -810,9 +811,91 @@ describe("runRetryPass", () => {
 
     const summary = await runRetryPass({ occupancyStatsClient, failuresClient });
 
-    expect(summary).toEqual({ retriedSuccessfully: 1, remainingFailures: 0 });
+    expect(summary).toEqual({ retriedSuccessfully: 1, remainingFailures: 0, exceededRetryLimit: 0 });
     expect(upsertCalls[0]).toMatchObject({ blockface_id: "bf-1", day_of_week: 1, hour_of_day: 8, mean_occupancy: 0.5 });
     expect(deleteCalls).toEqual(["f-1"]);
+  });
+
+  it("retries a row below MAX_RETRY_COUNT normally", async () => {
+    const row: BackfillFailuresRow = {
+      id: "f-1",
+      blockface_id: "bf-1",
+      iso_day: 1,
+      hour: 8,
+      mean_occupancy: 0.5,
+      std_dev: 0.1,
+      sample_count: 100,
+      error_message: "old error",
+      retry_count: MAX_RETRY_COUNT - 1,
+    };
+    const { client: failuresClient, deleteCalls } = createMockFailuresClient({ rowsForRetryPass: [row] });
+    const { client: occupancyStatsClient, upsertCalls } = createMockOccupancyStatsClient();
+
+    const summary = await runRetryPass({ occupancyStatsClient, failuresClient });
+
+    expect(summary).toEqual({ retriedSuccessfully: 1, remainingFailures: 0, exceededRetryLimit: 0 });
+    expect(upsertCalls).toHaveLength(1);
+    expect(deleteCalls).toEqual(["f-1"]);
+  });
+
+  it("skips a row at exactly MAX_RETRY_COUNT without attempting a retry", async () => {
+    const row: BackfillFailuresRow = {
+      id: "f-1",
+      blockface_id: "bf-1",
+      iso_day: 1,
+      hour: 8,
+      mean_occupancy: 0.5,
+      std_dev: 0.1,
+      sample_count: 100,
+      error_message: "old error",
+      retry_count: MAX_RETRY_COUNT,
+    };
+    const { client: failuresClient, deleteCalls, upsertCalls: failureUpsertCalls } = createMockFailuresClient({ rowsForRetryPass: [row] });
+    const { client: occupancyStatsClient, upsertCalls } = createMockOccupancyStatsClient();
+
+    const summary = await runRetryPass({ occupancyStatsClient, failuresClient });
+
+    expect(summary).toEqual({ retriedSuccessfully: 0, remainingFailures: 0, exceededRetryLimit: 1 });
+    // Not attempted at all: no occupancy_stats write, no delete, no
+    // failure-row update -- the row is left exactly as-is for a human to
+    // find, not retried and not silently modified.
+    expect(upsertCalls).toHaveLength(0);
+    expect(deleteCalls).toHaveLength(0);
+    expect(failureUpsertCalls).toHaveLength(0);
+  });
+
+  it("separates remaining-eligible failures from exceeded-limit failures in the same pass", async () => {
+    const eligibleRow: BackfillFailuresRow = {
+      id: "f-eligible",
+      blockface_id: "bf-eligible",
+      iso_day: 1,
+      hour: 8,
+      mean_occupancy: 0.5,
+      std_dev: 0.1,
+      sample_count: 100,
+      error_message: "old error",
+      retry_count: 2,
+    };
+    const exceededRow: BackfillFailuresRow = {
+      id: "f-exceeded",
+      blockface_id: "bf-exceeded",
+      iso_day: 2,
+      hour: 9,
+      mean_occupancy: 0.4,
+      std_dev: 0.2,
+      sample_count: 200,
+      error_message: "persistent error",
+      retry_count: MAX_RETRY_COUNT,
+    };
+    const { client: failuresClient } = createMockFailuresClient({ rowsForRetryPass: [eligibleRow, exceededRow] });
+    // Both blockfaces fail the upsert -- eligibleRow should still be
+    // attempted and counted as remaining, exceededRow should not be
+    // attempted at all and counted separately.
+    const { client: occupancyStatsClient } = createMockOccupancyStatsClient(new Set(["bf-eligible", "bf-exceeded"]));
+
+    const summary = await runRetryPass({ occupancyStatsClient, failuresClient });
+
+    expect(summary).toEqual({ retriedSuccessfully: 0, remainingFailures: 1, exceededRetryLimit: 1 });
   });
 
   it("updates error_message and increments retry_count on a repeat failure, without deleting", async () => {
@@ -832,7 +915,7 @@ describe("runRetryPass", () => {
 
     const summary = await runRetryPass({ occupancyStatsClient, failuresClient });
 
-    expect(summary).toEqual({ retriedSuccessfully: 0, remainingFailures: 1 });
+    expect(summary).toEqual({ retriedSuccessfully: 0, remainingFailures: 1, exceededRetryLimit: 0 });
     expect(deleteCalls).toHaveLength(0);
     expect(failureUpsertCalls[0]).toMatchObject({ retry_count: 2, error_message: expect.stringContaining("simulated failure") });
   });
@@ -854,7 +937,7 @@ describe("runRetryPass", () => {
 
     const summary = await runRetryPass({ occupancyStatsClient, failuresClient });
 
-    expect(summary).toEqual({ retriedSuccessfully: 0, remainingFailures: 1 });
+    expect(summary).toEqual({ retriedSuccessfully: 0, remainingFailures: 1, exceededRetryLimit: 0 });
     expect(upsertCalls).toHaveLength(0);
   });
 
@@ -864,7 +947,7 @@ describe("runRetryPass", () => {
 
     const summary = await runRetryPass({ occupancyStatsClient, failuresClient });
 
-    expect(summary).toEqual({ retriedSuccessfully: 0, remainingFailures: 0 });
+    expect(summary).toEqual({ retriedSuccessfully: 0, remainingFailures: 0, exceededRetryLimit: 0 });
   });
 
   it("throws a clear error when reading occupancy_stats_backfill_failures itself fails", async () => {
