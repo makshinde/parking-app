@@ -3,8 +3,10 @@ import {
   accumulateComboSummary,
   buildAllBucketCombos,
   buildBucketWhereClause,
+  buildRollingBucketsForCombo,
   bucketComboKey,
   createEmptyComboSummary,
+  fetchOperatingHourRange,
   fetchProgressStatuses,
   logBucketFailure,
   markComboStatus,
@@ -23,6 +25,7 @@ import type {
   BackfillProgressSupabaseClient,
   BackfillProgressStatusRow,
   ComboSummary,
+  OperatingHoursSupabaseClient,
 } from "./backfill-occupancy-stats.ts";
 import type { RawReading } from "./blockfaceLookup.ts";
 import type { OccupancyStatsSupabaseClient } from "./upsertOccupancyStats.ts";
@@ -57,28 +60,118 @@ describe("parseCliOptions", () => {
 // --- buildAllBucketCombos / bucketComboKey ------------------------------
 
 describe("buildAllBucketCombos", () => {
-  it("builds exactly 91 combos (7 days * 13 operating hours, 8am-9pm)", () => {
-    const combos = buildAllBucketCombos();
-    expect(combos).toHaveLength(91);
+  it("builds 7 days * N hours for the given hour range, inclusive", () => {
+    const combos = buildAllBucketCombos({ startHour: 8, endHour: 21 });
+    expect(combos).toHaveLength(7 * 14); // 8..21 inclusive = 14 hours
   });
 
-  it("spans ISO days 1-7 and hours 8-20 inclusive, with no duplicates", () => {
-    const combos = buildAllBucketCombos();
+  it("spans ISO days 1-7 and the given hour range, with no duplicates", () => {
+    const combos = buildAllBucketCombos({ startHour: 8, endHour: 21 });
     const keys = new Set(combos.map(bucketComboKey));
-    expect(keys.size).toBe(91);
+    expect(keys.size).toBe(7 * 14);
 
     const days = new Set(combos.map((c) => c.isoDay));
     expect(days).toEqual(new Set([1, 2, 3, 4, 5, 6, 7]));
 
     const hours = new Set(combos.map((c) => c.hour));
     expect(Math.min(...hours)).toBe(8);
-    expect(Math.max(...hours)).toBe(20);
+    expect(Math.max(...hours)).toBe(21);
+  });
+
+  it("handles a single-hour range", () => {
+    const combos = buildAllBucketCombos({ startHour: 9, endHour: 9 });
+    expect(combos).toHaveLength(7);
+    expect(new Set(combos.map((c) => c.hour))).toEqual(new Set([9]));
   });
 });
 
 describe("bucketComboKey", () => {
   it("joins isoDay and hour with a colon", () => {
     expect(bucketComboKey({ isoDay: 3, hour: 14 })).toBe("3:14");
+  });
+});
+
+// --- fetchOperatingHourRange -----------------------------------------------
+
+function createMockOperatingHoursClient(options: {
+  minStartRows?: Record<string, string>[];
+  minStartError?: { message: string } | null;
+  maxEndRows?: Record<string, string>[];
+  maxEndError?: { message: string } | null;
+}) {
+  const orCalls: string[] = [];
+  const orderCalls: { column: string; ascending: boolean }[] = [];
+
+  const client: OperatingHoursSupabaseClient = {
+    from: () => ({
+      select: (columns: string) => ({
+        or: (filter: string) => {
+          orCalls.push(filter);
+          return {
+            order: (column: string, opts: { ascending: boolean }) => {
+              orderCalls.push({ column, ascending: opts.ascending });
+              return {
+                limit: async () => {
+                  const isStartQuery = columns === "operating_hours_start";
+                  if (isStartQuery) {
+                    return options.minStartError !== undefined && options.minStartError !== null
+                      ? { data: null, error: options.minStartError }
+                      : { data: options.minStartRows ?? [], error: null };
+                  }
+                  return options.maxEndError !== undefined && options.maxEndError !== null
+                    ? { data: null, error: options.maxEndError }
+                    : { data: options.maxEndRows ?? [], error: null };
+                },
+              };
+            },
+          };
+        },
+      }),
+    }),
+  };
+
+  return { client, orCalls, orderCalls };
+}
+
+describe("fetchOperatingHourRange", () => {
+  it("returns the hour components of the min start and max end, excluding placeholder rows", async () => {
+    const { client, orCalls, orderCalls } = createMockOperatingHoursClient({
+      minStartRows: [{ operating_hours_start: "08:00:00" }],
+      maxEndRows: [{ operating_hours_end: "21:59:00" }],
+    });
+
+    const range = await fetchOperatingHourRange(client);
+
+    expect(range).toEqual({ startHour: 8, endHour: 21 });
+    // Both queries exclude the exact 00:00/23:59 placeholder pair via
+    // De Morgan's law (start<>00:00 OR end<>23:59), since aggregate
+    // functions are disabled on this Supabase project.
+    expect(orCalls).toEqual([
+      "operating_hours_start.neq.00:00,operating_hours_end.neq.23:59",
+      "operating_hours_start.neq.00:00,operating_hours_end.neq.23:59",
+    ]);
+    expect(orderCalls).toEqual([
+      { column: "operating_hours_start", ascending: true },
+      { column: "operating_hours_end", ascending: false },
+    ]);
+  });
+
+  it("throws a clear error when the min-start query fails", async () => {
+    const { client } = createMockOperatingHoursClient({ minStartError: { message: "connection reset" } });
+    await expect(fetchOperatingHourRange(client)).rejects.toThrow(/minimum operating_hours_start.*connection reset/s);
+  });
+
+  it("throws a clear error when the max-end query fails", async () => {
+    const { client } = createMockOperatingHoursClient({
+      minStartRows: [{ operating_hours_start: "08:00:00" }],
+      maxEndError: { message: "connection reset" },
+    });
+    await expect(fetchOperatingHourRange(client)).rejects.toThrow(/maximum operating_hours_end.*connection reset/s);
+  });
+
+  it("throws when no rows have a genuine (non-placeholder) schedule", async () => {
+    const { client } = createMockOperatingHoursClient({ minStartRows: [], maxEndRows: [] });
+    await expect(fetchOperatingHourRange(client)).rejects.toThrow(/no blockfaces rows have a genuine/);
   });
 });
 
@@ -197,6 +290,43 @@ describe("partitionByBucket", () => {
     const { buckets, parseFailures } = partitionByBucket([]);
     expect(buckets.size).toBe(0);
     expect(parseFailures).toBe(0);
+  });
+});
+
+describe("buildRollingBucketsForCombo", () => {
+  it("fetches only the given combo's slice, using the same server-side where clause as the archive", async () => {
+    const combo = { isoDay: 4, hour: 17 };
+    const whereClauses: string[] = [];
+    const fetchRollingRecords = async (whereClause: string) => {
+      whereClauses.push(whereClause);
+      return [makeRawRecord(), makeRawRecord()];
+    };
+
+    const { buckets, parseFailures } = await buildRollingBucketsForCombo(combo, fetchRollingRecords);
+
+    expect(whereClauses).toEqual([buildBucketWhereClause(combo)]);
+    expect(buckets.size).toBe(1);
+    expect(buckets.get(bucketComboKey(combo))).toHaveLength(2);
+    expect(parseFailures).toBe(0);
+  });
+
+  it("counts unparseable records without throwing", async () => {
+    const combo = { isoDay: 4, hour: 17 };
+    const fetchRollingRecords = async () => [makeRawRecord(), makeRawRecord({ paidoccupancy: "not-a-number" })];
+
+    const { buckets, parseFailures } = await buildRollingBucketsForCombo(combo, fetchRollingRecords);
+
+    expect(buckets.get(bucketComboKey(combo))).toHaveLength(1);
+    expect(parseFailures).toBe(1);
+  });
+
+  it("propagates a failure in the fetch itself", async () => {
+    const combo = { isoDay: 4, hour: 17 };
+    const fetchRollingRecords = async () => {
+      throw new Error("socrata request failed");
+    };
+
+    await expect(buildRollingBucketsForCombo(combo, fetchRollingRecords)).rejects.toThrow("socrata request failed");
   });
 });
 

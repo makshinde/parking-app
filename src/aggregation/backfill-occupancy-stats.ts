@@ -17,23 +17,17 @@ import { upsertOccupancyStats, type OccupancyStatsSupabaseClient } from "./upser
 
 // The current, not-yet-archived Paid Parking Occupancy dataset (see
 // CLAUDE.md's Architecture section) -- unlike wtpb-jp8d/7c2e-uany (full,
-// closed calendar years), this one keeps growing, so it's fetched in a
-// single bulk pull rather than 91 separate per-bucket queries against it
-// (see partitionByBucket's comment for why).
+// closed calendar years), this one keeps growing, so for the full run it's
+// fetched in a single bulk pull rather than one per-bucket query per
+// combination (see partitionByBucket's comment for why). A --combo test
+// run instead fetches only that one bucket's slice (see
+// buildRollingBucketsForCombo).
 const ROLLING_WINDOW_DATASET_ID = "rke9-rsvs";
 const SOCRATA_BASE_URL = "https://data.seattle.gov/resource";
 
 function buildSocrataDatasetUrl(datasetId: string): string {
   return `${SOCRATA_BASE_URL}/${datasetId}.json`;
 }
-
-// Seattle's paid parking operates 8am-9pm -- live-verified via the full
-// rke9-rsvs dataset's hour distribution (see blockfaceLookup.ts's
-// occupancydatetime comment). 7 days * 13 hours (8..20 inclusive) = 91
-// bucket combinations, matching CLAUDE.md's documented "91 queries per
-// year" batch job design.
-const OPERATING_HOUR_START = 8;
-const OPERATING_HOUR_END = 20;
 
 export interface BucketCombo {
   isoDay: number;
@@ -44,14 +38,97 @@ export function bucketComboKey(combo: BucketCombo): string {
   return `${combo.isoDay}:${combo.hour}`;
 }
 
-export function buildAllBucketCombos(): BucketCombo[] {
+export interface OperatingHourRange {
+  startHour: number;
+  endHour: number;
+}
+
+export function buildAllBucketCombos(hourRange: OperatingHourRange): BucketCombo[] {
   const combos: BucketCombo[] = [];
   for (let isoDay = 1; isoDay <= 7; isoDay++) {
-    for (let hour = OPERATING_HOUR_START; hour <= OPERATING_HOUR_END; hour++) {
+    for (let hour = hourRange.startHour; hour <= hourRange.endHour; hour++) {
       combos.push({ isoDay, hour });
     }
   }
   return combos;
+}
+
+// --- Operating hour range (derived from blockfaces, not hardcoded) --------
+
+// blockfaces rows created for UNPAID_CONFIRMED/DATA_GAP elements with no
+// genuine posted schedule default to this exact pair (schema.sql), not a
+// real observed start/end -- excluded via De Morgan's law (NOT(start=00:00
+// AND end=23:59) == start<>00:00 OR end<>23:59), since this Supabase
+// project has aggregate functions disabled (PGRST123 on MIN()/MAX()), so
+// .or() combined with .neq() is what's actually available server-side.
+const EXCLUDE_PLACEHOLDER_HOURS_FILTER = "operating_hours_start.neq.00:00,operating_hours_end.neq.23:59";
+
+function parseHourComponent(time: string): number {
+  const match = /^(\d{2}):/.exec(time);
+  if (match === null || match[1] === undefined) {
+    throw new Error(`parseHourComponent: unexpected time format "${time}"`);
+  }
+  return Number(match[1]);
+}
+
+export interface OperatingHoursSupabaseTableBuilder {
+  select(columns: string): {
+    or(filter: string): {
+      order(column: string, options: { ascending: boolean }): {
+        limit(count: number): PromiseLike<SupabaseQueryResult<Record<string, string>[]>>;
+      };
+    };
+  };
+}
+
+export interface OperatingHoursSupabaseClient {
+  from(table: string): OperatingHoursSupabaseTableBuilder;
+}
+
+// Derives the real operating-hour envelope from blockfaces' own posted
+// schedules, live-verified against the real database (2792 rows total,
+// 1251 carrying the placeholder pair, 1541 with a genuine schedule): every
+// genuine row starts at exactly 08:00, but the latest genuine end time is
+// 21:59 -- later than an earlier hardcoded assumption (8am-9pm) based only
+// on where historical readings happened to cluster, not on blockfaces' own
+// posted hours. Queried with order+limit=1 rather than MIN()/MAX() since
+// aggregate functions are disabled on this Supabase project.
+export async function fetchOperatingHourRange(client: OperatingHoursSupabaseClient): Promise<OperatingHourRange> {
+  const { data: minStartRows, error: minStartError } = await client
+    .from("blockfaces")
+    .select("operating_hours_start")
+    .or(EXCLUDE_PLACEHOLDER_HOURS_FILTER)
+    .order("operating_hours_start", { ascending: true })
+    .limit(1);
+
+  if (minStartError !== null) {
+    throw new Error(`backfill-occupancy-stats: reading blockfaces' minimum operating_hours_start failed: ${minStartError.message}`);
+  }
+
+  const { data: maxEndRows, error: maxEndError } = await client
+    .from("blockfaces")
+    .select("operating_hours_end")
+    .or(EXCLUDE_PLACEHOLDER_HOURS_FILTER)
+    .order("operating_hours_end", { ascending: false })
+    .limit(1);
+
+  if (maxEndError !== null) {
+    throw new Error(`backfill-occupancy-stats: reading blockfaces' maximum operating_hours_end failed: ${maxEndError.message}`);
+  }
+
+  const minStart = minStartRows?.[0]?.operating_hours_start;
+  const maxEnd = maxEndRows?.[0]?.operating_hours_end;
+  if (minStart === undefined || maxEnd === undefined) {
+    // No meaningful envelope to derive without at least one genuine
+    // (non-placeholder) schedule -- there's no sensible default to fall
+    // back to here (a hardcoded guess is exactly what this function exists
+    // to replace), so this throws rather than silently picking one.
+    throw new Error(
+      "backfill-occupancy-stats: no blockfaces rows have a genuine (non-placeholder) operating-hours schedule -- cannot derive an operating-hour range",
+    );
+  }
+
+  return { startHour: parseHourComponent(minStart), endHour: parseHourComponent(maxEnd) };
 }
 
 // --- CLI options --------------------------------------------------------
@@ -164,10 +241,10 @@ export interface PartitionByBucketResult {
   parseFailures: number;
 }
 
-// The rolling window is fetched once in full (tens of millions of rows) and
-// sorted into its 91 buckets up front here, so each combination's main-loop
-// iteration does an instant Map lookup rather than re-scanning the entire
-// rolling window 91 times.
+// For the full run, the rolling window is fetched once in full (tens of
+// millions of rows) and sorted into its buckets up front here, so each
+// combination's main-loop iteration does an instant Map lookup rather than
+// re-scanning the entire rolling window once per combo.
 export function partitionByBucket(readings: RawReading[]): PartitionByBucketResult {
   const buckets = new Map<string, RawReading[]>();
   let parseFailures = 0;
@@ -194,6 +271,22 @@ export function partitionByBucket(readings: RawReading[]): PartitionByBucketResu
   }
 
   return { buckets, parseFailures };
+}
+
+// For a --combo test run, fetching and partitioning the entire rolling
+// window just to use one bucket out of it would be wasteful -- this
+// applies the same server-side day/hour filtering used for the archive
+// (buildBucketWhereClause) to the rolling window too, so a --combo test
+// only pulls the one small, relevant slice from both sources. Returns the
+// same shape as partitionByBucket so main() can treat both paths uniformly.
+export async function buildRollingBucketsForCombo(
+  combo: BucketCombo,
+  fetchRollingRecords: (whereClause: string) => Promise<SocrataRecord[]>,
+): Promise<PartitionByBucketResult> {
+  const whereClause = buildBucketWhereClause(combo);
+  const rawRecords = await fetchRollingRecords(whereClause);
+  const { readings, parseFailures } = parseRawReadings(rawRecords);
+  return { buckets: new Map([[bucketComboKey(combo), readings]]), parseFailures };
 }
 
 // --- Progress bookkeeping (occupancy_stats_backfill_progress) -------------
@@ -609,7 +702,7 @@ function createSupabaseClient(url: string, serviceRoleKey: string) {
 
 export async function main(): Promise<void> {
   const { combo: singleCombo } = parseCliOptions(process.argv.slice(2));
-  console.log(singleCombo === null ? "Running the full 91-combo backfill." : `Running a single combo for testing: iso_day=${singleCombo.isoDay}, hour=${singleCombo.hour}.`);
+  console.log(singleCombo === null ? "Running the full backfill." : `Running a single combo for testing: iso_day=${singleCombo.isoDay}, hour=${singleCombo.hour}.`);
 
   const supabaseUrl = getRequiredEnvVar("SUPABASE_URL");
   const supabaseServiceRoleKey = getRequiredEnvVar("SUPABASE_SERVICE_ROLE_KEY");
@@ -630,28 +723,52 @@ export async function main(): Promise<void> {
   const occupancyStatsClient = rawSupabaseClient as unknown as OccupancyStatsSupabaseClient;
   const progressClient = rawSupabaseClient as unknown as BackfillProgressSupabaseClient;
   const failuresClient = rawSupabaseClient as unknown as BackfillFailuresSupabaseClient;
+  const operatingHoursClient = rawSupabaseClient as unknown as OperatingHoursSupabaseClient;
 
   const now = new Date();
   const priorYear = getPriorYear(now);
   const archiveDatasetId = resolveYearlyArchiveDatasetId(priorYear);
   console.log(`Using archive dataset ${archiveDatasetId} for year ${priorYear}.`);
 
-  console.log("Fetching the entire rolling window (this may take a while)...");
-  const rawRollingRecords = await fetchSocrataRecords(buildSocrataDatasetUrl(ROLLING_WINDOW_DATASET_ID), "1=1");
-  console.log(`Fetched ${rawRollingRecords.length} rolling-window records.`);
-  const { readings: rollingReadings, parseFailures: rollingRecordParseFailures } = parseRawReadings(rawRollingRecords);
-  const { buckets: rollingBuckets, parseFailures: rollingPartitionParseFailures } = partitionByBucket(rollingReadings);
-  const rollingParseFailures = rollingRecordParseFailures + rollingPartitionParseFailures;
-  console.log(`Partitioned the rolling window into ${rollingBuckets.size} buckets (${rollingParseFailures} unparseable records skipped).`);
+  // For a --combo test, only that one bucket's slice is needed from the
+  // rolling window -- fetched with the same server-side day/hour filtering
+  // as the archive, not the full unfiltered window. The full window is
+  // only fetched (and partitioned into every bucket up front) for the
+  // complete run, where every bucket needs it.
+  let rollingBuckets: Map<string, RawReading[]>;
+  let rollingParseFailures: number;
+  if (singleCombo !== null) {
+    console.log(`Fetching only the rolling-window slice for iso_day=${singleCombo.isoDay}, hour=${singleCombo.hour}...`);
+    const result = await buildRollingBucketsForCombo(singleCombo, (whereClause) =>
+      fetchSocrataRecords(buildSocrataDatasetUrl(ROLLING_WINDOW_DATASET_ID), whereClause),
+    );
+    rollingBuckets = result.buckets;
+    rollingParseFailures = result.parseFailures;
+    console.log(`Fetched ${rollingBuckets.get(bucketComboKey(singleCombo))?.length ?? 0} rolling-window records for this combo (${rollingParseFailures} unparseable records skipped).`);
+  } else {
+    console.log("Fetching the entire rolling window (this may take a while)...");
+    const rawRollingRecords = await fetchSocrataRecords(buildSocrataDatasetUrl(ROLLING_WINDOW_DATASET_ID), "1=1");
+    console.log(`Fetched ${rawRollingRecords.length} rolling-window records.`);
+    const { readings: rollingReadings, parseFailures: rollingRecordParseFailures } = parseRawReadings(rawRollingRecords);
+    const { buckets, parseFailures: rollingPartitionParseFailures } = partitionByBucket(rollingReadings);
+    rollingBuckets = buckets;
+    rollingParseFailures = rollingRecordParseFailures + rollingPartitionParseFailures;
+    console.log(`Partitioned the rolling window into ${rollingBuckets.size} buckets (${rollingParseFailures} unparseable records skipped).`);
+  }
 
   console.log("Building blockface lookup...");
   const lookup = await buildBlockfaceLookup(blockfaceLookupClient);
   console.log(`Loaded ${lookup.size} blockfaces.`);
 
-  const allCombos = singleCombo !== null ? [singleCombo] : buildAllBucketCombos();
+  let combosToRun: BucketCombo[];
+  if (singleCombo !== null) {
+    combosToRun = [singleCombo];
+  } else {
+    console.log("Deriving the real operating-hour range from blockfaces...");
+    const hourRange = await fetchOperatingHourRange(operatingHoursClient);
+    console.log(`Operating hours span ${hourRange.startHour}:00-${hourRange.endHour}:59, ${7 * (hourRange.endHour - hourRange.startHour + 1)} combos.`);
+    const allCombos = buildAllBucketCombos(hourRange);
 
-  let combosToRun = allCombos;
-  if (singleCombo === null) {
     console.log("Checking occupancy_stats_backfill_progress for already-complete combos...");
     const statuses = await fetchProgressStatuses(progressClient);
     combosToRun = selectCombosToRun(allCombos, statuses);
