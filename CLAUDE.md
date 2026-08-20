@@ -332,6 +332,37 @@ function can have multiple kinds of input.
   map, never guessed or assumed to follow the same naming pattern as an
   existing year -- Socrata dataset IDs are opaque codes with no
   relationship to the year they cover.
+- The Paid Parking Occupancy dataset (rke9-rsvs and its yearly archives)
+  appears to sample each blockface at a roughly fixed ~50-55 second cadence
+  regardless of actual activity: live analysis of one combo (iso_day=2,
+  hour=14, ~4.7M readings) grouped by (sourceelementkey, sideofstreet,
+  date) found the average reading count per blockface-hour-instance sits in
+  a narrow ~65-73 band across every parkingSpaceCount tier (1, 2, 3-5,
+  6-10, 11+) and, within each tier, across clamped, not-clamped, and
+  extreme (200%+) occupancy groups alike -- no group's average departed
+  meaningfully from that band. Reading count is therefore a proxy for this
+  dataset's sampling rate, not for turnover or activity level, and should
+  not be used as a stand-in for session/transaction density in future
+  analysis.
+
+  Separately, the most extreme occupancy overages found in that same
+  combo (paidOccupancy exceeding parkingSpaceCount by 500-600%) traced
+  exclusively to parkingSpaceCount=1 blockfaces, consistent with some form
+  of small-denominator stacking -- one hypothesis being overlapping paid
+  sessions (e.g. a car paying for a full hour but leaving early, followed
+  by another car paying for its own session in the same now-empty spot,
+  both counted as "occupied" for overlapping time). This hypothesis is
+  plausible but unconfirmed: a direct test of "small capacity + high
+  reading-density" against "small capacity alone" did not distinguish
+  extreme overages from ordinary ones, but per the sampling-cadence finding
+  above, reading count isn't a valid density signal in the first place, so
+  that test result neither confirms nor refutes the underlying mechanism --
+  it's inconclusive, not negative.
+
+  Neither finding requires a code change. calculateOccupancyRatio.ts's
+  existing clamp-to-1.0 handling (see src/aggregation/calculateOccupancyRatio.ts)
+  is correct and sufficient regardless of which mechanism, if any, turns
+  out to explain the overages.
 
 ## Out of scope (v1)
 
