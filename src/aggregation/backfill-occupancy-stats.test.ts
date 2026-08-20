@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   accumulateComboSummary,
+  analyzeClampedOccupancy,
   buildAllBucketCombos,
   buildBucketWhereClause,
   buildRollingBucketsForCombo,
@@ -579,6 +580,53 @@ const LOOKUP = new Map([["9477:W", "blockface-1"]]);
 function makeManyReadings(count: number, overrides: Partial<RawReading> = {}): RawReading[] {
   return Array.from({ length: count }, (_, i) => makeReading({ paidOccupancy: i % 8, ...overrides }));
 }
+
+// --- analyzeClampedOccupancy ---------------------------------------------
+
+describe("analyzeClampedOccupancy", () => {
+  it("returns null when nothing exceeds capacity", () => {
+    const readings = [makeReading({ paidOccupancy: 4, parkingSpaceCount: 8 }), makeReading({ paidOccupancy: 8, parkingSpaceCount: 8 })];
+    expect(analyzeClampedOccupancy(readings)).toBeNull();
+  });
+
+  it("returns null for an empty array, not an error", () => {
+    expect(analyzeClampedOccupancy([])).toBeNull();
+  });
+
+  it("counts readings exceeding capacity and reports the raw (unclamped) min/max ratio", () => {
+    const readings = [
+      makeReading({ paidOccupancy: 4, parkingSpaceCount: 8 }), // 50%, not clamped
+      makeReading({ paidOccupancy: 9, parkingSpaceCount: 8 }), // 112.5%, clamped
+      makeReading({ paidOccupancy: 24, parkingSpaceCount: 8 }), // 300%, clamped
+    ];
+
+    const summary = analyzeClampedOccupancy(readings);
+
+    expect(summary).not.toBeNull();
+    expect(summary?.count).toBe(2);
+    expect(summary?.minRatio).toBeCloseTo(1.125);
+    expect(summary?.maxRatio).toBeCloseTo(3);
+  });
+
+  it("does not count a reading exactly at capacity (ratio of exactly 1.0)", () => {
+    const readings = [makeReading({ paidOccupancy: 8, parkingSpaceCount: 8 })];
+    expect(analyzeClampedOccupancy(readings)).toBeNull();
+  });
+
+  it("does not count a reading with negative paidOccupancy (clamped to 0 by a different branch, not this one)", () => {
+    const readings = [makeReading({ paidOccupancy: -3, parkingSpaceCount: 8 })];
+    expect(analyzeClampedOccupancy(readings)).toBeNull();
+  });
+
+  it("excludes a reading with parkingSpaceCount <= 0, a separate structural error elsewhere, not a ratio to report here", () => {
+    const readings = [makeReading({ paidOccupancy: 5, parkingSpaceCount: 0 }), makeReading({ paidOccupancy: 9, parkingSpaceCount: 8 })];
+
+    const summary = analyzeClampedOccupancy(readings);
+
+    expect(summary?.count).toBe(1);
+    expect(summary?.minRatio).toBeCloseTo(1.125);
+  });
+});
 
 describe("processCombo", () => {
   it("combines archive and rolling readings, writing stats only once enough of both together clear the threshold", async () => {

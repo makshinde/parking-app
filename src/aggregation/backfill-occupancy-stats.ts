@@ -477,6 +477,59 @@ export interface ProcessComboDeps {
   now: Date;
 }
 
+export interface ClampedOccupancySummary {
+  count: number;
+  minRatio: number;
+  maxRatio: number;
+}
+
+// Detects readings whose raw occupancy ratio (paidOccupancy /
+// parkingSpaceCount) exceeds 1.0 -- the same condition
+// calculateOccupancyRatio.ts clamps to 1.0. Computed independently here
+// from each raw reading, not by having calculateOccupancyRatio report
+// back, so this stays a self-contained diagnostic pass with no coupling to
+// that function's internals (see its own comment for why it no longer
+// warns per call). Returns null when nothing was clamped, rather than a
+// zeroed-out summary with no meaningful range -- same "explicit absence
+// over a value that could be mistaken for a real one" reasoning
+// decideBucketStats uses for its own null return.
+export function analyzeClampedOccupancy(readings: RawReading[]): ClampedOccupancySummary | null {
+  let count = 0;
+  let minRatio = Infinity;
+  let maxRatio = -Infinity;
+
+  for (const reading of readings) {
+    // parkingSpaceCount <= 0 is a structural error calculateOccupancyRatio
+    // itself throws on (a separate, unrelated failure mode) -- excluded
+    // here rather than misclassified as "not clamped". A negative
+    // paidOccupancy is clamped to 0 by a different branch entirely (never
+    // this one), and is naturally excluded by paidOccupancy <=
+    // parkingSpaceCount below without needing its own check.
+    if (reading.parkingSpaceCount <= 0 || reading.paidOccupancy <= reading.parkingSpaceCount) {
+      continue;
+    }
+    const rawRatio = reading.paidOccupancy / reading.parkingSpaceCount;
+    count += 1;
+    minRatio = Math.min(minRatio, rawRatio);
+    maxRatio = Math.max(maxRatio, rawRatio);
+  }
+
+  return count === 0 ? null : { count, minRatio, maxRatio };
+}
+
+function formatRatioAsPercent(ratio: number): string {
+  return `${Math.round(ratio * 100)}%`;
+}
+
+function logClampedOccupancySummary(combo: BucketCombo, summary: ClampedOccupancySummary | null): void {
+  if (summary === null) {
+    return;
+  }
+  console.warn(
+    `backfill-occupancy-stats: iso_day=${combo.isoDay}, hour=${combo.hour}: ${summary.count} readings had occupancy exceeding capacity (clamped to 1.0), raw ratios ranged from ${formatRatioAsPercent(summary.minRatio)} to ${formatRatioAsPercent(summary.maxRatio)}`,
+  );
+}
+
 // Processes one blockface/day/hour bucket combination: fetches the
 // archive's matching rows (server-side filtered), combines them with the
 // bucket's already-partitioned rolling-window rows, groups by blockface,
@@ -495,6 +548,8 @@ export async function processCombo(combo: BucketCombo, deps: ProcessComboDeps): 
   summary.parseFailures += parseFailures;
 
   const allReadings = [...archiveReadings, ...deps.rollingReadings];
+  logClampedOccupancySummary(combo, analyzeClampedOccupancy(allReadings));
+
   const { grouped, unmatchedCount } = groupReadingsByBlockface(allReadings, deps.lookup, deps.now);
   summary.unmatched = unmatchedCount;
 
