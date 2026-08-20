@@ -13,7 +13,12 @@ import {
 } from "./blockfaceLookup.ts";
 import { groupReadingsByBlockface } from "./groupReadingsByBlockface.ts";
 import { decideBucketStats, type BucketStats } from "./decideBucketStats.ts";
-import { upsertOccupancyStats, type OccupancyStatsSupabaseClient } from "./upsertOccupancyStats.ts";
+import {
+  upsertOccupancyStats,
+  upsertOccupancyStatsBatch,
+  type OccupancyStatsSupabaseClient,
+  type OccupancyStatsWriteRequest,
+} from "./upsertOccupancyStats.ts";
 
 // The current, not-yet-archived Paid Parking Occupancy dataset (see
 // CLAUDE.md's Architecture section) -- unlike wtpb-jp8d/7c2e-uany (full,
@@ -533,12 +538,17 @@ function logClampedOccupancySummary(combo: BucketCombo, summary: ClampedOccupanc
 // Processes one blockface/day/hour bucket combination: fetches the
 // archive's matching rows (server-side filtered), combines them with the
 // bucket's already-partitioned rolling-window rows, groups by blockface,
-// and attempts to write each blockface's stats. A single blockface's write
-// failure is logged to occupancy_stats_backfill_failures and does not stop
-// the rest of this combination's blockfaces from being processed -- only a
-// failure in the archive fetch itself (thrown, not caught here) aborts the
-// whole combo, since that's a real "we don't have this bucket's data at
-// all" failure rather than one bad write among many good ones.
+// and writes every blockface's stats via upsertOccupancyStatsBatch (a small
+// number of batched upsert calls rather than one call per blockface --
+// live-benchmarked at ~88ms/call sequential versus ~0.3-0.65ms/row batched,
+// see upsertOccupancyStats.ts). A single blockface's write failure is still
+// logged individually to occupancy_stats_backfill_failures and does not
+// stop the rest of this combination's blockfaces from being written --
+// upsertOccupancyStatsBatch's own per-chunk fallback preserves that
+// isolation despite batching. Only a failure in the archive fetch itself
+// (thrown, not caught here) aborts the whole combo, since that's a real "we
+// don't have this bucket's data at all" failure rather than one bad write
+// among many good ones.
 export async function processCombo(combo: BucketCombo, deps: ProcessComboDeps): Promise<ComboSummary> {
   const summary = createEmptyComboSummary();
 
@@ -553,26 +563,27 @@ export async function processCombo(combo: BucketCombo, deps: ProcessComboDeps): 
   const { grouped, unmatchedCount } = groupReadingsByBlockface(allReadings, deps.lookup, deps.now);
   summary.unmatched = unmatchedCount;
 
+  const writeRequests: OccupancyStatsWriteRequest[] = [];
   for (const [blockfaceId, weightedReadings] of grouped) {
     const stats = decideBucketStats(weightedReadings);
     if (stats === null) {
       summary.skippedInsufficientData += 1;
       continue;
     }
+    writeRequests.push({ blockfaceId, isoDay: combo.isoDay, hour: combo.hour, stats });
+  }
 
-    try {
-      await upsertOccupancyStats(deps.occupancyStatsClient, blockfaceId, combo.isoDay, combo.hour, stats);
-      summary.written += 1;
-    } catch (error) {
-      summary.blockfaceFailures += 1;
-      await logBucketFailure(deps.failuresClient, {
-        blockfaceId,
-        isoDay: combo.isoDay,
-        hour: combo.hour,
-        stats,
-        errorMessage: error instanceof Error ? error.message : String(error),
-      });
-    }
+  const { writtenCount, failures } = await upsertOccupancyStatsBatch(deps.occupancyStatsClient, writeRequests);
+  summary.written += writtenCount;
+  summary.blockfaceFailures += failures.length;
+  for (const failure of failures) {
+    await logBucketFailure(deps.failuresClient, {
+      blockfaceId: failure.blockfaceId,
+      isoDay: failure.isoDay,
+      hour: failure.hour,
+      stats: failure.stats,
+      errorMessage: failure.errorMessage,
+    });
   }
 
   return summary;
