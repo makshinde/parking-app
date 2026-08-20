@@ -12,10 +12,13 @@ export interface BlockfaceLookupRow {
 
 // Minimal, table-name-generic client shape, same DI pattern as
 // upsertBlockface.ts/import-off-street-facilities.ts -- this is a plain
-// read (select with no filters), not an upsert, so it gets its own small
-// interface rather than reusing SupabaseTableBuilder's upsert-shaped one.
+// read (select with no filters, but paginated via .range()), not an
+// upsert, so it gets its own small interface rather than reusing
+// SupabaseTableBuilder's upsert-shaped one.
 export interface BlockfaceLookupSupabaseTableBuilder {
-  select(columns: string): PromiseLike<SupabaseQueryResult<BlockfaceLookupRow[]>>;
+  select(columns: string): {
+    range(from: number, to: number): PromiseLike<SupabaseQueryResult<BlockfaceLookupRow[]>>;
+  };
 }
 
 export interface BlockfaceLookupSupabaseClient {
@@ -28,20 +31,55 @@ export function buildLookupKey(sourceElementKey: number, sideOfStreet: string): 
   return `${sourceElementKey}:${sideOfStreet}`;
 }
 
-// Reads every blockfaces row's identity columns and builds an in-memory
-// lookup from (source_element_key, side_of_street) to id, so normalizing a
-// batch of raw readings doesn't need one DB round-trip per reading.
-export async function buildBlockfaceLookup(supabaseClient: BlockfaceLookupSupabaseClient): Promise<Map<string, string>> {
-  const { data, error } = await supabaseClient.from("blockfaces").select("id, source_element_key, side_of_street");
+// Supabase's PostgREST layer caps a single response at 1000 rows by
+// default regardless of how many rows actually match, silently -- live-
+// verified this session (blockfaces has 2792 real rows; an earlier,
+// unpaginated version of this function returned only the first 1000 with
+// no error or warning of any kind). Paginating via .range() keeps every
+// request comfortably under that default regardless of table size, same
+// page-then-stop-on-a-short-page pattern already used in
+// fetchArcGisFeatures.ts and fetchSocrataRecords.ts.
+const BLOCKFACE_LOOKUP_PAGE_SIZE = 1000;
+
+async function fetchBlockfaceLookupPage(supabaseClient: BlockfaceLookupSupabaseClient, offset: number): Promise<BlockfaceLookupRow[]> {
+  const { data, error } = await supabaseClient
+    .from("blockfaces")
+    .select("id, source_element_key, side_of_street")
+    .range(offset, offset + BLOCKFACE_LOOKUP_PAGE_SIZE - 1);
 
   if (error !== null) {
     throw new Error(`buildBlockfaceLookup: reading blockfaces failed: ${error.message}`);
   }
 
+  return data ?? [];
+}
+
+// Reads every blockfaces row's identity columns and builds an in-memory
+// lookup from (source_element_key, side_of_street) to id, so normalizing a
+// batch of raw readings doesn't need one DB round-trip per reading.
+export async function buildBlockfaceLookup(supabaseClient: BlockfaceLookupSupabaseClient): Promise<Map<string, string>> {
   const lookup = new Map<string, string>();
-  for (const row of data ?? []) {
-    lookup.set(buildLookupKey(row.source_element_key, row.side_of_street), row.id);
+  let offset = 0;
+
+  while (true) {
+    const page = await fetchBlockfaceLookupPage(supabaseClient, offset);
+    for (const row of page) {
+      lookup.set(buildLookupKey(row.source_element_key, row.side_of_street), row.id);
+    }
+
+    // A page with fewer rows than the page size is necessarily the last
+    // page. A page with exactly BLOCKFACE_LOOKUP_PAGE_SIZE rows might still
+    // be the last page (the table could happen to have a row count that's
+    // an exact multiple of the page size) -- row count alone can't
+    // distinguish that from "there's more," so this always requests the
+    // next offset after a full page and relies on a short page to stop,
+    // same reasoning as fetchSocrataRecords.ts's own pagination loop.
+    if (page.length < BLOCKFACE_LOOKUP_PAGE_SIZE) {
+      break;
+    }
+    offset += BLOCKFACE_LOOKUP_PAGE_SIZE;
   }
+
   return lookup;
 }
 
