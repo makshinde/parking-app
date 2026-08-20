@@ -7,17 +7,39 @@ import {
 } from "./blockfaceLookup";
 import type { BlockfaceLookupRow, BlockfaceLookupSupabaseClient, RawReading } from "./blockfaceLookup";
 
+// Mirrors real Supabase .range(from, to) semantics (inclusive range, sliced
+// against the full underlying row set) rather than ignoring the range
+// arguments and always returning everything -- a mock that did the latter
+// would pass even an unpaginated implementation, defeating the point of
+// testing pagination at all.
 function createMockClient(rows: BlockfaceLookupRow[], error: { message: string } | null = null) {
-  const select = async (_columns: string) => ({ data: error === null ? rows : null, error });
+  const rangeCalls: Array<{ from: number; to: number }> = [];
+  const select = (_columns: string) => ({
+    range: async (from: number, to: number) => {
+      rangeCalls.push({ from, to });
+      if (error !== null) {
+        return { data: null, error };
+      }
+      return { data: rows.slice(from, to + 1), error: null };
+    },
+  });
   const client: BlockfaceLookupSupabaseClient = {
     from: (_table: string) => ({ select }),
   };
-  return client;
+  return { client, rangeCalls };
+}
+
+function makeRows(count: number, offset = 0): BlockfaceLookupRow[] {
+  return Array.from({ length: count }, (_, i) => ({
+    id: `blockface-${offset + i}`,
+    source_element_key: offset + i,
+    side_of_street: "N",
+  }));
 }
 
 describe("buildBlockfaceLookup", () => {
   it("builds a map keyed by source_element_key:side_of_street to id", async () => {
-    const client = createMockClient([
+    const { client } = createMockClient([
       { id: "blockface-1", source_element_key: 81189, side_of_street: "NW" },
       { id: "blockface-2", source_element_key: 81189, side_of_street: "SE" },
       { id: "blockface-3", source_element_key: 70501, side_of_street: "W" },
@@ -32,14 +54,62 @@ describe("buildBlockfaceLookup", () => {
   });
 
   it("returns an empty map when blockfaces has no rows", async () => {
-    const client = createMockClient([]);
+    const { client } = createMockClient([]);
     const lookup = await buildBlockfaceLookup(client);
     expect(lookup.size).toBe(0);
   });
 
   it("throws a clear error when the read fails", async () => {
-    const client = createMockClient([], { message: "connection reset" });
+    const { client } = createMockClient([], { message: "connection reset" });
     await expect(buildBlockfaceLookup(client)).rejects.toThrow(/reading blockfaces failed.*connection reset/s);
+  });
+
+  // Regression test for a real bug: an earlier, unpaginated version of this
+  // function did a single select() with no range, which Supabase's
+  // PostgREST layer silently caps at 1000 rows -- live-verified this
+  // session against the real database (blockfaces has 2792 real rows; the
+  // unpaginated version returned only 1000, with no error). A test that
+  // only exercised a handful of rows (like the tests above) would never
+  // have caught this -- this one uses a result set larger than one page.
+  it("paginates past Supabase's default 1000-row page cap, loading every row rather than just the first page", async () => {
+    const rows = makeRows(2792);
+    const { client, rangeCalls } = createMockClient(rows);
+
+    const lookup = await buildBlockfaceLookup(client);
+
+    expect(lookup.size).toBe(2792);
+    // Spot-check both edges of every page, not just the total count --
+    // confirms rows from the second and third pages genuinely made it in,
+    // not just that the total happens to add up.
+    expect(lookup.get("0:N")).toBe("blockface-0");
+    expect(lookup.get("999:N")).toBe("blockface-999"); // last row of page 1
+    expect(lookup.get("1000:N")).toBe("blockface-1000"); // first row of page 2
+    expect(lookup.get("1999:N")).toBe("blockface-1999"); // last row of page 2
+    expect(lookup.get("2000:N")).toBe("blockface-2000"); // first row of page 3
+    expect(lookup.get("2791:N")).toBe("blockface-2791"); // last row overall
+
+    expect(rangeCalls).toEqual([
+      { from: 0, to: 999 },
+      { from: 1000, to: 1999 },
+      { from: 2000, to: 2999 },
+    ]);
+  });
+
+  it("stops exactly at a page boundary (a row count that's an exact multiple of the page size) without treating the boundary itself as incomplete", async () => {
+    const rows = makeRows(2000);
+    const { client, rangeCalls } = createMockClient(rows);
+
+    const lookup = await buildBlockfaceLookup(client);
+
+    expect(lookup.size).toBe(2000);
+    // A full-length page (page 2) must still trigger one more request to
+    // confirm there's nothing after it -- row count alone can't tell a
+    // "the table ends exactly here" full page from a "there's more" one.
+    expect(rangeCalls).toEqual([
+      { from: 0, to: 999 },
+      { from: 1000, to: 1999 },
+      { from: 2000, to: 2999 },
+    ]);
   });
 });
 
