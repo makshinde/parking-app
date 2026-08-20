@@ -27,13 +27,18 @@ describe("calculateOccupancyRatio", () => {
     expect(warnSpy).not.toHaveBeenCalled();
   });
 
-  it("clamps to 1.0 and logs a warning with both raw values when occupancy exceeds capacity", () => {
+  // Deliberately does NOT warn here, unlike the negative-occupancy clamp
+  // below: live-verified this session, a single backfill batch-job combo
+  // produced 3.3MB of these warnings (one per reading) before crashing --
+  // at real batch-job volume this doesn't scale. Callers that need to know
+  // how often this fires can detect it themselves from the same raw values
+  // (see backfill-occupancy-stats.ts's analyzeClampedOccupancy), aggregated
+  // rather than logged per call.
+  it("clamps to 1.0 without logging a per-call warning when occupancy exceeds capacity", () => {
     const result = calculateOccupancyRatio(10, 8);
 
     expect(result).toBe(1);
-    expect(warnSpy).toHaveBeenCalledTimes(1);
-    expect(warnSpy.mock.calls[0]?.[0]).toContain("paidOccupancy=10");
-    expect(warnSpy.mock.calls[0]?.[0]).toContain("parkingSpaceCount=8");
+    expect(warnSpy).not.toHaveBeenCalled();
   });
 
   it("throws for zero parkingSpaceCount -- no meaningful ratio for zero capacity", () => {

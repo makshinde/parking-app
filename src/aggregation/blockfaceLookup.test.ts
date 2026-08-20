@@ -231,6 +231,48 @@ describe("normalizeReading", () => {
 
     expect(() => normalizeReading(reading, lookup, new Date())).toThrow(/parkingSpaceCount must be a positive number/);
   });
+
+  // getTimeZoneOffsetMinutes caches its Intl.DateTimeFormat instance keyed
+  // by timeZone (see its own comment for why) rather than constructing one
+  // per call -- these two tests confirm that reuse doesn't corrupt or
+  // stale-cache the result: repeated calls with the same input must stay
+  // identical, and calls across different DST periods (interleaved, to
+  // rule out call-order effects) must each still get their own correct,
+  // independently-recomputed offset rather than one leaking into another.
+  it("returns identical results across repeated calls using the same cached formatter", () => {
+    const lookup = new Map([["81189:NW", "blockface-1"]]);
+    const reading = makeReading({ occupancyDateTime: "2026-07-30T17:38:00.000" });
+    const now = new Date("2026-08-02T17:38:00.000-07:00");
+
+    const first = normalizeReading(reading, lookup, now);
+    const second = normalizeReading(reading, lookup, now);
+    const third = normalizeReading(reading, lookup, now);
+
+    expect(first).toEqual(second);
+    expect(second).toEqual(third);
+  });
+
+  it("still resolves the correct DST-aware offset for each instant when summer and winter calls are interleaved through the shared cache", () => {
+    const lookup = new Map([["81189:NW", "blockface-1"]]);
+    const summerReading = makeReading({ occupancyDateTime: "2026-07-30T17:38:00.000" });
+    const summerNow = new Date("2026-08-02T17:38:00.000-07:00");
+    const winterReading = makeReading({ occupancyDateTime: "2026-01-15T10:00:00.000" });
+    const winterNow = new Date(Date.UTC(2026, 0, 20, 18, 0, 0));
+
+    // Interleaved (summer, winter, summer again) rather than grouped, so a
+    // cache keyed only by timeZone -- which both readings share -- can't
+    // accidentally pass by coincidentally never needing to recompute for a
+    // different instant.
+    const summerResult1 = normalizeReading(summerReading, lookup, summerNow);
+    const winterResult = normalizeReading(winterReading, lookup, winterNow);
+    const summerResult2 = normalizeReading(summerReading, lookup, summerNow);
+
+    // Same hand-verified expected values as the standalone summer/winter
+    // tests above (ageInDays 3 and 5 respectively).
+    expect((summerResult1 as { ageInDays: number }).ageInDays).toBeCloseTo(3, 10);
+    expect((winterResult as { ageInDays: number }).ageInDays).toBeCloseTo(5, 10);
+    expect(summerResult1).toEqual(summerResult2);
+  });
 });
 
 describe("extractIsoDayAndHour", () => {

@@ -174,12 +174,36 @@ const SOURCE_TIME_ZONE = "America/Los_Angeles";
 const MS_PER_MINUTE = 60_000;
 const MS_PER_DAY = 24 * 60 * MS_PER_MINUTE;
 
+// Constructing an Intl.DateTimeFormat is expensive (V8/ICU-backed, far
+// costlier than a plain object) -- live-verified this session: calling
+// `new Intl.DateTimeFormat(...)` fresh on every invocation of
+// getTimeZoneOffsetMinutes (i.e. once per matched reading) OOM-crashed a
+// single backfill combo after ~1 million calls and ~73 minutes, with the
+// crash's own native stack trace terminating inside
+// Intl.DateTimeFormat's formatToParts. A formatter's output only depends
+// on its construction options and the instant passed to format() --
+// nothing about it needs to vary per call here, so it's built once per
+// distinct timeZone and reused for every instant after that. A Map keyed
+// by timeZone rather than a single cached constant, in case this is ever
+// used for more than SOURCE_TIME_ZONE later.
+const dateTimeFormatCache = new Map<string, Intl.DateTimeFormat>();
+
+function getCachedDateTimeFormat(timeZone: string): Intl.DateTimeFormat {
+  const cached = dateTimeFormatCache.get(timeZone);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const formatter = new Intl.DateTimeFormat("en-US", { timeZone, timeZoneName: "shortOffset" });
+  dateTimeFormatCache.set(timeZone, formatter);
+  return formatter;
+}
+
 // Pacific time's UTC offset changes twice a year for DST (-7 in summer,
 // -8 in winter), so it can't be hardcoded -- this asks the platform's own
 // timezone database (via Intl, no new dependency) what offset applies at
 // approximately the given instant, e.g. "GMT-7".
 function getTimeZoneOffsetMinutes(instant: Date, timeZone: string): number {
-  const parts = new Intl.DateTimeFormat("en-US", { timeZone, timeZoneName: "shortOffset" }).formatToParts(instant);
+  const parts = getCachedDateTimeFormat(timeZone).formatToParts(instant);
   const offsetPart = parts.find((part) => part.type === "timeZoneName");
   const match = offsetPart ? /^GMT([+-]\d+)$/.exec(offsetPart.value) : null;
   if (match === null || match[1] === undefined) {

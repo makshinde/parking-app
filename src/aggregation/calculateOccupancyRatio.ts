@@ -43,9 +43,20 @@ function clampNegativeOccupancy(paidOccupancy: number): number {
 // CLAUDE.md's "parkingspacecount ... is not stable across years" note.
 // Occupancy reported higher than capacity (ratio > 1) is plausible
 // real-world messiness (e.g. a miscount, a temporarily over-capacity block),
-// not a structural error -- clamped to 1.0 and logged, not rejected. Exactly
-// 1.0 (a fully occupied block) is a legitimate, expected outcome on its own
-// and is returned as-is, without a warning.
+// not a structural error -- clamped to 1.0, not rejected. Exactly 1.0 (a
+// fully occupied block) is a legitimate, expected outcome on its own.
+//
+// This does NOT log a per-call warning for the clamp (unlike
+// clampNegativeOccupancy above, which still does): live-verified this
+// session, a single backfill batch-job combo produced 3.3MB of these
+// warnings before crashing, one per reading -- at the batch job's real
+// volume (potentially tens of millions of readings across a full run),
+// logging here doesn't scale and is itself a real cost, not just noise.
+// Callers that need to know how often/how badly this clamp fires (the
+// batch job does, aggregated once per combo) can detect it themselves
+// directly from the same two raw values passed in here -- see
+// backfill-occupancy-stats.ts's analyzeClampedOccupancy -- without this
+// function needing to report anything back.
 export function calculateOccupancyRatio(paidOccupancy: number, parkingSpaceCount: number): number {
   assertValidParkingSpaceCount(parkingSpaceCount);
   const safePaidOccupancy = clampNegativeOccupancy(paidOccupancy);
@@ -53,9 +64,6 @@ export function calculateOccupancyRatio(paidOccupancy: number, parkingSpaceCount
   const ratio = safePaidOccupancy / parkingSpaceCount;
 
   if (ratio > MAX_OCCUPANCY_RATIO) {
-    console.warn(
-      `calculateOccupancyRatio: paidOccupancy=${paidOccupancy}, parkingSpaceCount=${parkingSpaceCount} produced a ratio of ${ratio}, exceeding 1.0 -- clamping to 1.0`,
-    );
     return MAX_OCCUPANCY_RATIO;
   }
 
