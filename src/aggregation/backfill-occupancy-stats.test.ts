@@ -557,21 +557,31 @@ describe("logBucketFailure", () => {
 
 // --- processCombo ----------------------------------------------------------
 
+// Mirrors the real, live-verified Supabase/Postgres batch-upsert behavior:
+// a single row in a batch failing (a bad blockface_id here, standing in for
+// a real constraint violation) aborts the ENTIRE batch atomically -- none
+// of that call's rows get written, not just the bad one. upsertOccupancyStatsBatch
+// (upsertOccupancyStats.ts) is what falls back to one-row-at-a-time writes
+// on exactly this kind of failure, so this mock has to reproduce the
+// atomic-failure shape for that fallback path to be tested meaningfully.
 function createMockOccupancyStatsClient(failForBlockfaceIds: Set<string> = new Set()) {
   const upsertCalls: Record<string, unknown>[] = [];
+  const upsertCallBatchSizes: number[] = [];
   const client: OccupancyStatsSupabaseClient = {
     from: () => ({
-      upsert: async (row: Record<string, unknown>) => {
-        upsertCalls.push(row);
-        const blockfaceId = row.blockface_id as string;
-        if (failForBlockfaceIds.has(blockfaceId)) {
-          return { data: null, error: { message: `simulated failure for ${blockfaceId}` } };
+      upsert: async (rowOrRows: Record<string, unknown> | Record<string, unknown>[]) => {
+        const rows = Array.isArray(rowOrRows) ? rowOrRows : [rowOrRows];
+        upsertCallBatchSizes.push(rows.length);
+        const failingRow = rows.find((row) => failForBlockfaceIds.has(row.blockface_id as string));
+        if (failingRow !== undefined) {
+          return { data: null, error: { message: `simulated failure for ${failingRow.blockface_id}` } };
         }
+        upsertCalls.push(...rows);
         return { data: null, error: null };
       },
     }),
   };
-  return { client, upsertCalls };
+  return { client, upsertCalls, upsertCallBatchSizes };
 }
 
 const NOW = new Date("2026-08-19T12:00:00Z");
@@ -740,6 +750,42 @@ describe("processCombo", () => {
     expect(summary.written).toBe(0);
     expect(summary.blockfaceFailures).toBe(1);
     expect(failureUpsertCalls[0]).toMatchObject({ blockface_id: "blockface-1", error_message: expect.stringContaining("simulated failure") });
+  });
+
+  it("writes multiple blockfaces in one batch call, and a failing one doesn't take a good one down with it", async () => {
+    const localLookup = new Map([
+      ["9477:W", "blockface-1"],
+      ["1234:N", "blockface-2"],
+    ]);
+    const { client: occupancyStatsClient, upsertCalls, upsertCallBatchSizes } = createMockOccupancyStatsClient(new Set(["blockface-2"]));
+    const { client: failuresClient, upsertCalls: failureUpsertCalls } = createMockFailuresClient();
+
+    const rollingReadings = [
+      ...makeManyReadings(35, { sourceElementKey: 9477, sideOfStreet: "W" }),
+      ...makeManyReadings(35, { sourceElementKey: 1234, sideOfStreet: "N" }),
+    ];
+
+    const summary = await processCombo(
+      { isoDay: 4, hour: 17 },
+      {
+        occupancyStatsClient,
+        failuresClient,
+        fetchArchiveRecords: async () => [],
+        lookup: localLookup,
+        rollingReadings,
+        now: NOW,
+      },
+    );
+
+    // Both blockfaces are attempted together in one batch first (size 2),
+    // which fails atomically because of blockface-2 -- the fallback then
+    // retries each individually, so blockface-1 still ends up written and
+    // only blockface-2 is attributed as a real failure.
+    expect(upsertCallBatchSizes[0]).toBe(2);
+    expect(summary.written).toBe(1);
+    expect(summary.blockfaceFailures).toBe(1);
+    expect(upsertCalls.map((c) => c.blockface_id)).toEqual(["blockface-1"]);
+    expect(failureUpsertCalls[0]).toMatchObject({ blockface_id: "blockface-2" });
   });
 
   it("propagates a failure in the archive fetch itself (does not catch it)", async () => {
