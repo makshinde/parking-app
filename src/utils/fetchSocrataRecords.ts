@@ -22,7 +22,7 @@ function buildQueryUrl(datasetUrl: string, whereClause: string, offset: number):
 // optional: requests still succeed without one, just against that lower,
 // shared limit -- so this returns an empty headers object rather than
 // throwing when the env var isn't set.
-function buildRequestHeaders(): HeadersInit {
+export function buildRequestHeaders(): HeadersInit {
   const token = process.env.SOCRATA_APP_TOKEN;
   if (token === undefined || token.trim() === "") {
     return {};

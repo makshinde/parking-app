@@ -28,6 +28,16 @@ export function createEmptyAccumulator(): WeightedStatsAccumulator {
   return { count: 0, totalWeight: 0, mean: 0, sumSquaredDiff: 0 };
 }
 
+// A full set of per-bucket accumulators, keyed by whatever bucket-key
+// convention the caller uses (e.g. `${blockfaceId}:${isoDay}:${hour}`).
+// WeightedStatsAccumulator is already a plain object of finite numbers, so
+// this is directly JSON-serializable/deserializable with no conversion step
+// -- used by streamArchiveWithResume.ts to checkpoint accumulator state
+// alongside the stream's own position, so a resume restores accumulation
+// progress exactly rather than replaying already-counted readings into it
+// (see that module's comments for the full reasoning).
+export type AccumulatorSnapshot = Record<string, WeightedStatsAccumulator>;
+
 // Same validity rules as weightedStats.ts's assertValidReading: value is
 // continuous but a non-finite value has no meaningful "nearest valid"
 // reading, so it throws rather than clamping. weight is never actually
