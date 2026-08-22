@@ -539,10 +539,25 @@ function createSupabaseClient(url: string, serviceRoleKey: string) {
 // only saves a chunk's checkpoint after onChunk returns successfully) --
 // an accepted gap for a testing-only flag, not a concern for the real,
 // uninterrupted production run.
+//
+// Deliberately NOT a constructor parameter property (no `public`/`readonly`
+// modifier on the constructor argument itself): this file is run directly
+// via plain `node` (no bundler -- see CLAUDE.md's Conventions section on
+// the .ts-extension requirement for the same reason), which uses Node's
+// strip-only TypeScript support. That mode only erases type annotations;
+// it does not support parameter-property shorthand, which expands into
+// real field-assignment code, not just a type. Live-verified: the
+// parameter-property form crashed immediately with
+// ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX under plain `node`, even though it
+// type-checked fine and passed under vitest (which transforms via esbuild,
+// not Node's stripper).
 export class MaxChunksReachedError extends Error {
-  constructor(public readonly chunksProcessed: number) {
+  readonly chunksProcessed: number;
+
+  constructor(chunksProcessed: number) {
     super(`reached --max-chunks after ${chunksProcessed} chunk(s)`);
     this.name = "MaxChunksReachedError";
+    this.chunksProcessed = chunksProcessed;
   }
 }
 
