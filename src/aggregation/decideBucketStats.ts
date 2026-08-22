@@ -1,4 +1,5 @@
 import { calculateWeightedStats, type WeightedReading } from "./weightedStats.ts";
+import { finalizeStats, type WeightedStatsAccumulator } from "./incrementalWeightedStats.ts";
 
 // Minimum reading count for a blockface/day-of-week/hour bucket before its
 // occupancy_stats row is written. Empirically grounded in the real bucket
@@ -32,4 +33,20 @@ export function decideBucketStats(readings: WeightedReading[]): BucketStats | nu
 
   const { mean, stdDev } = calculateWeightedStats(readings);
   return { mean, stdDev, sampleCount: readings.length };
+}
+
+// Same MIN_READINGS_PER_BUCKET gate as decideBucketStats, but for a
+// WeightedStatsAccumulator (incrementalWeightedStats.ts) instead of a
+// materialized WeightedReading[]. Needed for the streaming aggregation
+// path (backfill-occupancy-stats.ts): once a bucket's readings have been
+// folded into a running accumulator, the individual readings are gone --
+// by design, that's what keeps streaming the archive from holding raw
+// readings in memory -- so there is no readings array left to hand to
+// decideBucketStats, even in principle, once streaming has finished.
+export function decideBucketStatsFromAccumulator(accumulator: WeightedStatsAccumulator): BucketStats | null {
+  if (accumulator.count < MIN_READINGS_PER_BUCKET) {
+    return null;
+  }
+
+  return finalizeStats(accumulator);
 }
