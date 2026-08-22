@@ -178,6 +178,73 @@ it.
   job-failure bookkeeping, so only the service-role key can read or write
   it.
 
+  Beyond the per-run, 91-combo batch job above, a separate, not-yet-built
+  streaming path is planned to pull a full year's archive once, unfiltered,
+  and sort readings into buckets locally with an incremental accumulator
+  (see incrementalWeightedStats.ts), instead of running 91+ separately
+  filtered Socrata queries -- motivated by Socrata's own $offset-based
+  pagination degrading badly with query depth on a filtered query
+  (live-verified: the same query took 5-10s at offset=0 but 92s at
+  offset=4,000,000). This streaming path needs its own resumability
+  checkpoint, since a full-archive pull is a single long-running job that
+  can be interrupted partway through, the same motivation as
+  occupancy_stats_backfill_progress but for this different, coarser-grained
+  job. archive_stream_checkpoint (schema.sql, migrations/011) holds that
+  checkpoint: one row per archive_dataset_id (so 2020's archive and 2025's
+  archive checkpoint independently and never interfere with each other),
+  storing last_processed_id and a running readings_processed_count.
+
+  last_processed_id stores Socrata's own :id system field value (e.g.
+  "row-km8v~rgdh.iue6"), not a timestamp, deliberately. An earlier design
+  considered checkpointing on occupancydatetime instead, but :id turned out
+  to be strictly better on every axis that was actually tested: :id is a
+  genuine, hidden-by-default per-row unique identifier (retrieved via
+  $select=:id,...), and keyset-paginating an entire real day (2025-06-10) by
+  it ($where=:id > cursor&$order=:id&$limit=50000, no $offset) produced
+  exactly 1,002,814 unique rows with zero duplicates or gaps, live-verified
+  against an independently-run count(*) for that same day. It's also
+  10-40x faster at depth than the timestamp-based equivalent (300ms-1.3s
+  per 50,000-row page for :id vs 14-16s per page for occupancydatetime,
+  both live-verified at real pagination depth, not just near the start of
+  the dataset). And because :id is guaranteed unique per row, there is no
+  tie-breaking edge case at a resume boundary at all: a timestamp cursor
+  can skip rows when multiple readings share the exact same timestamp
+  spanning a chunk boundary (an accepted, negligible limitation given the
+  existing 30-reading MIN_READINGS_PER_BUCKET threshold), but :id pagination
+  has no such gap to accept in the first place, since $where=:id > cursor
+  can never match the same row twice or skip a row between it and the next
+  cursor.
+
+  readings_processed_count is purely informational (progress
+  reporting/sanity-checking) -- it plays no role in deciding where a
+  resumed run picks up again; that's last_processed_id's job alone.
+
+  Recomputed, honest full-2025-archive time estimate for this streaming
+  path, from real measured :id-pagination throughput (26 steady-state
+  50,000-row pages averaging 570.65ms each): pure fetch alone comes out to
+  roughly 57 minutes for the full 300,055,806-row archive. A larger,
+  combined pipeline test (fetch + parse + normalizeReading +
+  calculateRecencyWeight + incremental accumulation + periodic checkpoint
+  write, 4.65 million rows through the real production functions) measured
+  real per-reading processing overhead at 53.1% of fetch time -- not
+  negligible -- bringing the honest full-archive, all-in estimate to
+  roughly 5 hours end to end. That same test's memory stayed flat and
+  bounded throughout (RSS 136-262MB across the whole run, no growth trend),
+  confirming the incremental-accumulator design (small, fixed per-bucket
+  running totals, never holding raw readings) avoids the ~95-97GB that
+  holding the full archive as raw objects in memory would require
+  (extrapolated from clean, isolated 1M/5M-row memory measurements; this
+  same machine's 8GB of physical RAM could not even hold 20M raw reading
+  objects without severe swap thrashing). Separately, some evidence of
+  Socrata-side slowdown under sustained heavy use was observed (an isolated
+  fetch-only re-test the next morning ran 2-4x slower than the original
+  clean baseline), though not conclusively enough on its own to fully
+  explain the worst stalls seen during the heavier combined test --
+  local-machine resource contention likely compounds it. None of this
+  streaming path (the checkpoint table aside) is built yet as of this
+  note -- incrementalWeightedStats.ts (the accumulator) exists, but the
+  streaming fetch/resume module itself does not.
+
 ## Handling invalid input
 
 Two categories, handled differently:
