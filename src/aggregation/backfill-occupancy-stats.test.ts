@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   accumulateComboSummary,
   analyzeClampedOccupancy,
+  buildAccumulatorBucketKey,
   buildAllBucketCombos,
   buildBucketWhereClause,
   buildRollingBucketsForCombo,
@@ -9,9 +10,11 @@ import {
   createEmptyComboSummary,
   fetchOperatingHourRange,
   fetchProgressStatuses,
+  foldReadingsIntoAccumulators,
   logBucketFailure,
   markComboStatus,
   MAX_RETRY_COUNT,
+  parseAccumulatorBucketKey,
   parseCliOptions,
   parseRawReading,
   parseRawReadings,
@@ -32,6 +35,7 @@ import type {
 import type { RawReading } from "./blockfaceLookup.ts";
 import type { OccupancyStatsSupabaseClient } from "./upsertOccupancyStats.ts";
 import type { SocrataRecord } from "../utils/fetchSocrataRecords.ts";
+import type { WeightedStatsAccumulator } from "./incrementalWeightedStats.ts";
 
 // --- parseCliOptions ---------------------------------------------------
 
@@ -243,6 +247,135 @@ describe("parseRawReadings", () => {
 
   it("handles an empty array cleanly, not as an error", () => {
     expect(parseRawReadings([])).toEqual({ readings: [], parseFailures: 0 });
+  });
+});
+
+// --- buildAccumulatorBucketKey / parseAccumulatorBucketKey ----------------
+
+describe("buildAccumulatorBucketKey / parseAccumulatorBucketKey", () => {
+  it("round-trips a blockfaceId/isoDay/hour triple", () => {
+    const key = buildAccumulatorBucketKey("b1f4a2e0-0000-4000-8000-000000000001", 3, 14);
+    expect(parseAccumulatorBucketKey(key)).toEqual({
+      blockfaceId: "b1f4a2e0-0000-4000-8000-000000000001",
+      isoDay: 3,
+      hour: 14,
+    });
+  });
+
+  it("handles hour 0 and single-digit values without ambiguity", () => {
+    const key = buildAccumulatorBucketKey("bf-1", 1, 0);
+    expect(parseAccumulatorBucketKey(key)).toEqual({ blockfaceId: "bf-1", isoDay: 1, hour: 0 });
+  });
+
+  it("throws for a malformed key", () => {
+    expect(() => parseAccumulatorBucketKey("not-a-real-key")).toThrow(/malformed bucket key/);
+  });
+});
+
+// --- foldReadingsIntoAccumulators ------------------------------------------
+
+const FOLD_NOW = new Date("2026-08-19T12:00:00Z");
+const FOLD_LOOKUP = new Map([["9477:W", "blockface-1"]]);
+
+describe("foldReadingsIntoAccumulators", () => {
+  it("folds a matched reading into a fresh accumulator for its bucket", () => {
+    const accumulators = new Map<string, WeightedStatsAccumulator>();
+
+    const result = foldReadingsIntoAccumulators([makeRawRecord()], accumulators, FOLD_LOOKUP, FOLD_NOW);
+
+    expect(result).toEqual({ unmatchedCount: 0, parseFailures: 0 });
+    // makeRawRecord's default occupancydatetime (2026-07-30T17:38:00.000)
+    // is a Thursday (ISO day 4), hour 17 -- same bucket the existing
+    // partitionByBucket tests already rely on.
+    const key = buildAccumulatorBucketKey("blockface-1", 4, 17);
+    expect(accumulators.get(key)?.count).toBe(1);
+  });
+
+  it("accumulates multiple readings into the same bucket rather than overwriting", () => {
+    const accumulators = new Map<string, WeightedStatsAccumulator>();
+
+    foldReadingsIntoAccumulators([makeRawRecord(), makeRawRecord(), makeRawRecord()], accumulators, FOLD_LOOKUP, FOLD_NOW);
+
+    const key = buildAccumulatorBucketKey("blockface-1", 4, 17);
+    expect(accumulators.get(key)?.count).toBe(3);
+  });
+
+  it("keeps different (blockface, isoDay, hour) buckets separate within one call", () => {
+    const accumulators = new Map<string, WeightedStatsAccumulator>();
+    const lookup = new Map([
+      ["9477:W", "blockface-1"],
+      ["1234:N", "blockface-2"],
+    ]);
+    const records = [
+      makeRawRecord(), // blockface-1, Thu 17
+      makeRawRecord({ sourceelementkey: "1234", sideofstreet: "N" }), // blockface-2, Thu 17
+      makeRawRecord({ occupancydatetime: "2026-08-02T09:00:00.000" }), // blockface-1, Sun (ISO 7) 09
+    ];
+
+    foldReadingsIntoAccumulators(records, accumulators, lookup, FOLD_NOW);
+
+    expect(accumulators.size).toBe(3);
+    expect(accumulators.get(buildAccumulatorBucketKey("blockface-1", 4, 17))?.count).toBe(1);
+    expect(accumulators.get(buildAccumulatorBucketKey("blockface-2", 4, 17))?.count).toBe(1);
+    expect(accumulators.get(buildAccumulatorBucketKey("blockface-1", 7, 9))?.count).toBe(1);
+  });
+
+  it("counts an unmatched reading (no blockface in lookup) without folding it into any bucket", () => {
+    const accumulators = new Map<string, WeightedStatsAccumulator>();
+
+    const result = foldReadingsIntoAccumulators(
+      [makeRawRecord({ sourceelementkey: "99999" })],
+      accumulators,
+      FOLD_LOOKUP,
+      FOLD_NOW,
+    );
+
+    expect(result).toEqual({ unmatchedCount: 1, parseFailures: 0 });
+    expect(accumulators.size).toBe(0);
+  });
+
+  it("counts a malformed record without aborting the rest of the chunk", () => {
+    const accumulators = new Map<string, WeightedStatsAccumulator>();
+    const records = [makeRawRecord({ parkingspacecount: "n/a" }), makeRawRecord()];
+
+    const result = foldReadingsIntoAccumulators(records, accumulators, FOLD_LOOKUP, FOLD_NOW);
+
+    expect(result).toEqual({ unmatchedCount: 0, parseFailures: 1 });
+    expect(accumulators.get(buildAccumulatorBucketKey("blockface-1", 4, 17))?.count).toBe(1);
+  });
+
+  it("mutates the same Map instance across repeated calls (the shared-accumulator contract main() relies on)", () => {
+    const accumulators = new Map<string, WeightedStatsAccumulator>();
+
+    foldReadingsIntoAccumulators([makeRawRecord()], accumulators, FOLD_LOOKUP, FOLD_NOW);
+    foldReadingsIntoAccumulators([makeRawRecord()], accumulators, FOLD_LOOKUP, FOLD_NOW);
+
+    expect(accumulators.get(buildAccumulatorBucketKey("blockface-1", 4, 17))?.count).toBe(2);
+  });
+
+  it("handles an empty record batch cleanly, not as an error", () => {
+    const accumulators = new Map<string, WeightedStatsAccumulator>();
+    expect(foldReadingsIntoAccumulators([], accumulators, FOLD_LOOKUP, FOLD_NOW)).toEqual({ unmatchedCount: 0, parseFailures: 0 });
+    expect(accumulators.size).toBe(0);
+  });
+
+  it("produces an accumulator whose finalized stats agree with the batch calculateWeightedStats path for the same readings", () => {
+    // Cross-checks against groupReadingsByBlockface's own normalizeReading +
+    // calculateRecencyWeight pipeline (the already-trusted batch path),
+    // not just internal self-consistency.
+    const accumulators = new Map<string, WeightedStatsAccumulator>();
+    const records = Array.from({ length: 5 }, () => makeRawRecord());
+
+    foldReadingsIntoAccumulators(records, accumulators, FOLD_LOOKUP, FOLD_NOW);
+
+    const accumulator = accumulators.get(buildAccumulatorBucketKey("blockface-1", 4, 17));
+    expect(accumulator).toBeDefined();
+    expect(accumulator?.count).toBe(5);
+    // All 5 records are byte-identical, so every reading has the same
+    // value/weight -- the accumulated mean must equal that single value.
+    const { readings: parsed } = parseRawReadings(records);
+    const singleReading = parsed[0]!;
+    expect(accumulator?.mean).toBeCloseTo(singleReading.paidOccupancy / singleReading.parkingSpaceCount, 10);
   });
 });
 

@@ -8,6 +8,7 @@ import { isoDayToSocrataDow } from "./isoDayToSocrataDow.ts";
 import {
   buildBlockfaceLookup,
   extractIsoDayAndHour,
+  normalizeReading,
   type RawReading,
   type BlockfaceLookupSupabaseClient,
 } from "./blockfaceLookup.ts";
@@ -19,6 +20,8 @@ import {
   type OccupancyStatsSupabaseClient,
   type OccupancyStatsWriteRequest,
 } from "./upsertOccupancyStats.ts";
+import { calculateRecencyWeight } from "../scoring/recencyWeight.ts";
+import { addReading, createEmptyAccumulator, type WeightedStatsAccumulator } from "./incrementalWeightedStats.ts";
 
 // The current, not-yet-archived Paid Parking Occupancy dataset (see
 // CLAUDE.md's Architecture section) -- unlike wtpb-jp8d/7c2e-uany (full,
@@ -237,6 +240,90 @@ export function parseRawReadings(records: SocrataRecord[]): ParseRawReadingsResu
   }
 
   return { readings, parseFailures };
+}
+
+// --- Streaming aggregation: bucket keys and folding -----------------------
+
+// blockfaceId is a uuid (schema.sql's blockfaces.id), which never contains
+// a colon, so joining with ':' and splitting back apart (below) is
+// unambiguous. Unlike the old per-combo design (where isoDay/hour were
+// constant for an entire archive query and only blockfaceId varied), a
+// single streamed chunk can contain readings spanning every bucket at
+// once -- :id keyset pagination has no correlation with time (see
+// CLAUDE.md's Architecture section) -- so the accumulator Map needs the
+// full (blockfaceId, isoDay, hour) triple as its key, not blockfaceId alone.
+export function buildAccumulatorBucketKey(blockfaceId: string, isoDay: number, hour: number): string {
+  return `${blockfaceId}:${isoDay}:${hour}`;
+}
+
+export interface AccumulatorBucketKeyComponents {
+  blockfaceId: string;
+  isoDay: number;
+  hour: number;
+}
+
+const ACCUMULATOR_BUCKET_KEY_PATTERN = /^(.+):(\d+):(\d+)$/;
+
+// Inverse of buildAccumulatorBucketKey, used when iterating the final
+// accumulator Map to write occupancy_stats rows. A bucket key is a fixed,
+// structural format this module itself produces, not external input, so a
+// malformed key signals a real bug -- same discrete/categorical-input
+// reasoning isoDayToSocrataDow uses for an out-of-range day -- and throws
+// rather than guessing at a best-effort parse.
+export function parseAccumulatorBucketKey(key: string): AccumulatorBucketKeyComponents {
+  const match = ACCUMULATOR_BUCKET_KEY_PATTERN.exec(key);
+  if (match === null) {
+    throw new Error(`parseAccumulatorBucketKey: malformed bucket key "${key}"`);
+  }
+  const [, blockfaceId, isoDay, hour] = match;
+  return { blockfaceId: blockfaceId as string, isoDay: Number(isoDay), hour: Number(hour) };
+}
+
+export interface FoldReadingsResult {
+  unmatchedCount: number;
+  parseFailures: number;
+}
+
+// Parses a batch of raw Socrata records (either the one-time rolling-window
+// fold or a single streamed archive chunk -- see main()) and folds each
+// matched reading directly into the shared accumulators Map, in place.
+// Never materializes a WeightedReading[] the way the old per-combo
+// groupReadingsByBlockface did -- a streaming run can't afford to hold
+// every reading for a bucket in memory at once, that's the entire point of
+// the incremental accumulator (incrementalWeightedStats.ts). Reused for
+// both the rolling-window fold and every archive chunk, so the two paths
+// can never drift out of sync with each other's matching/weighting logic.
+export function foldReadingsIntoAccumulators(
+  records: SocrataRecord[],
+  accumulators: Map<string, WeightedStatsAccumulator>,
+  lookup: Map<string, string>,
+  now: Date,
+): FoldReadingsResult {
+  let unmatchedCount = 0;
+  let parseFailures = 0;
+
+  for (const record of records) {
+    let reading: RawReading;
+    try {
+      reading = parseRawReading(record);
+    } catch {
+      parseFailures += 1;
+      continue;
+    }
+
+    const result = normalizeReading(reading, lookup, now);
+    if (!result.matched) {
+      unmatchedCount += 1;
+      continue;
+    }
+
+    const bucketKey = buildAccumulatorBucketKey(result.blockfaceId, result.isoDay, result.hour);
+    const weight = calculateRecencyWeight(result.ageInDays);
+    const existing = accumulators.get(bucketKey) ?? createEmptyAccumulator();
+    accumulators.set(bucketKey, addReading(existing, result.occupancyRatio, weight));
+  }
+
+  return { unmatchedCount, parseFailures };
 }
 
 // --- Rolling window partitioning ------------------------------------------
