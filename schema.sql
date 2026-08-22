@@ -429,16 +429,33 @@ CREATE TABLE archive_stream_checkpoint (
   -- used to decide where to resume from, that's last_processed_id's job.
   readings_processed_count bigint NOT NULL,
 
+  -- The :id cursor value accumulator_state (below) was last snapshotted
+  -- at -- distinct from last_processed_id, which advances every chunk
+  -- while this only advances every snapshotIntervalChunks chunks (see
+  -- streamArchiveWithResume.ts). Null means no snapshot has been taken yet
+  -- (a fresh run, or one still short of its first snapshot boundary).
+  --
+  -- This is a deliberate split, not the original design: live-measured,
+  -- writing a realistic ~94,064-bucket accumulator_state blob (~13.66MB
+  -- serialized) averaged 17,890ms/write against this table across 3
+  -- successful attempts, and outright failed with a Postgres statement
+  -- timeout on 2 of 5 -- ~175x slower than the ~102ms/write lightweight
+  -- position-only checkpoint. Snapshotting on every chunk would cost
+  -- roughly 30 hours across the full archive's ~6,002 chunks, dwarfing the
+  -- ~5 hour honest full-archive estimate for everything else combined. A
+  -- gap where this lags behind last_processed_id is expected and normal --
+  -- a resume re-fetches and re-folds exactly that bounded gap, never the
+  -- whole dataset, before continuing.
+  accumulator_snapshot_last_processed_id text,
+
   -- Serialized per-bucket incremental accumulator state (AccumulatorSnapshot,
   -- see incrementalWeightedStats.ts), exactly as it stood when
-  -- last_processed_id was last checkpointed. Written in the SAME upsert as
-  -- last_processed_id/readings_processed_count (streamArchiveWithResume.ts's
-  -- saveArchiveStreamCheckpoint), never as a separate write -- two
-  -- independently-timed writes for "how far the stream got" and "what's
-  -- been counted so far" could otherwise drift apart across a crash,
-  -- either double-counting a replayed chunk into an accumulator that
-  -- already reflects it, or silently losing a checkpointed chunk's
-  -- contribution. A single atomic write makes that drift impossible.
+  -- accumulator_snapshot_last_processed_id was last written -- NOT
+  -- necessarily as of last_processed_id (see that column's comment above).
+  -- Written atomically together with accumulator_snapshot_last_processed_id
+  -- (streamArchiveWithResume.ts's saveArchiveStreamAccumulatorSnapshot),
+  -- never separately from it, so those two specifically can never disagree
+  -- with each other about what's actually been counted.
   accumulator_state jsonb NOT NULL DEFAULT '{}'::jsonb,
 
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -449,11 +466,13 @@ COMMENT ON TABLE archive_stream_checkpoint IS
 COMMENT ON COLUMN archive_stream_checkpoint.archive_dataset_id IS
   'Socrata dataset id for the yearly archive being streamed (e.g. "7c2e-uany" for 2025), matching resolveYearlyArchiveDatasetId''s output. UNIQUE so each archive gets its own independent checkpoint.';
 COMMENT ON COLUMN archive_stream_checkpoint.last_processed_id IS
-  'Socrata''s own :id system field value for the last row successfully processed -- not a timestamp. Live-verified unique per row, gap-free and duplicate-free under keyset pagination, and 10-40x faster at depth than an occupancydatetime-based cursor. Resuming from this can never skip or duplicate a row the way a timestamp cursor can when multiple readings share the same timestamp at a resume boundary.';
+  'Socrata''s own :id system field value for the last row successfully processed -- not a timestamp. Live-verified unique per row, gap-free and duplicate-free under keyset pagination, and 10-40x faster at depth than an occupancydatetime-based cursor. Resuming from this can never skip or duplicate a row the way a timestamp cursor can when multiple readings share the same timestamp at a resume boundary. Updated every chunk (cheap -- see saveArchiveStreamPosition), unlike accumulator_snapshot_last_processed_id below.';
+COMMENT ON COLUMN archive_stream_checkpoint.accumulator_snapshot_last_processed_id IS
+  'The :id cursor value accumulator_state was last snapshotted at -- distinct from last_processed_id (the stream''s own fetch position), which advances every chunk while this only advances every snapshotIntervalChunks chunks (see streamArchiveWithResume.ts). Null means no snapshot has been taken yet. A gap where this lags behind last_processed_id is expected and normal -- a resume re-fetches and re-folds exactly that bounded gap, never the whole dataset, before continuing.';
+COMMENT ON COLUMN archive_stream_checkpoint.accumulator_state IS
+  'Serialized per-bucket incremental accumulator state (AccumulatorSnapshot, see incrementalWeightedStats.ts), exactly as it stood when accumulator_snapshot_last_processed_id was last written -- NOT necessarily as of last_processed_id. Written atomically together with accumulator_snapshot_last_processed_id, never separately from it, so those two can never disagree with each other about what''s actually been counted.';
 COMMENT ON COLUMN archive_stream_checkpoint.readings_processed_count IS
   'Running count of readings processed so far in this archive''s streaming run. Informational only (progress reporting) -- resuming is driven by last_processed_id, not this count.';
-COMMENT ON COLUMN archive_stream_checkpoint.accumulator_state IS
-  'Serialized per-bucket incremental accumulator state (AccumulatorSnapshot, see incrementalWeightedStats.ts), exactly as it stood when last_processed_id was last checkpointed. Written in the same upsert as last_processed_id/readings_processed_count, never separately -- a resume restores this alongside the stream position atomically, so it can never be ahead (causing double-counting on replay) or behind (silently losing a checkpointed chunk''s contribution).';
 
 ALTER TABLE archive_stream_checkpoint ENABLE ROW LEVEL SECURITY;
 -- No CREATE POLICY statements, intentionally: same reasoning as
