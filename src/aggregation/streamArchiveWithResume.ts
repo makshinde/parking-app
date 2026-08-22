@@ -1,5 +1,6 @@
 import type { SupabaseQueryResult } from "../importers/upsertBlockface.ts";
 import { buildRequestHeaders, type SocrataRecord } from "../utils/fetchSocrataRecords.ts";
+import type { AccumulatorSnapshot } from "./incrementalWeightedStats.ts";
 
 const SOCRATA_BASE_URL = "https://data.seattle.gov/resource";
 
@@ -13,12 +14,23 @@ export interface ArchiveStreamCheckpoint {
   archiveDatasetId: string;
   lastProcessedId: string;
   readingsProcessedCount: number;
+  // Persisted in the SAME write as lastProcessedId/readingsProcessedCount
+  // (see saveArchiveStreamCheckpoint) -- never as a separate call. That's
+  // the whole point: two independently-timed writes for "how far the
+  // stream got" and "what's been counted so far" can drift apart across a
+  // crash, which either double-counts a replayed chunk into an accumulator
+  // that already reflects it, or silently drops readings whose chunk was
+  // checkpointed but whose accumulator update never got persisted. A
+  // single atomic write for both fields makes that drift impossible: a
+  // resume always restores a mutually consistent pair.
+  accumulatorState: AccumulatorSnapshot;
 }
 
 interface ArchiveStreamCheckpointRow {
   archive_dataset_id: string;
   last_processed_id: string;
   readings_processed_count: number;
+  accumulator_state: AccumulatorSnapshot;
 }
 
 // Same DI shape as BackfillFailuresSupabaseClient (backfill-occupancy-stats.ts):
@@ -50,7 +62,7 @@ export async function fetchArchiveStreamCheckpoint(
 ): Promise<ArchiveStreamCheckpoint | null> {
   const { data, error } = await client
     .from("archive_stream_checkpoint")
-    .select("archive_dataset_id, last_processed_id, readings_processed_count")
+    .select("archive_dataset_id, last_processed_id, readings_processed_count, accumulator_state")
     .eq("archive_dataset_id", archiveDatasetId)
     .maybeSingle();
 
@@ -67,6 +79,7 @@ export async function fetchArchiveStreamCheckpoint(
     archiveDatasetId: data.archive_dataset_id,
     lastProcessedId: data.last_processed_id,
     readingsProcessedCount: data.readings_processed_count,
+    accumulatorState: data.accumulator_state,
   };
 }
 
@@ -82,6 +95,7 @@ export async function saveArchiveStreamCheckpoint(
       archive_dataset_id: checkpoint.archiveDatasetId,
       last_processed_id: checkpoint.lastProcessedId,
       readings_processed_count: checkpoint.readingsProcessedCount,
+      accumulator_state: checkpoint.accumulatorState,
     },
     { onConflict: "archive_dataset_id" },
   );
@@ -164,18 +178,37 @@ export interface StreamArchiveOptions {
   archiveDatasetId: string;
   // Defaults to DEFAULT_STREAM_CHUNK_SIZE (Socrata's own per-request cap).
   chunkSize?: number;
-  // Called once per fetched chunk, in order. IMPORTANT: onChunk may be
-  // called again with the same chunk of readings after a crash-and-resume
-  // -- the checkpoint is only saved *after* onChunk finishes for a given
-  // chunk (so a crash mid-chunk loses at most that one chunk's worth of
-  // work, per the agreed design), which means a chunk whose processing
-  // succeeded but whose checkpoint write never landed will be re-fetched
-  // and re-delivered to onChunk on the next run. This module guarantees
-  // at-least-once delivery of every reading, not exactly-once. Making
-  // onChunk's own effect idempotent (e.g. upserting into a per-bucket
-  // accumulator keyed by bucket, not appending to a list) is the caller's
-  // responsibility, not this module's.
-  onChunk: (readings: SocrataRecord[]) => Promise<void> | void;
+  // Called once, before the first fetch, only when a checkpoint already
+  // existed for this archiveDatasetId -- hands back the accumulator state
+  // exactly as it was atomically checkpointed alongside that checkpoint's
+  // last_processed_id, so the caller can seed its own accumulators (e.g.
+  // repopulate a Map<bucketKey, WeightedStatsAccumulator>) before any
+  // chunk is (re-)processed. Never called on a genuinely fresh start
+  // (nothing to restore).
+  onResume?: (accumulatorState: AccumulatorSnapshot) => Promise<void> | void;
+  // Called once per fetched chunk, in order, and must return the caller's
+  // complete, up-to-date accumulator snapshot after folding this chunk's
+  // readings in -- that return value is what gets checkpointed (see below).
+  //
+  // IMPORTANT: onChunk may be called again with the same chunk of readings
+  // after a crash-and-resume -- the checkpoint is only saved *after*
+  // onChunk finishes for a given chunk (so a crash mid-chunk loses at most
+  // that one chunk's worth of work, per the agreed design), which means a
+  // chunk whose processing succeeded but whose checkpoint write never
+  // landed will be re-fetched and re-delivered to onChunk on the next run.
+  // This module guarantees at-least-once delivery of every reading, not
+  // exactly-once.
+  //
+  // Returning the accumulator snapshot (rather than this module reading it
+  // from some side channel) is what makes the checkpoint write atomic: the
+  // returned snapshot is saved in the exact same upsert as this chunk's
+  // last_processed_id/readings_processed_count, so a resume can never
+  // restore a stream position and an accumulator state that disagree with
+  // each other -- eliminating both double-counting a replayed chunk (if the
+  // accumulator had been persisted separately, ahead of the stream
+  // position) and silently losing a chunk's contribution (if persisted
+  // separately, behind it).
+  onChunk: (readings: SocrataRecord[]) => Promise<AccumulatorSnapshot> | AccumulatorSnapshot;
 }
 
 // Streams an entire archive dataset chunk by chunk, resuming from
@@ -195,25 +228,38 @@ export async function streamArchiveWithResume(
   let cursorId: string | null = existingCheckpoint?.lastProcessedId ?? null;
   let readingsProcessedCount = existingCheckpoint?.readingsProcessedCount ?? 0;
 
+  // Fires unconditionally whenever a checkpoint existed, before the first
+  // fetch -- including the case where the very next page turns out to be
+  // empty (nothing new since the last run). That case still needs this
+  // hand-off: the restored accumulator state IS the final result the
+  // caller must finalize, even though no further chunk gets processed.
+  if (existingCheckpoint !== null) {
+    await options.onResume?.(existingCheckpoint.accumulatorState);
+  }
+
   while (true) {
     const page = await fetchArchivePage(options.archiveDatasetId, cursorId, chunkSize);
     if (page.length === 0) {
       break;
     }
 
-    await options.onChunk(page);
+    const accumulatorState = await options.onChunk(page);
 
     const lastRecord = page[page.length - 1] as SocrataRecord;
     cursorId = getRecordId(lastRecord);
     readingsProcessedCount += page.length;
 
     // Checkpoint is written only after onChunk has fully completed for this
-    // page -- see StreamArchiveOptions.onChunk's own comment for exactly
-    // what that guarantees (at-least-once, not exactly-once) and why.
+    // page, and includes the accumulator snapshot onChunk just returned in
+    // the SAME write as the new stream position -- see
+    // StreamArchiveOptions.onChunk's own comment for exactly what that
+    // guarantees (at-least-once delivery, but never a drifted-apart
+    // position/accumulator pair) and why.
     await saveArchiveStreamCheckpoint(checkpointClient, {
       archiveDatasetId: options.archiveDatasetId,
       lastProcessedId: cursorId,
       readingsProcessedCount,
+      accumulatorState,
     });
 
     // Fewer rows than requested necessarily means this was the last page

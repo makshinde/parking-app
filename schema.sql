@@ -429,6 +429,18 @@ CREATE TABLE archive_stream_checkpoint (
   -- used to decide where to resume from, that's last_processed_id's job.
   readings_processed_count bigint NOT NULL,
 
+  -- Serialized per-bucket incremental accumulator state (AccumulatorSnapshot,
+  -- see incrementalWeightedStats.ts), exactly as it stood when
+  -- last_processed_id was last checkpointed. Written in the SAME upsert as
+  -- last_processed_id/readings_processed_count (streamArchiveWithResume.ts's
+  -- saveArchiveStreamCheckpoint), never as a separate write -- two
+  -- independently-timed writes for "how far the stream got" and "what's
+  -- been counted so far" could otherwise drift apart across a crash,
+  -- either double-counting a replayed chunk into an accumulator that
+  -- already reflects it, or silently losing a checkpointed chunk's
+  -- contribution. A single atomic write makes that drift impossible.
+  accumulator_state jsonb NOT NULL DEFAULT '{}'::jsonb,
+
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -440,6 +452,8 @@ COMMENT ON COLUMN archive_stream_checkpoint.last_processed_id IS
   'Socrata''s own :id system field value for the last row successfully processed -- not a timestamp. Live-verified unique per row, gap-free and duplicate-free under keyset pagination, and 10-40x faster at depth than an occupancydatetime-based cursor. Resuming from this can never skip or duplicate a row the way a timestamp cursor can when multiple readings share the same timestamp at a resume boundary.';
 COMMENT ON COLUMN archive_stream_checkpoint.readings_processed_count IS
   'Running count of readings processed so far in this archive''s streaming run. Informational only (progress reporting) -- resuming is driven by last_processed_id, not this count.';
+COMMENT ON COLUMN archive_stream_checkpoint.accumulator_state IS
+  'Serialized per-bucket incremental accumulator state (AccumulatorSnapshot, see incrementalWeightedStats.ts), exactly as it stood when last_processed_id was last checkpointed. Written in the same upsert as last_processed_id/readings_processed_count, never separately -- a resume restores this alongside the stream position atomically, so it can never be ahead (causing double-counting on replay) or behind (silently losing a checkpointed chunk''s contribution).';
 
 ALTER TABLE archive_stream_checkpoint ENABLE ROW LEVEL SECURITY;
 -- No CREATE POLICY statements, intentionally: same reasoning as
