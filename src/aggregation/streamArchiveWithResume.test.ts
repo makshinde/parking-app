@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS,
   clearArchiveStreamCheckpoint,
   DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS,
   DEFAULT_STREAM_CHUNK_SIZE,
@@ -549,5 +550,73 @@ describe("streamArchiveWithResume", () => {
     await expect(
       streamArchiveWithResume(client, { archiveDatasetId: ARCHIVE_DATASET_ID, chunkSize: 50, onChunk: () => ({}) }),
     ).rejects.toThrow(/503/);
+  });
+
+  describe("archive-streaming progress logging", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("does not log progress before ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS chunks have been processed", async () => {
+      const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const { client } = makeMockCheckpointClient({ existingRow: null });
+      for (let i = 0; i < ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS - 1; i++) {
+        fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(2, `q${i}`))); // full chunkSize-2 pages, never short
+      }
+      fetchMock.mockResolvedValueOnce(jsonResponse([])); // empty page -> stop BEFORE processing a 20th chunk
+
+      await streamArchiveWithResume(client, { archiveDatasetId: ARCHIVE_DATASET_ID, chunkSize: 2, onChunk: () => ({}) });
+
+      const progressLines = consoleLogSpy.mock.calls.filter((call) => String(call[0]).includes("Archive streaming progress"));
+      expect(progressLines).toHaveLength(0);
+    });
+
+    it("logs cumulative chunks processed and total readings once the interval is reached", async () => {
+      const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const { client } = makeMockCheckpointClient({ existingRow: null });
+      for (let i = 0; i < ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS; i++) {
+        fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(2, `p${i}`))); // 2 readings/chunk
+      }
+      fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(1, "last"))); // short -> stop
+
+      await streamArchiveWithResume(client, { archiveDatasetId: ARCHIVE_DATASET_ID, chunkSize: 2, onChunk: () => ({}) });
+
+      const progressLines = consoleLogSpy.mock.calls.filter((call) => String(call[0]).includes("Archive streaming progress"));
+      expect(progressLines).toHaveLength(1);
+      expect(progressLines[0]?.[0]).toContain(`${ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS} chunks processed`);
+      expect(progressLines[0]?.[0]).toContain(`${ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS * 2} total readings processed`);
+    });
+
+    // Also proves the logged reading count reflects the TRUE cumulative
+    // total across a resume (seeded from the checkpoint's own
+    // readings_processed_count), not just readings processed by this
+    // process's own main loop -- the same distinction that matters for
+    // readings_processed_count itself (see saveArchiveStreamPosition).
+    it("logs again after a second interval, with cumulative totals that include readings resumed from a prior run", async () => {
+      const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const { client } = makeMockCheckpointClient({
+        existingRow: {
+          archive_dataset_id: ARCHIVE_DATASET_ID,
+          last_processed_id: "row-old-1",
+          readings_processed_count: 1000,
+          accumulator_snapshot_last_processed_id: "row-old-1",
+          accumulator_state: SAMPLE_ACCUMULATOR_SNAPSHOT,
+        },
+      });
+      const totalChunks = ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS * 2;
+      for (let i = 0; i < totalChunks; i++) {
+        fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(2, `r${i}`)));
+      }
+      fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(1, "last"))); // short -> stop
+
+      await streamArchiveWithResume(client, { archiveDatasetId: ARCHIVE_DATASET_ID, chunkSize: 2, onChunk: () => ({}) });
+
+      const progressLines = consoleLogSpy.mock.calls.filter((call) => String(call[0]).includes("Archive streaming progress"));
+      expect(progressLines).toHaveLength(2);
+      expect(progressLines[0]?.[0]).toContain(`${ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS} chunks processed`);
+      expect(progressLines[0]?.[0]).toContain(`${1000 + ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS * 2} total readings processed`);
+      expect(progressLines[1]?.[0]).toContain(`${totalChunks} chunks processed`);
+      expect(progressLines[1]?.[0]).toContain(`${1000 + totalChunks * 2} total readings processed`);
+    });
   });
 });

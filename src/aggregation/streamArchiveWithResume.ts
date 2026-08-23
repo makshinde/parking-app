@@ -35,6 +35,17 @@ export const DEFAULT_STREAM_CHUNK_SIZE = 50000;
 //     target this was solved for.
 export const DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS = 120;
 
+// How often (in chunks) to print archive-streaming progress. Matches
+// ROLLING_WINDOW_PROGRESS_LOG_INTERVAL_PAGES's cadence (backfill-occupancy-
+// stats.ts) -- the archive-streaming main loop has the exact same "no
+// visible progress for a very long time" problem the rolling-window fetch
+// had (live-verified there: a real run sat silent for 45+ minutes between
+// log lines, indistinguishable from a stalled process). Unconditional, not
+// gated behind --max-chunks or any other testing flag -- a real,
+// uninterrupted production run spending hours in this loop needs this
+// visibility at least as much as a bounded test run does.
+export const ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS = 20;
+
 // --- archive_stream_checkpoint persistence ------------------------------
 
 export interface ArchiveStreamCheckpoint {
@@ -426,6 +437,7 @@ export async function streamArchiveWithResume(
   }
 
   let chunksSinceLastSnapshot = 0;
+  let totalChunksProcessed = 0;
 
   while (true) {
     const page = await fetchArchivePage(options.archiveDatasetId, cursorId, chunkSize);
@@ -438,6 +450,7 @@ export async function streamArchiveWithResume(
     cursorId = getRecordId(page[page.length - 1] as SocrataRecord);
     readingsProcessedCount += page.length;
     chunksSinceLastSnapshot += 1;
+    totalChunksProcessed += 1;
 
     // Cheap, every chunk -- see saveArchiveStreamPosition's own comment for
     // why this stays cheap even once a large accumulator snapshot already
@@ -447,6 +460,10 @@ export async function streamArchiveWithResume(
       lastProcessedId: cursorId,
       readingsProcessedCount,
     });
+
+    if (totalChunksProcessed % ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS === 0) {
+      console.log(`Archive streaming progress: ${totalChunksProcessed} chunks processed this run, ${readingsProcessedCount} total readings processed.`);
+    }
 
     if (chunksSinceLastSnapshot >= snapshotIntervalChunks) {
       // Expensive, only every snapshotIntervalChunks chunks. Written AFTER
