@@ -22,50 +22,82 @@ const SAMPLE_ACCUMULATOR_SNAPSHOT: AccumulatorSnapshot = {
 };
 
 // --- Checkpoint client mock, same shape as backfill-occupancy-stats.test.ts's
-// createMockFailuresClient (eq-chainable select/maybeSingle, upsert, delete/eq).
-// Labels each upsert call as "position" or "snapshot" by which keys are
-// present, so tests can assert the two cheap/expensive write paths never
-// get conflated.
+// createMockFailuresClient (eq-chainable select/maybeSingle, upsert, update,
+// delete/eq). Tracks a mutable currentRow (starting from existingRow, if
+// any) so .update() can genuinely simulate matching-vs-not-matching rows --
+// the same distinction saveArchiveStreamAccumulatorSnapshot's new row-count
+// check depends on -- rather than always succeeding regardless of whether a
+// row actually exists. .upsert() (still used by saveArchiveStreamPosition)
+// creates/merges into currentRow, exactly mirroring the real precondition
+// that a snapshot update always follows a position upsert for the same
+// chunk, or a checkpoint fetchArchiveStreamCheckpoint has already confirmed
+// exists (gap-replay's catch-up write).
 function makeMockCheckpointClient(options: {
   existingRow?: Record<string, unknown> | null;
   selectError?: { message: string } | null;
   upsertError?: { message: string } | null;
+  updateError?: { message: string } | null;
   deleteError?: { message: string } | null;
 } = {}) {
-  const existingRow = options.existingRow ?? null;
+  let currentRow: Record<string, unknown> | null = options.existingRow ?? null;
   const positionUpsertCalls: Record<string, unknown>[] = [];
-  const snapshotUpsertCalls: Record<string, unknown>[] = [];
+  const snapshotUpdateCalls: { archiveDatasetId: string; values: Record<string, unknown> }[] = [];
   const deleteCalls: unknown[] = [];
   const callOrder: string[] = [];
 
-  const queryBuilder = {
-    eq: () => queryBuilder,
+  const selectQueryBuilder = {
+    eq: () => selectQueryBuilder,
     maybeSingle: async () =>
       options.selectError !== undefined && options.selectError !== null
         ? { data: null, error: options.selectError }
-        : { data: existingRow, error: null },
+        : { data: currentRow, error: null },
   };
 
   const client: ArchiveStreamCheckpointSupabaseClient = {
     from: () =>
       ({
-        select: () => queryBuilder,
+        select: () => selectQueryBuilder,
         upsert: async (row: Record<string, unknown>) => {
-          if ("accumulator_state" in row) {
-            snapshotUpsertCalls.push(row);
-            callOrder.push("snapshot-upsert");
-          } else {
-            positionUpsertCalls.push(row);
-            callOrder.push("position-upsert");
+          positionUpsertCalls.push(row);
+          callOrder.push("position-upsert");
+          if (options.upsertError !== undefined && options.upsertError !== null) {
+            return { data: null, error: options.upsertError };
           }
-          return options.upsertError !== undefined && options.upsertError !== null
-            ? { data: null, error: options.upsertError }
-            : { data: null, error: null };
+          currentRow = { ...currentRow, ...row };
+          return { data: null, error: null };
+        },
+        update: (values: Record<string, unknown>) => {
+          let eqValue: string | undefined;
+          const updateBuilder = {
+            eq: (_column: string, value: string) => {
+              eqValue = value;
+              return updateBuilder;
+            },
+            select: async () => {
+              const archiveDatasetId = eqValue as string;
+              snapshotUpdateCalls.push({ archiveDatasetId, values });
+              callOrder.push("snapshot-update");
+              if (options.updateError !== undefined && options.updateError !== null) {
+                return { data: null, error: options.updateError };
+              }
+              if (currentRow === null || currentRow.archive_dataset_id !== archiveDatasetId) {
+                // Mirrors real PostgREST behavior: an UPDATE matching zero
+                // rows is not itself an error -- it just returns an empty
+                // result, which is exactly what saveArchiveStreamAccumulator
+                // Snapshot's row-count check exists to catch.
+                return { data: [], error: null };
+              }
+              currentRow = { ...currentRow, ...values };
+              return { data: [currentRow], error: null };
+            },
+          };
+          return updateBuilder;
         },
         delete: () => ({
           eq: async (_column: string, value: unknown) => {
             deleteCalls.push(value);
             callOrder.push("delete");
+            currentRow = null;
             return options.deleteError !== undefined && options.deleteError !== null
               ? { data: null, error: options.deleteError }
               : { data: [], error: null };
@@ -74,7 +106,7 @@ function makeMockCheckpointClient(options: {
       }) as unknown as ReturnType<ArchiveStreamCheckpointSupabaseClient["from"]>,
   };
 
-  return { client, positionUpsertCalls, snapshotUpsertCalls, deleteCalls, callOrder };
+  return { client, positionUpsertCalls, snapshotUpdateCalls, deleteCalls, callOrder };
 }
 
 function jsonResponse(body: unknown, init?: { ok?: boolean; status?: number; statusText?: string }) {
@@ -162,8 +194,20 @@ describe("saveArchiveStreamPosition", () => {
 });
 
 describe("saveArchiveStreamAccumulatorSnapshot", () => {
-  it("upserts ONLY the snapshot fields, never last_processed_id or readings_processed_count", async () => {
-    const { client, snapshotUpsertCalls } = makeMockCheckpointClient();
+  // The real precondition this function depends on: it's only ever called
+  // after saveArchiveStreamPosition has already created the row for this
+  // chunk (or against a checkpoint fetchArchiveStreamCheckpoint has already
+  // confirmed exists), so a matching row is always present in real usage.
+  const EXISTING_ROW = {
+    archive_dataset_id: ARCHIVE_DATASET_ID,
+    last_processed_id: "row-xyz",
+    readings_processed_count: 500,
+    accumulator_snapshot_last_processed_id: null,
+    accumulator_state: {},
+  };
+
+  it("updates ONLY the snapshot fields on the existing row, never last_processed_id or readings_processed_count", async () => {
+    const { client, snapshotUpdateCalls } = makeMockCheckpointClient({ existingRow: EXISTING_ROW });
 
     await saveArchiveStreamAccumulatorSnapshot(client, {
       archiveDatasetId: ARCHIVE_DATASET_ID,
@@ -171,17 +215,19 @@ describe("saveArchiveStreamAccumulatorSnapshot", () => {
       accumulatorState: SAMPLE_ACCUMULATOR_SNAPSHOT,
     });
 
-    expect(snapshotUpsertCalls).toEqual([
+    expect(snapshotUpdateCalls).toEqual([
       {
-        archive_dataset_id: ARCHIVE_DATASET_ID,
-        accumulator_snapshot_last_processed_id: "row-xyz",
-        accumulator_state: SAMPLE_ACCUMULATOR_SNAPSHOT,
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        values: {
+          accumulator_snapshot_last_processed_id: "row-xyz",
+          accumulator_state: SAMPLE_ACCUMULATOR_SNAPSHOT,
+        },
       },
     ]);
   });
 
   it("throws a clear error when saving the snapshot fails", async () => {
-    const { client } = makeMockCheckpointClient({ upsertError: { message: "statement timeout" } });
+    const { client } = makeMockCheckpointClient({ existingRow: EXISTING_ROW, updateError: { message: "statement timeout" } });
 
     await expect(
       saveArchiveStreamAccumulatorSnapshot(client, {
@@ -190,6 +236,27 @@ describe("saveArchiveStreamAccumulatorSnapshot", () => {
         accumulatorState: {},
       }),
     ).rejects.toThrow(new RegExp(`archive_dataset_id=${ARCHIVE_DATASET_ID}.*statement timeout`));
+  });
+
+  // Regression test for a real, live-confirmed bug: an .upsert() with a
+  // payload omitting last_processed_id reproducibly failed with a NOT NULL
+  // violation even against an already-existing row, because Postgres/
+  // PostgREST wasn't recognizing the conflict and attempted a fresh INSERT
+  // instead. A genuine UPDATE sidesteps that -- but a plain UPDATE has its
+  // own silent-failure mode (matching zero rows is not itself a PostgREST
+  // error), which is exactly what this defensive row-count check exists to
+  // catch instead of succeeding silently or failing with a confusing,
+  // unrelated error later.
+  it("throws a clear, specific error when no existing checkpoint row matches this archive dataset", async () => {
+    const { client } = makeMockCheckpointClient({ existingRow: null });
+
+    await expect(
+      saveArchiveStreamAccumulatorSnapshot(client, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        accumulatorSnapshotLastProcessedId: "row-1",
+        accumulatorState: {},
+      }),
+    ).rejects.toThrow(new RegExp(`expected exactly one existing archive_stream_checkpoint row for archive_dataset_id=${ARCHIVE_DATASET_ID}.*affected 0 row`));
   });
 });
 
@@ -234,7 +301,7 @@ describe("streamArchiveWithResume", () => {
   });
 
   it("starts fresh with no $where clause, and never calls onResume, when no checkpoint exists", async () => {
-    const { client, positionUpsertCalls, snapshotUpsertCalls, deleteCalls } = makeMockCheckpointClient({ existingRow: null });
+    const { client, positionUpsertCalls, snapshotUpdateCalls, deleteCalls } = makeMockCheckpointClient({ existingRow: null });
     fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(3, "a")));
     const chunks: SocrataRecord[][] = [];
     const onResume = vi.fn();
@@ -272,12 +339,12 @@ describe("streamArchiveWithResume", () => {
     expect(positionUpsertCalls).toEqual([
       { archive_dataset_id: ARCHIVE_DATASET_ID, last_processed_id: "row-a-2", readings_processed_count: 3 },
     ]);
-    expect(snapshotUpsertCalls).toEqual([]);
+    expect(snapshotUpdateCalls).toEqual([]);
     expect(deleteCalls).toEqual([ARCHIVE_DATASET_ID]);
   });
 
   it("snapshots the accumulator only every snapshotIntervalChunks chunks, saving position every chunk regardless", async () => {
-    const { client, positionUpsertCalls, snapshotUpsertCalls, callOrder } = makeMockCheckpointClient({ existingRow: null });
+    const { client, positionUpsertCalls, snapshotUpdateCalls, callOrder } = makeMockCheckpointClient({ existingRow: null });
     fetchMock
       .mockResolvedValueOnce(jsonResponse(makeRecords(2, "c1")))
       .mockResolvedValueOnce(jsonResponse(makeRecords(2, "c2")))
@@ -294,8 +361,8 @@ describe("streamArchiveWithResume", () => {
     // 4 chunks processed -> 4 position writes, but only 1 snapshot write
     // (after the 3rd chunk, at snapshotIntervalChunks=3) before the run ends.
     expect(positionUpsertCalls).toHaveLength(4);
-    expect(snapshotUpsertCalls).toHaveLength(1);
-    expect(snapshotUpsertCalls[0]).toMatchObject({ accumulator_snapshot_last_processed_id: "row-c3-1" });
+    expect(snapshotUpdateCalls).toHaveLength(1);
+    expect(snapshotUpdateCalls[0]?.values).toMatchObject({ accumulator_snapshot_last_processed_id: "row-c3-1" });
 
     // On the snapshotting chunk (the 3rd), position is saved BEFORE the
     // snapshot -- this ordering is what guarantees the snapshot cursor can
@@ -304,14 +371,14 @@ describe("streamArchiveWithResume", () => {
       "position-upsert", // chunk 1
       "position-upsert", // chunk 2
       "position-upsert", // chunk 3
-      "snapshot-upsert", // chunk 3's snapshot, after its position write
+      "snapshot-update", // chunk 3's snapshot, after its position write
       "position-upsert", // chunk 4
       "delete",
     ]);
   });
 
   it("resumes with no gap-replay fetch when the snapshot cursor already equals the stream position", async () => {
-    const { client, snapshotUpsertCalls } = makeMockCheckpointClient({
+    const { client, snapshotUpdateCalls } = makeMockCheckpointClient({
       existingRow: {
         archive_dataset_id: ARCHIVE_DATASET_ID,
         last_processed_id: "row-old-1",
@@ -329,12 +396,12 @@ describe("streamArchiveWithResume", () => {
     // redundant re-snapshot write, since there was nothing to catch up.
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(new URL(fetchMock.mock.calls[0]?.[0] as string).searchParams.get("$where")).toBe(":id > 'row-old-1'");
-    expect(snapshotUpsertCalls).toEqual([]);
+    expect(snapshotUpdateCalls).toEqual([]);
     expect(onResume).toHaveBeenCalledExactlyOnceWith(SAMPLE_ACCUMULATOR_SNAPSHOT);
   });
 
   it("replays exactly the bounded gap between the snapshot cursor and the stream position on resume, then re-snapshots and continues", async () => {
-    const { client, snapshotUpsertCalls, callOrder } = makeMockCheckpointClient({
+    const { client, snapshotUpdateCalls, callOrder } = makeMockCheckpointClient({
       existingRow: {
         archive_dataset_id: ARCHIVE_DATASET_ID,
         last_processed_id: "row-g-3", // stream got 2 chunks ahead of the snapshot before crashing
@@ -376,11 +443,11 @@ describe("streamArchiveWithResume", () => {
 
     // The caught-up snapshot is persisted immediately, at the stream's
     // cursor (row-g-3), before the main loop's own next chunk runs.
-    expect(snapshotUpsertCalls[0]).toMatchObject({
+    expect(snapshotUpdateCalls[0]?.values).toMatchObject({
       accumulator_snapshot_last_processed_id: "row-g-3",
       accumulator_state: { seed: { count: 4, totalWeight: 4, mean: 1, sumSquaredDiff: 0 } },
     });
-    expect(callOrder[0]).toBe("snapshot-upsert"); // the catch-up snapshot, before any main-loop write
+    expect(callOrder[0]).toBe("snapshot-update"); // the catch-up snapshot, before any main-loop write
 
     // Main loop then continues forward from row-g-3, not from row-g-1.
     const mainLoopCallUrl = new URL(fetchMock.mock.calls[1]?.[0] as string);

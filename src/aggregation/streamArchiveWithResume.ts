@@ -87,15 +87,27 @@ interface ArchiveStreamCheckpointRow {
 // Same DI shape as BackfillFailuresSupabaseClient (backfill-occupancy-stats.ts):
 // a chainable .eq() query builder resolving via .maybeSingle() (zero rows is
 // a valid, expected outcome -- a fresh archive with no checkpoint yet --
-// not an error), plus upsert and delete.
+// not an error), plus upsert, update, and delete.
 export interface ArchiveStreamCheckpointQueryBuilder extends PromiseLike<SupabaseQueryResult<ArchiveStreamCheckpointRow[]>> {
   eq(column: string, value: string): ArchiveStreamCheckpointQueryBuilder;
   maybeSingle(): PromiseLike<SupabaseQueryResult<ArchiveStreamCheckpointRow>>;
 }
 
+// .update()'s own builder shape, distinct from .select()'s above: chains
+// .eq() the same way, but resolves via .select() instead of .maybeSingle()
+// -- requesting the updated row(s) back (Prefer: return=representation) is
+// what lets saveArchiveStreamAccumulatorSnapshot confirm exactly one row
+// was actually affected, rather than assuming success from a null-data,
+// zero-rows-matched response the way a bare .upsert() would.
+export interface ArchiveStreamCheckpointUpdateQueryBuilder {
+  eq(column: string, value: string): ArchiveStreamCheckpointUpdateQueryBuilder;
+  select(): PromiseLike<SupabaseQueryResult<ArchiveStreamCheckpointRow[]>>;
+}
+
 export interface ArchiveStreamCheckpointSupabaseTableBuilder {
   select(columns: string): ArchiveStreamCheckpointQueryBuilder;
   upsert(values: Record<string, unknown>, options: { onConflict: string }): PromiseLike<SupabaseQueryResult>;
+  update(values: Record<string, unknown>): ArchiveStreamCheckpointUpdateQueryBuilder;
   delete(): { eq(column: string, value: string): PromiseLike<SupabaseQueryResult> };
 }
 
@@ -167,34 +179,64 @@ export async function saveArchiveStreamPosition(
 }
 
 // Expensive: writes accumulator_state and the :id cursor it reflects
-// (accumulator_snapshot_last_processed_id) together, in one upsert. These
+// (accumulator_snapshot_last_processed_id) together, in one write. These
 // two specifically must never drift apart from EACH OTHER -- that pairing
 // is what "the accumulator exactly as of this :id position" means, and
 // losing it would reintroduce the original double-counting/undercounting
 // risk this design exists to fix, just between these two fields instead of
 // against last_processed_id.
 //
-// Only ever called immediately after saveArchiveStreamPosition has run for
-// the same chunk (see streamArchiveWithResume) -- so the row is guaranteed
-// to already exist, since last_processed_id/readings_processed_count have
-// no defaults and a bare INSERT omitting them here would otherwise fail
-// their NOT NULL constraints.
+// A genuine UPDATE, not an upsert -- live-confirmed as a real, would-have-
+// broken-every-production-run bug: an .upsert() with onConflict targeting
+// archive_dataset_id's UNIQUE constraint, for a payload that omits
+// last_processed_id (a NOT NULL column with no default), reproducibly
+// failed with a "null value in column last_processed_id violates not-null
+// constraint" error EVEN AGAINST AN ALREADY-EXISTING ROW -- confirmed via
+// direct, isolated testing against a disposable row (not this project's
+// real data) that Postgres was genuinely attempting a fresh INSERT (a new,
+// randomly-generated id in the failing-row detail) rather than recognizing
+// the conflict, while a plain UPDATE against that identical row succeeded
+// immediately. Root mechanism unconfirmed (a PostgREST/postgrest-js
+// upsert-with-partial-payload interaction, not this table's schema -- the
+// UNIQUE constraint itself is real and correctly declared), but a genuine
+// UPDATE sidesteps it entirely and is also the more semantically correct
+// operation here regardless: this function is only ever called immediately
+// after saveArchiveStreamPosition has run for the same chunk (see
+// streamArchiveWithResume), or against a checkpoint row
+// fetchArchiveStreamCheckpoint has just confirmed exists (gap-replay's
+// catch-up write) -- there is no legitimate case where this row doesn't
+// already exist, unlike saveArchiveStreamPosition, which genuinely does
+// need upsert's create-or-update behavior for a truly fresh run's first
+// chunk.
+//
+// The .select() after .eq() requests the updated row back (Prefer:
+// return=representation) specifically so the row count can be checked --
+// an UPDATE matching zero rows is not an error PostgREST reports on its
+// own (it just quietly returns an empty result), and silently doing
+// nothing here would be exactly the kind of quiet, hard-to-detect failure
+// this whole checkpoint design exists to avoid.
 export async function saveArchiveStreamAccumulatorSnapshot(
   client: ArchiveStreamCheckpointSupabaseClient,
   snapshot: { archiveDatasetId: string; accumulatorSnapshotLastProcessedId: string; accumulatorState: AccumulatorSnapshot },
 ): Promise<void> {
-  const { error } = await client.from("archive_stream_checkpoint").upsert(
-    {
-      archive_dataset_id: snapshot.archiveDatasetId,
+  const { data, error } = await client
+    .from("archive_stream_checkpoint")
+    .update({
       accumulator_snapshot_last_processed_id: snapshot.accumulatorSnapshotLastProcessedId,
       accumulator_state: snapshot.accumulatorState,
-    },
-    { onConflict: "archive_dataset_id" },
-  );
+    })
+    .eq("archive_dataset_id", snapshot.archiveDatasetId)
+    .select();
 
   if (error !== null) {
     throw new Error(
       `saveArchiveStreamAccumulatorSnapshot: writing accumulator snapshot for archive_dataset_id=${snapshot.archiveDatasetId} failed: ${error.message}`,
+    );
+  }
+
+  if (data === null || data.length !== 1) {
+    throw new Error(
+      `saveArchiveStreamAccumulatorSnapshot: expected exactly one existing archive_stream_checkpoint row for archive_dataset_id=${snapshot.archiveDatasetId}, but the update affected ${data?.length ?? 0} row(s) -- this function is only ever called after saveArchiveStreamPosition has already created the row for this chunk, so a missing row signals a real bug upstream, not a normal case to handle gracefully`,
     );
   }
 }
