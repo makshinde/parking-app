@@ -458,13 +458,12 @@ function can have multiple kinds of input.
 
 ## Git workflow
 
-Use a branch and PR for anything that changes logic, either going forward
-(new or modified functions, schema or migration changes, new conventions
-future code must follow) or retrospectively (changing how existing code
-behaves). Commit directly to main for documentation-only changes that don't
-affect behavior, like adding a "known open question" or "future idea" note,
-typo fixes, or comment clarifications. When in doubt about which category a
-change falls into, ask rather than assume.
+Every change goes through a branch and a PR -- no exceptions, including
+pure documentation changes (a "known open question" or "future idea" note,
+typo fixes, comment clarifications). Branch protection on main enforces
+this directly (a direct push, including a docs-only one, is rejected: repo
+rules require a PR and a passing "test" status check), so there's no
+direct-to-main path to fall back on even if one seemed convenient.
 
 When deciding whether to bundle two related changes into one PR or keep them
 as separate PRs, the deciding factor is shared purpose, not shared file or
