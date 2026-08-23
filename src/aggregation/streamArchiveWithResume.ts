@@ -227,7 +227,11 @@ function buildArchivePageUrl(
   upperBoundId: string | null = null,
 ): string {
   const url = new URL(`${SOCRATA_BASE_URL}/${archiveDatasetId}.json`);
-  url.searchParams.set("$select", ":id,*");
+  // SoQL requires a star selection to come first in the select-list --
+  // live-verified against the real API: "*,:id" succeeds, ":id,*" fails
+  // with query.compiler.malformed ("Star selections must come at the start
+  // of the select-list").
+  url.searchParams.set("$select", "*,:id");
   url.searchParams.set("$order", ":id");
   url.searchParams.set("$limit", String(chunkSize));
 

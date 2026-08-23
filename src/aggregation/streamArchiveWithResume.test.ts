@@ -254,6 +254,12 @@ describe("streamArchiveWithResume", () => {
     expect(firstCallUrl.searchParams.has("$where")).toBe(false);
     expect(firstCallUrl.searchParams.get("$order")).toBe(":id");
     expect(firstCallUrl.searchParams.get("$limit")).toBe("50");
+    // SoQL requires a star selection to come first in the select-list --
+    // "*,:id" is valid, ":id,*" fails with query.compiler.malformed
+    // (live-verified against the real API: this exact ordering bug shipped
+    // once already and only surfaced in a real --max-chunks run, since a
+    // mocked fetch response doesn't validate SoQL syntax).
+    expect(firstCallUrl.searchParams.get("$select")).toBe("*,:id");
 
     expect(onResume).not.toHaveBeenCalled();
     expect(chunks).toHaveLength(1);
