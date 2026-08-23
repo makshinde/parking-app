@@ -74,3 +74,34 @@ export async function fetchSocrataRecords(datasetUrl: string, whereClause: strin
 
   return allRecords;
 }
+
+// Same $where/$limit/$offset pagination as fetchSocrataRecords, but hands
+// each page to onPage as soon as it arrives instead of accumulating every
+// page into one array -- for datasets too large to hold entirely in memory
+// at once (live-verified: fetchSocrataRecords itself OOM'd, ~2GB heap,
+// wholesale-fetching the 27,080,827-row rolling window dataset -- see
+// CLAUDE.md's Architecture section). onPage is awaited before the next
+// page is fetched, so at most one page's worth of raw records is ever held
+// in memory at a time, on top of whatever the caller's own onPage does with
+// each page (e.g. fold it into a running accumulator and discard it).
+export async function fetchSocrataRecordsPaginated(
+  datasetUrl: string,
+  whereClause: string,
+  onPage: (page: SocrataRecord[]) => Promise<void> | void,
+): Promise<void> {
+  let offset = 0;
+
+  while (true) {
+    const page = await fetchPage(datasetUrl, whereClause, offset);
+    await onPage(page);
+
+    // Same short-page stopping rule as fetchSocrataRecords -- see its own
+    // comment for why an exact-SOCRATA_PAGE_LIMIT page still gets one more
+    // (possibly empty) request rather than assuming it's the last page.
+    if (page.length < SOCRATA_PAGE_LIMIT) {
+      break;
+    }
+
+    offset += SOCRATA_PAGE_LIMIT;
+  }
+}

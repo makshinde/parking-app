@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchSocrataRecords, SOCRATA_PAGE_LIMIT } from "./fetchSocrataRecords";
+import { fetchSocrataRecords, fetchSocrataRecordsPaginated, SOCRATA_PAGE_LIMIT } from "./fetchSocrataRecords";
 
 function jsonResponse(body: unknown, init?: { ok?: boolean; status?: number; statusText?: string }) {
   return {
@@ -140,5 +140,105 @@ describe("fetchSocrataRecords", () => {
       const [, init] = call as [string, RequestInit];
       expect(init.headers).toEqual({});
     });
+  });
+});
+
+describe("fetchSocrataRecordsPaginated", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("hands a single page to onPage when pagination isn't needed", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(3)));
+    const pages: unknown[][] = [];
+
+    await fetchSocrataRecordsPaginated(DATASET_URL, "sourceelementkey='1029'", (page) => {
+      pages.push(page);
+    });
+
+    expect(pages).toHaveLength(1);
+    expect(pages[0]).toHaveLength(3);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("calls onPage separately for each page, never combining them into one array", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(makeRecords(SOCRATA_PAGE_LIMIT)))
+      .mockResolvedValueOnce(jsonResponse(makeRecords(3)));
+    const pageSizes: number[] = [];
+
+    await fetchSocrataRecordsPaginated(DATASET_URL, "1=1", (page) => {
+      pageSizes.push(page.length);
+    });
+
+    expect(pageSizes).toEqual([SOCRATA_PAGE_LIMIT, 3]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("awaits onPage before fetching the next page", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(makeRecords(SOCRATA_PAGE_LIMIT)))
+      .mockResolvedValueOnce(jsonResponse(makeRecords(1)));
+    const callOrder: string[] = [];
+
+    await fetchSocrataRecordsPaginated(DATASET_URL, "1=1", async (page) => {
+      callOrder.push(`onPage-start-${page.length}`);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      callOrder.push(`onPage-end-${page.length}`);
+    });
+
+    expect(callOrder).toEqual([
+      `onPage-start-${SOCRATA_PAGE_LIMIT}`,
+      `onPage-end-${SOCRATA_PAGE_LIMIT}`,
+      "onPage-start-1",
+      "onPage-end-1",
+    ]);
+  });
+
+  it("makes one more request after a page that returns exactly the limit, instead of assuming it's the last page", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(SOCRATA_PAGE_LIMIT))).mockResolvedValueOnce(jsonResponse([]));
+    const pages: unknown[][] = [];
+
+    await fetchSocrataRecordsPaginated(DATASET_URL, "1=1", (page) => {
+      pages.push(page);
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(pages).toHaveLength(2);
+    expect(pages[1]).toHaveLength(0);
+  });
+
+  it("calls onPage once with an empty array when no records match", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse([]));
+    const pages: unknown[][] = [];
+
+    await fetchSocrataRecordsPaginated(DATASET_URL, "1=0", (page) => {
+      pages.push(page);
+    });
+
+    expect(pages).toEqual([[]]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws rather than continuing on a non-200 response", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(makeRecords(SOCRATA_PAGE_LIMIT), { ok: false, status: 500, statusText: "Internal Server Error" }),
+    );
+
+    await expect(fetchSocrataRecordsPaginated(DATASET_URL, "1=1", () => {})).rejects.toThrow(/500/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws rather than swallowing a network failure", async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError("fetch failed"));
+
+    await expect(fetchSocrataRecordsPaginated(DATASET_URL, "1=1", () => {})).rejects.toThrow("fetch failed");
   });
 });
