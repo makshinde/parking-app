@@ -615,12 +615,12 @@ function makeMockCheckpointClient(existingRow: Record<string, unknown> | null) {
 }
 
 describe("initializeAccumulators", () => {
-  it("fresh start (no checkpoint): fetches and folds the rolling window", async () => {
+  it("fresh start (no checkpoint): fetches and folds the rolling window, page by page", async () => {
     const checkpointClient = makeMockCheckpointClient(null);
     let fetchCallCount = 0;
-    const fetchRollingWindowRecords = async () => {
+    const fetchRollingWindowPages = async (onPage: (page: SocrataRecord[]) => Promise<void> | void) => {
       fetchCallCount += 1;
-      return [makeRawRecord()];
+      await onPage([makeRawRecord()]);
     };
 
     const result = await initializeAccumulators({
@@ -628,7 +628,7 @@ describe("initializeAccumulators", () => {
       archiveDatasetId: "7c2e-uany",
       lookup: FOLD_LOOKUP,
       now: FOLD_NOW,
-      fetchRollingWindowRecords,
+      fetchRollingWindowPages,
     });
 
     expect(result.resuming).toBe(false);
@@ -654,9 +654,9 @@ describe("initializeAccumulators", () => {
       accumulator_state: {},
     });
     let fetchCallCount = 0;
-    const fetchRollingWindowRecords = async () => {
+    const fetchRollingWindowPages = async (onPage: (page: SocrataRecord[]) => Promise<void> | void) => {
       fetchCallCount += 1;
-      return [makeRawRecord()];
+      await onPage([makeRawRecord()]);
     };
 
     const result = await initializeAccumulators({
@@ -664,7 +664,7 @@ describe("initializeAccumulators", () => {
       archiveDatasetId: "7c2e-uany",
       lookup: FOLD_LOOKUP,
       now: FOLD_NOW,
-      fetchRollingWindowRecords,
+      fetchRollingWindowPages,
     });
 
     expect(fetchCallCount).toBe(0);
@@ -672,5 +672,73 @@ describe("initializeAccumulators", () => {
     expect(result.accumulators.size).toBe(0);
     expect(result.unmatchedCount).toBe(0);
     expect(result.parseFailures).toBe(0);
+  });
+
+  // The specific correctness concern behind paginating this fetch in the
+  // first place (see fetchRollingWindowPages's own comment): each page must
+  // be FOLDED INTO the same running accumulator, not treated as a fresh
+  // replacement for the previous page's contribution.
+  it("folds multiple pages into the same accumulator Map, accumulating rather than overwriting page to page", async () => {
+    const checkpointClient = makeMockCheckpointClient(null);
+    const fetchRollingWindowPages = async (onPage: (page: SocrataRecord[]) => Promise<void> | void) => {
+      await onPage([makeRawRecord(), makeRawRecord()]); // page 1: 2 readings
+      await onPage([makeRawRecord()]); // page 2: 1 more reading, same bucket
+    };
+
+    const result = await initializeAccumulators({
+      checkpointClient,
+      archiveDatasetId: "7c2e-uany",
+      lookup: FOLD_LOOKUP,
+      now: FOLD_NOW,
+      fetchRollingWindowPages,
+    });
+
+    const key = buildAccumulatorBucketKey("blockface-1", 4, 17);
+    expect(result.accumulators.size).toBe(1);
+    expect(result.accumulators.get(key)?.count).toBe(3);
+  });
+
+  it("keeps different buckets from different pages separate, rather than one page's buckets clobbering another's", async () => {
+    const checkpointClient = makeMockCheckpointClient(null);
+    const lookup = new Map([
+      ["9477:W", "blockface-1"],
+      ["1234:N", "blockface-2"],
+    ]);
+    const fetchRollingWindowPages = async (onPage: (page: SocrataRecord[]) => Promise<void> | void) => {
+      await onPage([makeRawRecord()]); // page 1: blockface-1
+      await onPage([makeRawRecord({ sourceelementkey: "1234", sideofstreet: "N" })]); // page 2: blockface-2
+    };
+
+    const result = await initializeAccumulators({
+      checkpointClient,
+      archiveDatasetId: "7c2e-uany",
+      lookup,
+      now: FOLD_NOW,
+      fetchRollingWindowPages,
+    });
+
+    expect(result.accumulators.size).toBe(2);
+    expect(result.accumulators.get(buildAccumulatorBucketKey("blockface-1", 4, 17))?.count).toBe(1);
+    expect(result.accumulators.get(buildAccumulatorBucketKey("blockface-2", 4, 17))?.count).toBe(1);
+  });
+
+  it("sums unmatchedCount and parseFailures across pages rather than only counting the last one", async () => {
+    const checkpointClient = makeMockCheckpointClient(null);
+    const fetchRollingWindowPages = async (onPage: (page: SocrataRecord[]) => Promise<void> | void) => {
+      await onPage([makeRawRecord({ sourceelementkey: "99999" })]); // page 1: unmatched
+      await onPage([makeRawRecord({ parkingspacecount: "n/a" })]); // page 2: parse failure
+    };
+
+    const result = await initializeAccumulators({
+      checkpointClient,
+      archiveDatasetId: "7c2e-uany",
+      lookup: FOLD_LOOKUP,
+      now: FOLD_NOW,
+      fetchRollingWindowPages,
+    });
+
+    expect(result.unmatchedCount).toBe(1);
+    expect(result.parseFailures).toBe(1);
+    expect(result.accumulators.size).toBe(0);
   });
 });

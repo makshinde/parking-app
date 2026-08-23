@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
 import { pathToFileURL } from "node:url";
-import { fetchSocrataRecords, type SocrataRecord } from "../utils/fetchSocrataRecords.ts";
+import { fetchSocrataRecordsPaginated, type SocrataRecord } from "../utils/fetchSocrataRecords.ts";
 import type { SupabaseQueryResult } from "../importers/upsertBlockface.ts";
 import { resolveYearlyArchiveDatasetId, getPriorYear } from "./resolveYearlyArchive.ts";
 import {
@@ -478,7 +478,14 @@ export interface InitializeAccumulatorsDeps {
   archiveDatasetId: string;
   lookup: Map<string, string>;
   now: Date;
-  fetchRollingWindowRecords: () => Promise<SocrataRecord[]>;
+  // Paginated, not a single fetch-everything call: the rolling window
+  // (rke9-rsvs) is genuinely too large to hold in memory as one array --
+  // live-verified, a first attempt at "fetch the whole thing, then parse,
+  // then fold" OOM'd (~2GB heap) against its real 27,080,827 rows. onPage
+  // is called once per page (see fetchSocrataRecordsPaginated), and
+  // initializeAccumulators folds and discards each page immediately rather
+  // than accumulating them.
+  fetchRollingWindowPages: (onPage: (page: SocrataRecord[]) => Promise<void> | void) => Promise<void>;
 }
 
 export interface InitializeAccumulatorsResult {
@@ -510,9 +517,15 @@ export async function initializeAccumulators(deps: InitializeAccumulatorsDeps): 
     return { accumulators, unmatchedCount: 0, parseFailures: 0, resuming: true };
   }
 
-  const rawRollingRecords = await deps.fetchRollingWindowRecords();
-  const result = foldReadingsIntoAccumulators(rawRollingRecords, accumulators, deps.lookup, deps.now);
-  return { accumulators, unmatchedCount: result.unmatchedCount, parseFailures: result.parseFailures, resuming: false };
+  let unmatchedCount = 0;
+  let parseFailures = 0;
+  await deps.fetchRollingWindowPages((page) => {
+    const result = foldReadingsIntoAccumulators(page, accumulators, deps.lookup, deps.now);
+    unmatchedCount += result.unmatchedCount;
+    parseFailures += result.parseFailures;
+  });
+
+  return { accumulators, unmatchedCount, parseFailures, resuming: false };
 }
 
 // --- Orchestration ------------------------------------------------------
@@ -599,7 +612,7 @@ export async function main(): Promise<void> {
     archiveDatasetId,
     lookup,
     now,
-    fetchRollingWindowRecords: () => fetchSocrataRecords(buildSocrataDatasetUrl(ROLLING_WINDOW_DATASET_ID), "1=1"),
+    fetchRollingWindowPages: (onPage) => fetchSocrataRecordsPaginated(buildSocrataDatasetUrl(ROLLING_WINDOW_DATASET_ID), "1=1", onPage),
   });
   let accumulators = initResult.accumulators;
   let totalUnmatched = initResult.unmatchedCount;
