@@ -82,7 +82,21 @@ async function fetchPageOnce(url: string): Promise<SocrataRecord[]> {
     );
   }
 
-  return (await response.json()) as SocrataRecord[];
+  try {
+    return (await response.json()) as SocrataRecord[];
+  } catch (err) {
+    // The connection can drop mid-body-read even after a successful status
+    // line -- live-verified: undici throws "TypeError: terminated" (wrapping
+    // an ECONNRESET) while streaming/parsing the body, well after fetch()
+    // itself already resolved with response.ok === true. Just as transient
+    // as a connection failure before the request even went out, so it's
+    // retried the same way rather than being left unclassified.
+    const message = err instanceof Error ? err.message : String(err);
+    throw new SocrataRequestError(
+      `fetchSocrataRecords: request to ${url} failed while reading the response body: ${message}`,
+      true,
+    );
+  }
 }
 
 async function fetchPage(datasetUrl: string, whereClause: string, offset: number): Promise<SocrataRecord[]> {

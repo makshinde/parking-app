@@ -14,6 +14,19 @@ function makeRecords(count: number): Record<string, number>[] {
   return Array.from({ length: count }, (_, i) => ({ id: i }));
 }
 
+// Simulates a response whose status line succeeded (fetch() itself
+// resolved, response.ok is true) but whose body stream then dropped mid-read
+// -- the real shape of the live-observed "TypeError: terminated" /
+// ECONNRESET failure, which happens strictly after a successful fetch().
+function brokenBodyResponse(): Response {
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    json: () => Promise.reject(new TypeError("terminated")),
+  } as Response;
+}
+
 const DATASET_URL = "https://data.seattle.gov/resource/rke9-rsvs.json";
 
 describe("fetchSocrataRecords", () => {
@@ -168,6 +181,27 @@ describe("fetchSocrataRecords", () => {
 
       expect(result).toHaveLength(1);
       expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("retries a body-read failure (connection dropped mid-stream after a 200) and succeeds on the next attempt", async () => {
+      fetchMock.mockResolvedValueOnce(brokenBodyResponse()).mockResolvedValueOnce(jsonResponse(makeRecords(2)));
+
+      const resultPromise = fetchSocrataRecords(DATASET_URL, "1=1");
+      await vi.runAllTimersAsync();
+      const result = await resultPromise;
+
+      expect(result).toHaveLength(2);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("surfaces a clear final error after exhausting all retries on a sustained body-read failure", async () => {
+      fetchMock.mockResolvedValue(brokenBodyResponse());
+
+      const assertion = expect(fetchSocrataRecords(DATASET_URL, "1=1")).rejects.toThrow(/terminated/);
+      await vi.runAllTimersAsync();
+      await assertion;
+
+      expect(fetchMock).toHaveBeenCalledTimes(MAX_FETCH_ATTEMPTS);
     });
 
     it("surfaces a clear final error after exhausting all retries on a sustained 502 outage", async () => {
