@@ -245,6 +245,22 @@ it.
   note -- incrementalWeightedStats.ts (the accumulator) exists, but the
   streaming fetch/resume module itself does not.
 
+  This same slowdown was observed again on 2026-08-22, now against the
+  fully-built streaming path described above, with real numbers: a live
+  `--max-chunks=50` run of backfill-occupancy-stats.ts sat in the
+  rolling-window fetch phase (fetching and folding rke9-rsvs's ~27M rows,
+  ~9% of a full year's archive) for 45+ minutes, against a roughly 8-minute
+  expectation scaled down from this section's own 57-minutes-fetch-only
+  full-archive estimate. Directly checked via `ps` during the run rather
+  than assumed: the process was genuinely still working, not hung or stuck
+  in a retry loop (CPU time was still advancing between two snapshots taken
+  15 seconds apart, RSS stayed bounded in the ~187-278MB range consistent
+  with this design's flat-memory behavior, and zero retry-attempt log lines
+  had printed), it was just taking far longer than expected to do that
+  work. Another data point supporting the sustained-heavy-use-slowdown
+  hypothesis above, not a new or separate investigation -- root cause still
+  unconfirmed.
+
 ## Handling invalid input
 
 Two categories, handled differently:
