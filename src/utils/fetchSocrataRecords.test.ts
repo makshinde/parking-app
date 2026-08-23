@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchSocrataRecords, fetchSocrataRecordsPaginated, SOCRATA_PAGE_LIMIT } from "./fetchSocrataRecords";
+import { fetchSocrataRecords, fetchSocrataRecordsPaginated, MAX_FETCH_ATTEMPTS, SOCRATA_PAGE_LIMIT } from "./fetchSocrataRecords";
 
 function jsonResponse(body: unknown, init?: { ok?: boolean; status?: number; statusText?: string }) {
   return {
@@ -81,21 +81,16 @@ describe("fetchSocrataRecords", () => {
     expect(secondCallUrl.searchParams.get("$offset")).toBe(String(SOCRATA_PAGE_LIMIT));
   });
 
-  it("throws rather than returning partial data on a non-200 response", async () => {
+  it("throws rather than returning partial data on a non-200, non-retryable response", async () => {
     fetchMock.mockResolvedValueOnce(
-      jsonResponse(makeRecords(SOCRATA_PAGE_LIMIT), { ok: false, status: 500, statusText: "Internal Server Error" }),
+      jsonResponse(makeRecords(SOCRATA_PAGE_LIMIT), { ok: false, status: 404, statusText: "Not Found" }),
     );
 
-    await expect(fetchSocrataRecords(DATASET_URL, "1=1")).rejects.toThrow(/500/);
+    await expect(fetchSocrataRecords(DATASET_URL, "1=1")).rejects.toThrow(/404/);
     // Only the failing first page was attempted -- no silent fallback to a
-    // second request pretending the first page succeeded.
+    // second request pretending the first page succeeded, and no retry
+    // either, since a 4xx will fail identically every time.
     expect(fetchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("throws rather than swallowing a network failure", async () => {
-    fetchMock.mockRejectedValueOnce(new TypeError("fetch failed"));
-
-    await expect(fetchSocrataRecords(DATASET_URL, "1=1")).rejects.toThrow("fetch failed");
   });
 
   it("returns an empty array when no records match", async () => {
@@ -139,6 +134,87 @@ describe("fetchSocrataRecords", () => {
       }
       const [, init] = call as [string, RequestInit];
       expect(init.headers).toEqual({});
+    });
+  });
+
+  describe("retry-with-backoff on transient failures", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("retries a transient 502 and succeeds once the next attempt goes through", async () => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse([], { ok: false, status: 502, statusText: "Bad Gateway" }))
+        .mockResolvedValueOnce(jsonResponse(makeRecords(2)));
+
+      const resultPromise = fetchSocrataRecords(DATASET_URL, "1=1");
+      await vi.runAllTimersAsync();
+      const result = await resultPromise;
+
+      expect(result).toHaveLength(2);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("retries a network failure (rejected fetch) and succeeds once the next attempt goes through", async () => {
+      fetchMock.mockRejectedValueOnce(new TypeError("fetch failed")).mockResolvedValueOnce(jsonResponse(makeRecords(1)));
+
+      const resultPromise = fetchSocrataRecords(DATASET_URL, "1=1");
+      await vi.runAllTimersAsync();
+      const result = await resultPromise;
+
+      expect(result).toHaveLength(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("surfaces a clear final error after exhausting all retries on a sustained 502 outage", async () => {
+      fetchMock.mockResolvedValue(jsonResponse([], { ok: false, status: 502, statusText: "Bad Gateway" }));
+
+      const assertion = expect(fetchSocrataRecords(DATASET_URL, "1=1")).rejects.toThrow(/502/);
+      await vi.runAllTimersAsync();
+      await assertion;
+
+      // Initial attempt plus every retry, no more -- confirms the backoff
+      // loop actually stops instead of retrying forever.
+      expect(fetchMock).toHaveBeenCalledTimes(MAX_FETCH_ATTEMPTS);
+    });
+
+    it("does not retry a 4xx client error, since retrying it would never succeed", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse([], { ok: false, status: 404, statusText: "Not Found" }));
+
+      await expect(fetchSocrataRecords(DATASET_URL, "1=1")).rejects.toThrow(/404/);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("waits with increasing delay between retries rather than a fixed interval", async () => {
+      fetchMock.mockResolvedValue(jsonResponse([], { ok: false, status: 503, statusText: "Service Unavailable" }));
+
+      const assertion = expect(fetchSocrataRecords(DATASET_URL, "1=1")).rejects.toThrow(/503/);
+
+      // Nothing retried yet immediately after the first failure.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // First backoff (1s) elapses -> second attempt fires.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      // A second 1s wait alone should NOT be enough to trigger the third
+      // attempt -- the delay after attempt 2 is 2s, not 1s.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      // The remaining 1s of the 2s backoff elapses -> third attempt fires.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+
+      await vi.runAllTimersAsync();
+      await assertion;
+      expect(fetchMock).toHaveBeenCalledTimes(MAX_FETCH_ATTEMPTS);
     });
   });
 });
@@ -227,18 +303,44 @@ describe("fetchSocrataRecordsPaginated", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("throws rather than continuing on a non-200 response", async () => {
+  it("throws rather than continuing on a non-200, non-retryable response", async () => {
     fetchMock.mockResolvedValueOnce(
-      jsonResponse(makeRecords(SOCRATA_PAGE_LIMIT), { ok: false, status: 500, statusText: "Internal Server Error" }),
+      jsonResponse(makeRecords(SOCRATA_PAGE_LIMIT), { ok: false, status: 404, statusText: "Not Found" }),
     );
 
-    await expect(fetchSocrataRecordsPaginated(DATASET_URL, "1=1", () => {})).rejects.toThrow(/500/);
+    await expect(fetchSocrataRecordsPaginated(DATASET_URL, "1=1", () => {})).rejects.toThrow(/404/);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("throws rather than swallowing a network failure", async () => {
-    fetchMock.mockRejectedValueOnce(new TypeError("fetch failed"));
+  it("retries a transient 502 mid-stream, same as fetchSocrataRecords", async () => {
+    vi.useFakeTimers();
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([], { ok: false, status: 502, statusText: "Bad Gateway" }))
+      .mockResolvedValueOnce(jsonResponse(makeRecords(2)));
+    const pages: unknown[][] = [];
 
-    await expect(fetchSocrataRecordsPaginated(DATASET_URL, "1=1", () => {})).rejects.toThrow("fetch failed");
+    const donePromise = fetchSocrataRecordsPaginated(DATASET_URL, "1=1", (page) => {
+      pages.push(page);
+    });
+    await vi.runAllTimersAsync();
+    await donePromise;
+
+    expect(pages).toEqual([makeRecords(2)]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it("surfaces a clear final error after exhausting retries on a sustained network failure", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockRejectedValue(new TypeError("fetch failed"));
+
+    const assertion = expect(fetchSocrataRecordsPaginated(DATASET_URL, "1=1", () => {})).rejects.toThrow(
+      "fetch failed",
+    );
+    await vi.runAllTimersAsync();
+    await assertion;
+
+    expect(fetchMock).toHaveBeenCalledTimes(MAX_FETCH_ATTEMPTS);
+    vi.useRealTimers();
   });
 });
