@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   analyzeClampedOccupancy,
   buildAccumulatorBucketKey,
@@ -10,6 +10,7 @@ import {
   parseCliOptions,
   parseRawReading,
   parseRawReadings,
+  ROLLING_WINDOW_PROGRESS_LOG_INTERVAL_PAGES,
   runRetryPass,
 } from "./backfill-occupancy-stats.ts";
 import type { BackfillFailuresRow, BackfillFailuresSupabaseClient } from "./backfill-occupancy-stats.ts";
@@ -740,5 +741,107 @@ describe("initializeAccumulators", () => {
     expect(result.unmatchedCount).toBe(1);
     expect(result.parseFailures).toBe(1);
     expect(result.accumulators.size).toBe(0);
+  });
+
+  describe("rolling-window progress logging", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("does not log progress before ROLLING_WINDOW_PROGRESS_LOG_INTERVAL_PAGES pages have been fetched", async () => {
+      const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const checkpointClient = makeMockCheckpointClient(null);
+      const fetchRollingWindowPages = async (onPage: (page: SocrataRecord[]) => Promise<void> | void) => {
+        for (let i = 0; i < ROLLING_WINDOW_PROGRESS_LOG_INTERVAL_PAGES - 1; i++) {
+          await onPage([makeRawRecord()]);
+        }
+      };
+
+      await initializeAccumulators({
+        checkpointClient,
+        archiveDatasetId: "7c2e-uany",
+        lookup: FOLD_LOOKUP,
+        now: FOLD_NOW,
+        fetchRollingWindowPages,
+      });
+
+      const progressLines = consoleLogSpy.mock.calls.filter((call) => String(call[0]).includes("Rolling window progress"));
+      expect(progressLines).toHaveLength(0);
+    });
+
+    it("logs cumulative pages fetched and rows folded once the interval is reached", async () => {
+      const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const checkpointClient = makeMockCheckpointClient(null);
+      const fetchRollingWindowPages = async (onPage: (page: SocrataRecord[]) => Promise<void> | void) => {
+        for (let i = 0; i < ROLLING_WINDOW_PROGRESS_LOG_INTERVAL_PAGES; i++) {
+          await onPage([makeRawRecord(), makeRawRecord()]); // 2 rows/page
+        }
+      };
+
+      await initializeAccumulators({
+        checkpointClient,
+        archiveDatasetId: "7c2e-uany",
+        lookup: FOLD_LOOKUP,
+        now: FOLD_NOW,
+        fetchRollingWindowPages,
+      });
+
+      const progressLines = consoleLogSpy.mock.calls.filter((call) => String(call[0]).includes("Rolling window progress"));
+      expect(progressLines).toHaveLength(1);
+      expect(progressLines[0]?.[0]).toContain(`${ROLLING_WINDOW_PROGRESS_LOG_INTERVAL_PAGES} pages fetched`);
+      expect(progressLines[0]?.[0]).toContain(`${ROLLING_WINDOW_PROGRESS_LOG_INTERVAL_PAGES * 2} rows folded`);
+    });
+
+    it("logs again after a second full interval, with cumulative (not reset) totals", async () => {
+      const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const checkpointClient = makeMockCheckpointClient(null);
+      const totalPages = ROLLING_WINDOW_PROGRESS_LOG_INTERVAL_PAGES * 2;
+      const fetchRollingWindowPages = async (onPage: (page: SocrataRecord[]) => Promise<void> | void) => {
+        for (let i = 0; i < totalPages; i++) {
+          await onPage([makeRawRecord()]); // 1 row/page
+        }
+      };
+
+      await initializeAccumulators({
+        checkpointClient,
+        archiveDatasetId: "7c2e-uany",
+        lookup: FOLD_LOOKUP,
+        now: FOLD_NOW,
+        fetchRollingWindowPages,
+      });
+
+      const progressLines = consoleLogSpy.mock.calls.filter((call) => String(call[0]).includes("Rolling window progress"));
+      expect(progressLines).toHaveLength(2);
+      expect(progressLines[0]?.[0]).toContain(`${ROLLING_WINDOW_PROGRESS_LOG_INTERVAL_PAGES} pages fetched`);
+      expect(progressLines[1]?.[0]).toContain(`${totalPages} pages fetched`);
+      expect(progressLines[1]?.[0]).toContain(`${totalPages} rows folded`);
+    });
+
+    it("never logs progress on a resume, since the rolling window isn't fetched at all", async () => {
+      const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const checkpointClient = makeMockCheckpointClient({
+        archive_dataset_id: "7c2e-uany",
+        last_processed_id: "row-1",
+        readings_processed_count: 10,
+        accumulator_snapshot_last_processed_id: null,
+        accumulator_state: {},
+      });
+      const fetchRollingWindowPages = async (onPage: (page: SocrataRecord[]) => Promise<void> | void) => {
+        for (let i = 0; i < ROLLING_WINDOW_PROGRESS_LOG_INTERVAL_PAGES * 2; i++) {
+          await onPage([makeRawRecord()]);
+        }
+      };
+
+      await initializeAccumulators({
+        checkpointClient,
+        archiveDatasetId: "7c2e-uany",
+        lookup: FOLD_LOOKUP,
+        now: FOLD_NOW,
+        fetchRollingWindowPages,
+      });
+
+      const progressLines = consoleLogSpy.mock.calls.filter((call) => String(call[0]).includes("Rolling window progress"));
+      expect(progressLines).toHaveLength(0);
+    });
   });
 });
