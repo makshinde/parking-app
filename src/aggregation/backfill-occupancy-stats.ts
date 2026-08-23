@@ -495,6 +495,17 @@ export interface InitializeAccumulatorsResult {
   resuming: boolean;
 }
 
+// The rolling-window fetch has no other visible progress -- the next log
+// line main() prints only appears once the ENTIRE ~27M-row window has been
+// fetched and folded. Live-verified as a real problem, not a hypothetical:
+// a real run sat silent between "Loaded N blockfaces" and "Fresh run:
+// folded the rolling window..." for 45+ minutes, indistinguishable from a
+// stalled process from the log alone. 20 pages is roughly 1,000,000 rows at
+// SOCRATA_PAGE_LIMIT (50,000 rows/page, see fetchSocrataRecords.ts) --
+// frequent enough to give real visibility without spamming a line on every
+// single page.
+export const ROLLING_WINDOW_PROGRESS_LOG_INTERVAL_PAGES = 20;
+
 // Decides whether this is a fresh start or a resume for archiveDatasetId
 // (by checking archive_stream_checkpoint directly), and folds the rolling
 // window in ONLY on a fresh start. This is deliberate, not an oversight: on
@@ -519,10 +530,18 @@ export async function initializeAccumulators(deps: InitializeAccumulatorsDeps): 
 
   let unmatchedCount = 0;
   let parseFailures = 0;
+  let pagesFetched = 0;
+  let rowsFolded = 0;
   await deps.fetchRollingWindowPages((page) => {
     const result = foldReadingsIntoAccumulators(page, accumulators, deps.lookup, deps.now);
     unmatchedCount += result.unmatchedCount;
     parseFailures += result.parseFailures;
+    pagesFetched += 1;
+    rowsFolded += page.length;
+
+    if (pagesFetched % ROLLING_WINDOW_PROGRESS_LOG_INTERVAL_PAGES === 0) {
+      console.log(`Rolling window progress: ${pagesFetched} pages fetched, ${rowsFolded} rows folded so far...`);
+    }
   });
 
   return { accumulators, unmatchedCount, parseFailures, resuming: false };
