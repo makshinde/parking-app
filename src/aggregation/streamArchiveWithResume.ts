@@ -215,7 +215,18 @@ export async function saveArchiveStreamPosition(
 // own (it just quietly returns an empty result), and silently doing
 // nothing here would be exactly the kind of quiet, hard-to-detect failure
 // this whole checkpoint design exists to avoid.
-export async function saveArchiveStreamAccumulatorSnapshot(
+//
+// Marks the one kind of failure known to be structural, not transient: the
+// row-count check above finding zero matching rows. Retrying that would
+// never succeed -- there's no row to update, and no amount of waiting
+// creates one -- so it's classified separately from every other failure
+// this write can hit, which defaults to retryable (see
+// saveArchiveStreamAccumulatorSnapshot's own comment for why a default-
+// retryable-except-one-known-case design, not per-error-type handling, is
+// what this project already learned to do here).
+class SnapshotRowNotFoundError extends Error {}
+
+async function saveArchiveStreamAccumulatorSnapshotOnce(
   client: ArchiveStreamCheckpointSupabaseClient,
   snapshot: { archiveDatasetId: string; accumulatorSnapshotLastProcessedId: string; accumulatorState: AccumulatorSnapshot },
 ): Promise<void> {
@@ -235,9 +246,56 @@ export async function saveArchiveStreamAccumulatorSnapshot(
   }
 
   if (data === null || data.length !== 1) {
-    throw new Error(
+    throw new SnapshotRowNotFoundError(
       `saveArchiveStreamAccumulatorSnapshot: expected exactly one existing archive_stream_checkpoint row for archive_dataset_id=${snapshot.archiveDatasetId}, but the update affected ${data?.length ?? 0} row(s) -- this function is only ever called after saveArchiveStreamPosition has already created the row for this chunk, so a missing row signals a real bug upstream, not a normal case to handle gracefully`,
     );
+  }
+}
+
+// One initial attempt plus up to 3 retries, exponential backoff (1s, 2s,
+// 4s) -- same shape as fetchSocrataRecords.ts's fetchPage retry logic.
+// Live-confirmed this write's failures are transient and load-dependent,
+// not a fixed function of payload size: direct testing found the IDENTICAL
+// ~94,064-bucket payload fail at 18.65s in one attempt and succeed at
+// 39.78s in the very next, with no code or data difference between them.
+// Lowering DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS was considered and
+// rejected as a fix for this: every snapshot write serializes the FULL
+// accumulator state (onChunk always returns Object.fromEntries(accumulators),
+// never a delta -- see backfill-occupancy-stats.ts's main()), and that
+// state's size is dominated by the rolling window's one-time initial fold
+// (~100K+ buckets, live-verified), not by how many chunks have elapsed
+// since the last snapshot -- so a smaller interval doesn't shrink any
+// individual write, it only attempts the same already-risky size more
+// often. Retrying is the fix that actually matches the evidence.
+export const MAX_SNAPSHOT_WRITE_ATTEMPTS = 4;
+const SNAPSHOT_WRITE_RETRY_BASE_DELAY_MS = 1000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function saveArchiveStreamAccumulatorSnapshot(
+  client: ArchiveStreamCheckpointSupabaseClient,
+  snapshot: { archiveDatasetId: string; accumulatorSnapshotLastProcessedId: string; accumulatorState: AccumulatorSnapshot },
+): Promise<void> {
+  for (let attempt = 1; attempt <= MAX_SNAPSHOT_WRITE_ATTEMPTS; attempt++) {
+    try {
+      await saveArchiveStreamAccumulatorSnapshotOnce(client, snapshot);
+      return;
+    } catch (err) {
+      const retryable = !(err instanceof SnapshotRowNotFoundError);
+      const isLastAttempt = attempt === MAX_SNAPSHOT_WRITE_ATTEMPTS;
+      if (!retryable || isLastAttempt) {
+        throw err;
+      }
+
+      const delayMs = SNAPSHOT_WRITE_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+      const reason = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `saveArchiveStreamAccumulatorSnapshot: attempt ${attempt}/${MAX_SNAPSHOT_WRITE_ATTEMPTS} failed for archive_dataset_id=${snapshot.archiveDatasetId} (${reason}); retrying in ${delayMs}ms`,
+      );
+      await sleep(delayMs);
+    }
   }
 }
 

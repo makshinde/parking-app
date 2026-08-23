@@ -5,6 +5,7 @@ import {
   DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS,
   DEFAULT_STREAM_CHUNK_SIZE,
   fetchArchiveStreamCheckpoint,
+  MAX_SNAPSHOT_WRITE_ATTEMPTS,
   saveArchiveStreamAccumulatorSnapshot,
   saveArchiveStreamPosition,
   streamArchiveWithResume,
@@ -37,6 +38,11 @@ function makeMockCheckpointClient(options: {
   selectError?: { message: string } | null;
   upsertError?: { message: string } | null;
   updateError?: { message: string } | null;
+  // Per-call override for .update().select(), consumed in call order --
+  // undefined for a given index falls back to updateError (or success).
+  // Lets tests simulate "fails once, then succeeds" without a single
+  // static error applying to every retry attempt.
+  updateErrorSequence?: ({ message: string } | null)[];
   deleteError?: { message: string } | null;
 } = {}) {
   let currentRow: Record<string, unknown> | null = options.existingRow ?? null;
@@ -44,6 +50,7 @@ function makeMockCheckpointClient(options: {
   const snapshotUpdateCalls: { archiveDatasetId: string; values: Record<string, unknown> }[] = [];
   const deleteCalls: unknown[] = [];
   const callOrder: string[] = [];
+  let updateCallIndex = 0;
 
   const selectQueryBuilder = {
     eq: () => selectQueryBuilder,
@@ -77,8 +84,11 @@ function makeMockCheckpointClient(options: {
               const archiveDatasetId = eqValue as string;
               snapshotUpdateCalls.push({ archiveDatasetId, values });
               callOrder.push("snapshot-update");
-              if (options.updateError !== undefined && options.updateError !== null) {
-                return { data: null, error: options.updateError };
+              const sequenceError = options.updateErrorSequence?.[updateCallIndex];
+              updateCallIndex += 1;
+              const errorForThisCall = sequenceError !== undefined ? sequenceError : options.updateError;
+              if (errorForThisCall !== undefined && errorForThisCall !== null) {
+                return { data: null, error: errorForThisCall };
               }
               if (currentRow === null || currentRow.archive_dataset_id !== archiveDatasetId) {
                 // Mirrors real PostgREST behavior: an UPDATE matching zero
@@ -226,18 +236,6 @@ describe("saveArchiveStreamAccumulatorSnapshot", () => {
     ]);
   });
 
-  it("throws a clear error when saving the snapshot fails", async () => {
-    const { client } = makeMockCheckpointClient({ existingRow: EXISTING_ROW, updateError: { message: "statement timeout" } });
-
-    await expect(
-      saveArchiveStreamAccumulatorSnapshot(client, {
-        archiveDatasetId: ARCHIVE_DATASET_ID,
-        accumulatorSnapshotLastProcessedId: "row-1",
-        accumulatorState: {},
-      }),
-    ).rejects.toThrow(new RegExp(`archive_dataset_id=${ARCHIVE_DATASET_ID}.*statement timeout`));
-  });
-
   // Regression test for a real, live-confirmed bug: an .upsert() with a
   // payload omitting last_processed_id reproducibly failed with a NOT NULL
   // violation even against an already-existing row, because Postgres/
@@ -247,8 +245,12 @@ describe("saveArchiveStreamAccumulatorSnapshot", () => {
   // error), which is exactly what this defensive row-count check exists to
   // catch instead of succeeding silently or failing with a confusing,
   // unrelated error later.
-  it("throws a clear, specific error when no existing checkpoint row matches this archive dataset", async () => {
-    const { client } = makeMockCheckpointClient({ existingRow: null });
+  //
+  // This is the one kind of failure that must NOT retry: a missing row is
+  // structural, not transient -- confirmed here by asserting only a single
+  // call happened, not up to MAX_SNAPSHOT_WRITE_ATTEMPTS of them.
+  it("throws a clear, specific error when no existing checkpoint row matches this archive dataset, WITHOUT retrying", async () => {
+    const { client, snapshotUpdateCalls } = makeMockCheckpointClient({ existingRow: null });
 
     await expect(
       saveArchiveStreamAccumulatorSnapshot(client, {
@@ -257,6 +259,117 @@ describe("saveArchiveStreamAccumulatorSnapshot", () => {
         accumulatorState: {},
       }),
     ).rejects.toThrow(new RegExp(`expected exactly one existing archive_stream_checkpoint row for archive_dataset_id=${ARCHIVE_DATASET_ID}.*affected 0 row`));
+
+    expect(snapshotUpdateCalls).toHaveLength(1);
+  });
+
+  describe("retry-with-backoff on transient write failures", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    // Live-confirmed evidence this retries on: the IDENTICAL ~94,064-bucket
+    // payload failed with "canceling statement due to statement timeout" at
+    // 18.65s in one direct-testing attempt, then succeeded at 39.78s in the
+    // very next attempt with no code or data difference -- a transient,
+    // load-dependent failure, not a fixed function of payload size.
+    it("retries a statement timeout once and succeeds on the next attempt, logging the retry attempt", async () => {
+      const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { client, snapshotUpdateCalls } = makeMockCheckpointClient({
+        existingRow: EXISTING_ROW,
+        updateErrorSequence: [{ message: "canceling statement due to statement timeout" }],
+      });
+
+      const resultPromise = saveArchiveStreamAccumulatorSnapshot(client, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        accumulatorSnapshotLastProcessedId: "row-xyz",
+        accumulatorState: SAMPLE_ACCUMULATOR_SNAPSHOT,
+      });
+      await vi.runAllTimersAsync();
+      await resultPromise;
+
+      expect(snapshotUpdateCalls).toHaveLength(2);
+      const warnLines = consoleWarnSpy.mock.calls.map((call) => String(call[0]));
+      expect(warnLines.some((line) => line.includes("attempt 1") && line.includes("statement timeout") && line.includes("retrying in 1000ms"))).toBe(true);
+    });
+
+    it("surfaces a clear final error after exhausting all retries on a sustained statement timeout", async () => {
+      const { client, snapshotUpdateCalls } = makeMockCheckpointClient({
+        existingRow: EXISTING_ROW,
+        updateError: { message: "canceling statement due to statement timeout" },
+      });
+
+      const assertion = expect(
+        saveArchiveStreamAccumulatorSnapshot(client, {
+          archiveDatasetId: ARCHIVE_DATASET_ID,
+          accumulatorSnapshotLastProcessedId: "row-1",
+          accumulatorState: {},
+        }),
+      ).rejects.toThrow(new RegExp(`archive_dataset_id=${ARCHIVE_DATASET_ID}.*statement timeout`));
+      await vi.runAllTimersAsync();
+      await assertion;
+
+      // Initial attempt plus every retry, no more -- confirms the backoff
+      // loop actually stops instead of retrying forever.
+      expect(snapshotUpdateCalls).toHaveLength(MAX_SNAPSHOT_WRITE_ATTEMPTS);
+    });
+
+    it("waits with increasing delay between retries rather than a fixed interval", async () => {
+      const { client, snapshotUpdateCalls } = makeMockCheckpointClient({
+        existingRow: EXISTING_ROW,
+        updateError: { message: "canceling statement due to statement timeout" },
+      });
+
+      const assertion = expect(
+        saveArchiveStreamAccumulatorSnapshot(client, {
+          archiveDatasetId: ARCHIVE_DATASET_ID,
+          accumulatorSnapshotLastProcessedId: "row-1",
+          accumulatorState: {},
+        }),
+      ).rejects.toThrow(/statement timeout/);
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(snapshotUpdateCalls).toHaveLength(1);
+
+      // First backoff (1s) elapses -> second attempt fires.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(snapshotUpdateCalls).toHaveLength(2);
+
+      // A second 1s wait alone should NOT be enough to trigger the third
+      // attempt -- the delay after attempt 2 is 2s, not 1s.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(snapshotUpdateCalls).toHaveLength(2);
+
+      // The remaining 1s of the 2s backoff elapses -> third attempt fires.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(snapshotUpdateCalls).toHaveLength(3);
+
+      await vi.runAllTimersAsync();
+      await assertion;
+      expect(snapshotUpdateCalls).toHaveLength(MAX_SNAPSHOT_WRITE_ATTEMPTS);
+    });
+
+    // Confirms the structural "row not found" case still fails immediately
+    // even inside this describe block's fake-timer setup -- no behavior
+    // change from the previous fix, retry-with-backoff included.
+    it("still does not retry the structural row-not-found error", async () => {
+      const { client, snapshotUpdateCalls } = makeMockCheckpointClient({ existingRow: null });
+
+      await expect(
+        saveArchiveStreamAccumulatorSnapshot(client, {
+          archiveDatasetId: ARCHIVE_DATASET_ID,
+          accumulatorSnapshotLastProcessedId: "row-1",
+          accumulatorState: {},
+        }),
+      ).rejects.toThrow(/expected exactly one existing archive_stream_checkpoint row/);
+
+      expect(snapshotUpdateCalls).toHaveLength(1);
+    });
   });
 });
 
