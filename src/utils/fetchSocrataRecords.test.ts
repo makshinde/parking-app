@@ -194,6 +194,37 @@ describe("fetchSocrataRecords", () => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
+    it("retries a generic, previously-unseen error type thrown during fetch(), not just the specific cases already covered", async () => {
+      fetchMock
+        .mockRejectedValueOnce(new RangeError("unexpected condition establishing the connection"))
+        .mockResolvedValueOnce(jsonResponse(makeRecords(1)));
+
+      const resultPromise = fetchSocrataRecords(DATASET_URL, "1=1");
+      await vi.runAllTimersAsync();
+      const result = await resultPromise;
+
+      expect(result).toHaveLength(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("retries a generic, previously-unseen error type thrown during response.json()", async () => {
+      fetchMock
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: () => Promise.reject(new RangeError("unexpected parse failure")),
+        } as Response)
+        .mockResolvedValueOnce(jsonResponse(makeRecords(1)));
+
+      const resultPromise = fetchSocrataRecords(DATASET_URL, "1=1");
+      await vi.runAllTimersAsync();
+      const result = await resultPromise;
+
+      expect(result).toHaveLength(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
     it("surfaces a clear final error after exhausting all retries on a sustained body-read failure", async () => {
       fetchMock.mockResolvedValue(brokenBodyResponse());
 

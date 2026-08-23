@@ -30,13 +30,15 @@ export function buildRequestHeaders(): HeadersInit {
   return { "X-App-Token": token };
 }
 
-// A page can fail for reasons that have nothing to do with the request
-// itself -- a dropped connection, or a transient 502/503 from Socrata (both
-// live-observed during real multi-million-row runs). Those are worth
-// retrying. A 4xx, on the other hand, means the request itself is wrong
-// (bad $where clause, bad URL) -- retrying it will fail identically every
-// time, so it should fail immediately instead of wasting time on doomed
-// retries.
+// Marks the one kind of failure this module can identify with certainty as
+// non-transient: a successfully-received response carrying a 4xx status.
+// The request itself is wrong (bad $where clause, bad URL) -- retrying it
+// will fail identically every time, so it should fail immediately instead
+// of wasting time on doomed retries. Every other failure mode (fetch()
+// failing to connect, response.json() failing to read/parse the body, or
+// anything else not explicitly classified here) is left to propagate as
+// whatever error it naturally is and defaults to retryable in fetchPage's
+// catch block below -- see that function's comment for why.
 class SocrataRequestError extends Error {
   readonly retryable: boolean;
 
@@ -60,16 +62,7 @@ function isRetryableStatus(status: number): boolean {
 }
 
 async function fetchPageOnce(url: string): Promise<SocrataRecord[]> {
-  let response: Response;
-  try {
-    response = await fetch(url, { headers: buildRequestHeaders() });
-  } catch (err) {
-    // A thrown fetch (network failure, DNS error, connection reset) is
-    // always transient -- there's no status code to inspect, but there's
-    // also no reason to believe retrying won't work.
-    const message = err instanceof Error ? err.message : String(err);
-    throw new SocrataRequestError(`fetchSocrataRecords: request to ${url} failed: ${message}`, true);
-  }
+  const response = await fetch(url, { headers: buildRequestHeaders() });
 
   // A partial result set here would be silently wrong data, not a usable
   // best-effort answer -- there's no meaningful "partial success" to return,
@@ -82,21 +75,7 @@ async function fetchPageOnce(url: string): Promise<SocrataRecord[]> {
     );
   }
 
-  try {
-    return (await response.json()) as SocrataRecord[];
-  } catch (err) {
-    // The connection can drop mid-body-read even after a successful status
-    // line -- live-verified: undici throws "TypeError: terminated" (wrapping
-    // an ECONNRESET) while streaming/parsing the body, well after fetch()
-    // itself already resolved with response.ok === true. Just as transient
-    // as a connection failure before the request even went out, so it's
-    // retried the same way rather than being left unclassified.
-    const message = err instanceof Error ? err.message : String(err);
-    throw new SocrataRequestError(
-      `fetchSocrataRecords: request to ${url} failed while reading the response body: ${message}`,
-      true,
-    );
-  }
+  return (await response.json()) as SocrataRecord[];
 }
 
 async function fetchPage(datasetUrl: string, whereClause: string, offset: number): Promise<SocrataRecord[]> {
@@ -106,7 +85,19 @@ async function fetchPage(datasetUrl: string, whereClause: string, offset: number
     try {
       return await fetchPageOnce(url);
     } catch (err) {
-      const retryable = err instanceof SocrataRequestError ? err.retryable : false;
+      // The one deliberate non-transient case is a SocrataRequestError
+      // explicitly marked non-retryable (a successfully-received 4xx --
+      // see fetchPageOnce and SocrataRequestError's comment). Everything
+      // else defaults to retryable: fetch() failing to connect,
+      // response.json() failing to read/parse the body (live-observed:
+      // undici's "TypeError: terminated" wrapping an ECONNRESET mid-stream,
+      // well after fetch() itself already resolved with response.ok ===
+      // true), or any other exception this sequence isn't specifically
+      // anticipating. A network-layer failure is far more likely to be
+      // transient than to be a bug that retrying will just repeat, so an
+      // unrecognized failure is safer to retry than to give up on
+      // immediately.
+      const retryable = !(err instanceof SocrataRequestError) || err.retryable;
       const isLastAttempt = attempt === MAX_FETCH_ATTEMPTS;
       if (!retryable || isLastAttempt) {
         throw err;
