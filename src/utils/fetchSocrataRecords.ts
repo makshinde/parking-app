@@ -30,21 +30,89 @@ export function buildRequestHeaders(): HeadersInit {
   return { "X-App-Token": token };
 }
 
-async function fetchPage(datasetUrl: string, whereClause: string, offset: number): Promise<SocrataRecord[]> {
-  const url = buildQueryUrl(datasetUrl, whereClause, offset);
-  const response = await fetch(url, { headers: buildRequestHeaders() });
+// A page can fail for reasons that have nothing to do with the request
+// itself -- a dropped connection, or a transient 502/503 from Socrata (both
+// live-observed during real multi-million-row runs). Those are worth
+// retrying. A 4xx, on the other hand, means the request itself is wrong
+// (bad $where clause, bad URL) -- retrying it will fail identically every
+// time, so it should fail immediately instead of wasting time on doomed
+// retries.
+class SocrataRequestError extends Error {
+  readonly retryable: boolean;
+
+  constructor(message: string, retryable: boolean) {
+    super(message);
+    this.name = "SocrataRequestError";
+    this.retryable = retryable;
+  }
+}
+
+// One initial attempt plus up to 3 retries.
+export const MAX_FETCH_ATTEMPTS = 4;
+const RETRY_BASE_DELAY_MS = 1000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status >= 500 && status < 600;
+}
+
+async function fetchPageOnce(url: string): Promise<SocrataRecord[]> {
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: buildRequestHeaders() });
+  } catch (err) {
+    // A thrown fetch (network failure, DNS error, connection reset) is
+    // always transient -- there's no status code to inspect, but there's
+    // also no reason to believe retrying won't work.
+    const message = err instanceof Error ? err.message : String(err);
+    throw new SocrataRequestError(`fetchSocrataRecords: request to ${url} failed: ${message}`, true);
+  }
 
   // A partial result set here would be silently wrong data, not a usable
   // best-effort answer -- there's no meaningful "partial success" to return,
   // so this fails loudly instead of returning whichever pages happened to
   // succeed before the failure.
   if (!response.ok) {
-    throw new Error(
+    throw new SocrataRequestError(
       `fetchSocrataRecords: request to ${url} failed with status ${response.status} ${response.statusText}`,
+      isRetryableStatus(response.status),
     );
   }
 
   return (await response.json()) as SocrataRecord[];
+}
+
+async function fetchPage(datasetUrl: string, whereClause: string, offset: number): Promise<SocrataRecord[]> {
+  const url = buildQueryUrl(datasetUrl, whereClause, offset);
+
+  for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
+    try {
+      return await fetchPageOnce(url);
+    } catch (err) {
+      const retryable = err instanceof SocrataRequestError ? err.retryable : false;
+      const isLastAttempt = attempt === MAX_FETCH_ATTEMPTS;
+      if (!retryable || isLastAttempt) {
+        throw err;
+      }
+
+      // Exponential backoff (1s, 2s, 4s) rather than a fixed delay, so a
+      // sustained outage backs off instead of hammering an already-struggling
+      // server at a constant rate.
+      const delayMs = RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+      const reason = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `fetchSocrataRecords: attempt ${attempt}/${MAX_FETCH_ATTEMPTS} failed (${reason}); retrying in ${delayMs}ms`,
+      );
+      await sleep(delayMs);
+    }
+  }
+
+  // Unreachable: the loop above always either returns a page or throws on
+  // its final iteration.
+  throw new Error("fetchSocrataRecords: fetchPage exhausted retries without a resolved result");
 }
 
 // Queries a Socrata (SODA) API dataset and returns every matching record,
