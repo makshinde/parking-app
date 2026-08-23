@@ -18,7 +18,7 @@ import {
   type OccupancyStatsWriteRequest,
 } from "./upsertOccupancyStats.ts";
 import { calculateRecencyWeight } from "../scoring/recencyWeight.ts";
-import { addReading, createEmptyAccumulator, type WeightedStatsAccumulator } from "./incrementalWeightedStats.ts";
+import { addReading, createEmptyAccumulator, type AccumulatorSnapshot, type WeightedStatsAccumulator } from "./incrementalWeightedStats.ts";
 import {
   fetchArchiveStreamCheckpoint,
   streamArchiveWithResume,
@@ -210,6 +210,28 @@ export function foldReadingsIntoAccumulators(
   }
 
   return { unmatchedCount, parseFailures };
+}
+
+// Merges a restored accumulator snapshot (from streamArchiveWithResume's
+// onResume hook) into an existing accumulators Map IN PLACE, rather than
+// replacing the Map reference outright. This matters because accumulators
+// may already hold a rolling-window fold by the time onResume fires (see
+// initializeAccumulators's comment for the checkpoint-exists-but-no-
+// snapshot-yet case) -- onResume fires before any onChunk call, including
+// gap-replay's, so a naive `accumulators = new Map(Object.entries(snapshot))`
+// would silently discard that fold the instant this runs, before gap-replay
+// ever gets a chance to build on it. When a real snapshot WAS taken,
+// initializeAccumulators leaves accumulators empty beforehand, so merging
+// into it is equivalent to a replace -- this is correct for both cases, not
+// just the one that was broken. Returns the number of buckets the snapshot
+// itself contained, for logging (distinct from accumulators.size afterward,
+// which also reflects anything already merged in).
+export function mergeAccumulatorSnapshot(accumulators: Map<string, WeightedStatsAccumulator>, snapshot: AccumulatorSnapshot): number {
+  const entries = Object.entries(snapshot);
+  for (const [bucketKey, accumulator] of entries) {
+    accumulators.set(bucketKey, accumulator);
+  }
+  return entries.length;
 }
 
 // --- Diagnostics: clamped-occupancy detection ------------------------------
@@ -506,25 +528,39 @@ export interface InitializeAccumulatorsResult {
 // single page.
 export const ROLLING_WINDOW_PROGRESS_LOG_INTERVAL_PAGES = 20;
 
-// Decides whether this is a fresh start or a resume for archiveDatasetId
-// (by checking archive_stream_checkpoint directly), and folds the rolling
-// window in ONLY on a fresh start. This is deliberate, not an oversight: on
-// a resume, the rolling window's readings were already folded into
-// accumulators during the original fresh run that produced this archive's
-// very first checkpoint -- they're already baked into whatever accumulator
-// snapshot streamArchiveWithResume goes on to restore via its own onResume
-// hook. Re-fetching and re-folding the rolling window again here on a
-// resume would double-count every single rolling-window reading a second
-// time -- the exact same failure mode streamArchiveWithResume's own onChunk
-// contract warns about for a replayed archive chunk, just at this
-// orchestration level instead, for a data source streamArchiveWithResume
-// itself has no knowledge of (it only checkpoints archive chunks, never the
-// rolling window).
+// Decides whether to (re-)fold the rolling window in, based specifically on
+// whether an accumulator snapshot was ever durably taken for
+// archiveDatasetId -- NOT merely on whether a checkpoint row exists at all.
+// Those are different conditions, and conflating them was a real,
+// live-confirmed data-loss bug: a checkpoint row is created on the very
+// FIRST chunk (via the cheap, every-chunk saveArchiveStreamPosition), long
+// before the first accumulator snapshot ever happens (only every
+// DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS chunks -- see
+// streamArchiveWithResume.ts). A run interrupted between those two points
+// (live-hit by a real --max-chunks=50 test run that stopped at chunk 50,
+// well short of the 120-chunk snapshot interval) leaves a checkpoint row
+// whose accumulator_snapshot_last_processed_id is still null and whose
+// accumulator_state is still the empty default -- meaning the rolling
+// window's fold was NEVER durably persisted anywhere. It only ever existed
+// in that one process's memory, and is gone once the process exits. Treating
+// that row's mere existence as "the rolling window is already baked in"
+// (the previous condition here) would silently skip re-fetching it on the
+// next run, permanently and silently missing its entire contribution from
+// every bucket's final stats -- not a crash, just quietly wrong data.
+//
+// Only skip the fetch when accumulatorSnapshotLastProcessedId is non-null:
+// that's the one condition that actually guarantees the rolling window's
+// contribution is durably baked into whatever accumulator_state
+// streamArchiveWithResume's own onResume hook goes on to restore. See
+// main()'s onResume callback for the other half of this fix -- merging the
+// restored snapshot into accumulators instead of replacing it outright,
+// so a rolling-window fold redone here (in the checkpoint-exists-but-no-
+// snapshot-yet case) survives past that point instead of being discarded.
 export async function initializeAccumulators(deps: InitializeAccumulatorsDeps): Promise<InitializeAccumulatorsResult> {
   const existingCheckpoint = await fetchArchiveStreamCheckpoint(deps.checkpointClient, deps.archiveDatasetId);
   const accumulators = new Map<string, WeightedStatsAccumulator>();
 
-  if (existingCheckpoint !== null) {
+  if (existingCheckpoint !== null && existingCheckpoint.accumulatorSnapshotLastProcessedId !== null) {
     return { accumulators, unmatchedCount: 0, parseFailures: 0, resuming: true };
   }
 
@@ -647,8 +683,8 @@ export async function main(): Promise<void> {
     await streamArchiveWithResume(checkpointClient, {
       archiveDatasetId,
       onResume: (snapshot) => {
-        accumulators = new Map(Object.entries(snapshot));
-        console.log(`Restored ${accumulators.size} buckets from an existing checkpoint.`);
+        const restoredCount = mergeAccumulatorSnapshot(accumulators, snapshot);
+        console.log(`Restored ${restoredCount} buckets from an existing checkpoint (${accumulators.size} total after merging with any rolling-window fold).`);
       },
       onChunk: (records) => {
         chunksProcessed += 1;

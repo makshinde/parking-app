@@ -6,6 +6,7 @@ import {
   initializeAccumulators,
   logBucketFailure,
   MAX_RETRY_COUNT,
+  mergeAccumulatorSnapshot,
   parseAccumulatorBucketKey,
   parseCliOptions,
   parseRawReading,
@@ -222,6 +223,58 @@ describe("foldReadingsIntoAccumulators", () => {
     const { readings: parsed } = parseRawReadings(records);
     const singleReading = parsed[0]!;
     expect(accumulator?.mean).toBeCloseTo(singleReading.paidOccupancy / singleReading.parkingSpaceCount, 10);
+  });
+});
+
+// --- mergeAccumulatorSnapshot ------------------------------------------
+
+describe("mergeAccumulatorSnapshot", () => {
+  it("merges a non-empty snapshot into an empty map (equivalent to a fresh restore)", () => {
+    const accumulators = new Map<string, WeightedStatsAccumulator>();
+    const snapshot = { "bf-1:2:9": { count: 5, totalWeight: 5, mean: 0.4, sumSquaredDiff: 0.2 } };
+
+    const restoredCount = mergeAccumulatorSnapshot(accumulators, snapshot);
+
+    expect(restoredCount).toBe(1);
+    expect(accumulators.size).toBe(1);
+    expect(accumulators.get("bf-1:2:9")).toEqual(snapshot["bf-1:2:9"]);
+  });
+
+  // The specific correctness property the whole fix depends on: merging
+  // must NOT discard whatever the map already held (e.g. a rolling-window
+  // fold folded in before onResume fires) -- only replace/add the keys the
+  // snapshot itself specifies.
+  it("preserves pre-existing entries not present in the snapshot, rather than clobbering the whole map", () => {
+    const preExisting: WeightedStatsAccumulator = { count: 3, totalWeight: 3, mean: 0.1, sumSquaredDiff: 0.05 };
+    const accumulators = new Map<string, WeightedStatsAccumulator>([["bf-rolling-window:4:17", preExisting]]);
+
+    const restoredCount = mergeAccumulatorSnapshot(accumulators, { "bf-from-snapshot:1:9": { count: 7, totalWeight: 7, mean: 0.6, sumSquaredDiff: 0.3 } });
+
+    expect(restoredCount).toBe(1);
+    expect(accumulators.size).toBe(2);
+    expect(accumulators.get("bf-rolling-window:4:17")).toEqual(preExisting);
+    expect(accumulators.get("bf-from-snapshot:1:9")?.count).toBe(7);
+  });
+
+  it("merging an empty snapshot into a non-empty map is a no-op (the checkpoint-exists-but-no-snapshot-yet case)", () => {
+    const preExisting: WeightedStatsAccumulator = { count: 3, totalWeight: 3, mean: 0.1, sumSquaredDiff: 0.05 };
+    const accumulators = new Map<string, WeightedStatsAccumulator>([["bf-rolling-window:4:17", preExisting]]);
+
+    const restoredCount = mergeAccumulatorSnapshot(accumulators, {});
+
+    expect(restoredCount).toBe(0);
+    expect(accumulators.size).toBe(1);
+    expect(accumulators.get("bf-rolling-window:4:17")).toEqual(preExisting);
+  });
+
+  it("overwrites a key that exists in both, using the snapshot's value", () => {
+    const accumulators = new Map<string, WeightedStatsAccumulator>([
+      ["bf-1:2:9", { count: 1, totalWeight: 1, mean: 0.1, sumSquaredDiff: 0 }],
+    ]);
+
+    mergeAccumulatorSnapshot(accumulators, { "bf-1:2:9": { count: 9, totalWeight: 9, mean: 0.9, sumSquaredDiff: 0.5 } });
+
+    expect(accumulators.get("bf-1:2:9")?.count).toBe(9);
   });
 });
 
@@ -642,17 +695,20 @@ describe("initializeAccumulators", () => {
   // The critical correctness check the whole streaming redesign depends
   // on: the rolling window's readings were already folded into
   // accumulators during the original fresh run that produced this
-  // archive's first checkpoint, and are already baked into whatever
-  // snapshot streamArchiveWithResume goes on to restore. Re-fetching (and
-  // re-folding) it again here on a resume would double-count every single
-  // rolling-window reading a second time.
-  it("resume (existing checkpoint): does NOT fetch the rolling window at all", async () => {
+  // archive's first ACCUMULATOR SNAPSHOT, and are already baked into
+  // whatever snapshot streamArchiveWithResume goes on to restore.
+  // Re-fetching (and re-folding) it again here on a resume would
+  // double-count every single rolling-window reading a second time. Only
+  // a real, non-null accumulatorSnapshotLastProcessedId guarantees that --
+  // see the regression test below for the checkpoint-exists-but-no-
+  // snapshot-yet case, which must NOT take this same skip path.
+  it("resume (checkpoint with a real accumulator snapshot): does NOT fetch the rolling window at all", async () => {
     const checkpointClient = makeMockCheckpointClient({
       archive_dataset_id: "7c2e-uany",
       last_processed_id: "row-1",
       readings_processed_count: 10,
-      accumulator_snapshot_last_processed_id: null,
-      accumulator_state: {},
+      accumulator_snapshot_last_processed_id: "row-1",
+      accumulator_state: { "blockface-9:1:9": { count: 5, totalWeight: 5, mean: 0.4, sumSquaredDiff: 0.2 } },
     });
     let fetchCallCount = 0;
     const fetchRollingWindowPages = async (onPage: (page: SocrataRecord[]) => Promise<void> | void) => {
@@ -671,6 +727,47 @@ describe("initializeAccumulators", () => {
     expect(fetchCallCount).toBe(0);
     expect(result.resuming).toBe(true);
     expect(result.accumulators.size).toBe(0);
+    expect(result.unmatchedCount).toBe(0);
+    expect(result.parseFailures).toBe(0);
+  });
+
+  // Regression test for a real, live-confirmed data-loss bug: this is the
+  // EXACT checkpoint shape found in the live database after a real
+  // --max-chunks=50 run stopped at chunk 50, well short of the 120-chunk
+  // accumulator-snapshot interval -- a genuine last_processed_id (the
+  // cheap, every-chunk position update ran), but accumulator_snapshot_
+  // last_processed_id still null and accumulator_state still the empty
+  // default, because no snapshot interval was ever reached. The OLD
+  // condition here (existingCheckpoint !== null) treated this identically
+  // to the fully-resumable case above and skipped the rolling-window
+  // fetch entirely -- silently and permanently losing its contribution,
+  // since it was never durably persisted anywhere. This must now fetch
+  // and fold it, exactly like a genuine fresh start.
+  it("regression: a checkpoint row with a real last_processed_id but a NULL accumulator snapshot still fetches and folds the rolling window", async () => {
+    const checkpointClient = makeMockCheckpointClient({
+      archive_dataset_id: "7c2e-uany",
+      last_processed_id: "row-cq3g~cx27-6rpy",
+      readings_processed_count: 2450000,
+      accumulator_snapshot_last_processed_id: null,
+      accumulator_state: {},
+    });
+    let fetchCallCount = 0;
+    const fetchRollingWindowPages = async (onPage: (page: SocrataRecord[]) => Promise<void> | void) => {
+      fetchCallCount += 1;
+      await onPage([makeRawRecord()]);
+    };
+
+    const result = await initializeAccumulators({
+      checkpointClient,
+      archiveDatasetId: "7c2e-uany",
+      lookup: FOLD_LOOKUP,
+      now: FOLD_NOW,
+      fetchRollingWindowPages,
+    });
+
+    expect(fetchCallCount).toBe(1);
+    expect(result.resuming).toBe(false);
+    expect(result.accumulators.get(buildAccumulatorBucketKey("blockface-1", 4, 17))?.count).toBe(1);
     expect(result.unmatchedCount).toBe(0);
     expect(result.parseFailures).toBe(0);
   });
@@ -817,14 +914,14 @@ describe("initializeAccumulators", () => {
       expect(progressLines[1]?.[0]).toContain(`${totalPages} rows folded`);
     });
 
-    it("never logs progress on a resume, since the rolling window isn't fetched at all", async () => {
+    it("never logs progress on a resume with a real accumulator snapshot, since the rolling window isn't fetched at all", async () => {
       const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
       const checkpointClient = makeMockCheckpointClient({
         archive_dataset_id: "7c2e-uany",
         last_processed_id: "row-1",
         readings_processed_count: 10,
-        accumulator_snapshot_last_processed_id: null,
-        accumulator_state: {},
+        accumulator_snapshot_last_processed_id: "row-1",
+        accumulator_state: { "bf-1:1:9": { count: 5, totalWeight: 5, mean: 0.4, sumSquaredDiff: 0.2 } },
       });
       const fetchRollingWindowPages = async (onPage: (page: SocrataRecord[]) => Promise<void> | void) => {
         for (let i = 0; i < ROLLING_WINDOW_PROGRESS_LOG_INTERVAL_PAGES * 2; i++) {
@@ -843,5 +940,77 @@ describe("initializeAccumulators", () => {
       const progressLines = consoleLogSpy.mock.calls.filter((call) => String(call[0]).includes("Rolling window progress"));
       expect(progressLines).toHaveLength(0);
     });
+  });
+});
+
+// --- Resume-safety regression: rolling-window fold must survive onResume + gap-replay ---
+
+// This reproduces main()'s real sequence end-to-end (initializeAccumulators
+// -> streamArchiveWithResume's onResume -> gap-replay's onChunk), using the
+// EXACT checkpoint shape live-confirmed in the database after a real
+// --max-chunks=50 run stopped at chunk 50 -- short of the first 120-chunk
+// accumulator-snapshot interval. Proves the specific failure mode the fix
+// closes: a rolling-window fold (from initializeAccumulators) and a
+// gap-replayed archive chunk (from streamArchiveWithResume, simulated here
+// via the same foldReadingsIntoAccumulators onChunk uses) both land in the
+// final accumulator, with neither clobbering the other.
+describe("resume safety: rolling-window fold survives onResume + gap-replay", () => {
+  it("a rolling-window fold and a later gap-replayed archive chunk both land in the final accumulator", async () => {
+    // Exact live-confirmed shape: a real last_processed_id (the cheap,
+    // every-chunk position update ran through chunk 49), but
+    // accumulator_snapshot_last_processed_id still null and accumulator_state
+    // still the empty default, because the run stopped before the 120-chunk
+    // snapshot interval.
+    const checkpointClient = makeMockCheckpointClient({
+      archive_dataset_id: "7c2e-uany",
+      last_processed_id: "row-cq3g~cx27-6rpy",
+      readings_processed_count: 2450000,
+      accumulator_snapshot_last_processed_id: null,
+      accumulator_state: {},
+    });
+
+    const lookup = new Map([
+      ["9477:W", "blockface-rolling-window"], // matches the rolling-window fold's default record below
+      ["1234:N", "blockface-archive-gap-replay"],
+    ]);
+
+    // Step 1: initializeAccumulators, exactly as main() calls it. With the
+    // fix, this checkpoint shape must still fetch and fold the rolling
+    // window (the regression this PR closes), not skip it.
+    const fetchRollingWindowPages = async (onPage: (page: SocrataRecord[]) => Promise<void> | void) => {
+      await onPage([makeRawRecord()]); // sourceelementkey 9477 / W -> blockface-rolling-window
+    };
+    const initResult = await initializeAccumulators({
+      checkpointClient,
+      archiveDatasetId: "7c2e-uany",
+      lookup,
+      now: FOLD_NOW,
+      fetchRollingWindowPages,
+    });
+    const accumulators = initResult.accumulators;
+    expect(accumulators.get(buildAccumulatorBucketKey("blockface-rolling-window", 4, 17))?.count).toBe(1);
+
+    // Step 2: streamArchiveWithResume's onResume, exactly as main() wires
+    // it up (mergeAccumulatorSnapshot, not a reference replacement). Since
+    // no accumulator snapshot was ever taken, the real streamArchiveWithResume
+    // would restore an EMPTY snapshot here -- this must be a no-op that
+    // preserves the rolling-window fold from step 1, not discard it.
+    const restoredCount = mergeAccumulatorSnapshot(accumulators, {});
+    expect(restoredCount).toBe(0);
+    expect(accumulators.get(buildAccumulatorBucketKey("blockface-rolling-window", 4, 17))?.count).toBe(1);
+
+    // Step 3: a gap-replayed archive chunk, exactly as streamArchiveWithResume's
+    // bounded gap-replay would fold it via main()'s onChunk (which calls
+    // foldReadingsIntoAccumulators on the SAME accumulators Map).
+    const gapReplayRecord = makeRawRecord({ sourceelementkey: "1234", sideofstreet: "N" });
+    foldReadingsIntoAccumulators([gapReplayRecord], accumulators, lookup, FOLD_NOW);
+
+    // Final assertion: BOTH contributions survive, neither clobbering the
+    // other -- this is the exact bug: before the fix, step 2's onResume
+    // would have replaced the whole map, silently discarding step 1's
+    // rolling-window bucket before step 3 ever ran.
+    expect(accumulators.size).toBe(2);
+    expect(accumulators.get(buildAccumulatorBucketKey("blockface-rolling-window", 4, 17))?.count).toBe(1);
+    expect(accumulators.get(buildAccumulatorBucketKey("blockface-archive-gap-replay", 4, 17))?.count).toBe(1);
   });
 });
