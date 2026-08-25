@@ -23,25 +23,30 @@ const SAMPLE_ACCUMULATOR_SNAPSHOT: AccumulatorSnapshot = {
 };
 
 // --- Checkpoint client mock, same shape as backfill-occupancy-stats.test.ts's
-// createMockFailuresClient (eq-chainable select/maybeSingle, upsert, update,
-// delete/eq). Tracks a mutable currentRow (starting from existingRow, if
-// any) so .update() can genuinely simulate matching-vs-not-matching rows --
-// the same distinction saveArchiveStreamAccumulatorSnapshot's new row-count
-// check depends on -- rather than always succeeding regardless of whether a
-// row actually exists. .upsert() (still used by saveArchiveStreamPosition)
-// creates/merges into currentRow, exactly mirroring the real precondition
-// that a snapshot update always follows a position upsert for the same
-// chunk, or a checkpoint fetchArchiveStreamCheckpoint has already confirmed
-// exists (gap-replay's catch-up write).
+// createMockFailuresClient (eq-chainable select/maybeSingle, upsert,
+// delete/eq, plus a top-level .rpc()). Tracks a mutable currentRow
+// (starting from existingRow, if any) so .rpc() can genuinely simulate
+// matching-vs-not-matching rows -- the same distinction
+// saveArchiveStreamAccumulatorSnapshot's row-count check depends on --
+// rather than always succeeding regardless of whether a row actually
+// exists. .upsert() (still used by saveArchiveStreamPosition) creates/
+// merges into currentRow, exactly mirroring the real precondition that a
+// snapshot update always follows a position upsert for the same chunk, or
+// a checkpoint fetchArchiveStreamCheckpoint has already confirmed exists
+// (gap-replay's catch-up write). .rpc() mocks
+// update_archive_stream_accumulator_snapshot (migrations/014), called
+// instead of a plain .from(table).update() so the real write can go
+// through a scoped statement_timeout -- see streamArchiveWithResume.ts's
+// own comment for why.
 function makeMockCheckpointClient(options: {
   existingRow?: Record<string, unknown> | null;
   selectError?: { message: string } | null;
   upsertError?: { message: string } | null;
   updateError?: { message: string } | null;
-  // Per-call override for .update().select(), consumed in call order --
-  // undefined for a given index falls back to updateError (or success).
-  // Lets tests simulate "fails once, then succeeds" without a single
-  // static error applying to every retry attempt.
+  // Per-call override for .rpc(), consumed in call order -- undefined for
+  // a given index falls back to updateError (or success). Lets tests
+  // simulate "fails once, then succeeds" without a single static error
+  // applying to every retry attempt.
   updateErrorSequence?: ({ message: string } | null)[];
   deleteError?: { message: string } | null;
 } = {}) {
@@ -60,7 +65,7 @@ function makeMockCheckpointClient(options: {
         : { data: currentRow, error: null },
   };
 
-  const client: ArchiveStreamCheckpointSupabaseClient = {
+  const client = {
     from: () =>
       ({
         select: () => selectQueryBuilder,
@@ -73,36 +78,6 @@ function makeMockCheckpointClient(options: {
           currentRow = { ...currentRow, ...row };
           return { data: null, error: null };
         },
-        update: (values: Record<string, unknown>) => {
-          let eqValue: string | undefined;
-          const updateBuilder = {
-            eq: (_column: string, value: string) => {
-              eqValue = value;
-              return updateBuilder;
-            },
-            select: async () => {
-              const archiveDatasetId = eqValue as string;
-              snapshotUpdateCalls.push({ archiveDatasetId, values });
-              callOrder.push("snapshot-update");
-              const sequenceError = options.updateErrorSequence?.[updateCallIndex];
-              updateCallIndex += 1;
-              const errorForThisCall = sequenceError !== undefined ? sequenceError : options.updateError;
-              if (errorForThisCall !== undefined && errorForThisCall !== null) {
-                return { data: null, error: errorForThisCall };
-              }
-              if (currentRow === null || currentRow.archive_dataset_id !== archiveDatasetId) {
-                // Mirrors real PostgREST behavior: an UPDATE matching zero
-                // rows is not itself an error -- it just returns an empty
-                // result, which is exactly what saveArchiveStreamAccumulator
-                // Snapshot's row-count check exists to catch.
-                return { data: [], error: null };
-              }
-              currentRow = { ...currentRow, ...values };
-              return { data: [currentRow], error: null };
-            },
-          };
-          return updateBuilder;
-        },
         delete: () => ({
           eq: async (_column: string, value: unknown) => {
             deleteCalls.push(value);
@@ -114,7 +89,32 @@ function makeMockCheckpointClient(options: {
           },
         }),
       }) as unknown as ReturnType<ArchiveStreamCheckpointSupabaseClient["from"]>,
-  };
+    rpc: async (_fn: string, params: Record<string, unknown>) => {
+      const archiveDatasetId = params.p_archive_dataset_id as string;
+      const values = {
+        accumulator_snapshot_last_processed_id: params.p_accumulator_snapshot_last_processed_id,
+        accumulator_state: params.p_accumulator_state,
+      };
+      snapshotUpdateCalls.push({ archiveDatasetId, values });
+      callOrder.push("snapshot-update");
+
+      const sequenceError = options.updateErrorSequence?.[updateCallIndex];
+      updateCallIndex += 1;
+      const errorForThisCall = sequenceError !== undefined ? sequenceError : options.updateError;
+      if (errorForThisCall !== undefined && errorForThisCall !== null) {
+        return { data: null, error: errorForThisCall };
+      }
+      if (currentRow === null || currentRow.archive_dataset_id !== archiveDatasetId) {
+        // Mirrors the real function's RETURNS SETOF behavior: an UPDATE
+        // matching zero rows just returns an empty set, not an error --
+        // exactly what saveArchiveStreamAccumulatorSnapshot's row-count
+        // check exists to catch.
+        return { data: [], error: null };
+      }
+      currentRow = { ...currentRow, ...values };
+      return { data: [currentRow], error: null };
+    },
+  } as unknown as ArchiveStreamCheckpointSupabaseClient;
 
   return { client, positionUpsertCalls, snapshotUpdateCalls, deleteCalls, callOrder };
 }

@@ -480,3 +480,41 @@ ALTER TABLE archive_stream_checkpoint ENABLE ROW LEVEL SECURITY;
 -- With RLS enabled and zero policies, Postgres denies all access by default
 -- to any role without BYPASSRLS -- only the service-role key (used
 -- server-side by the batch job) can read or write it.
+
+-- Wraps archive_stream_checkpoint's accumulator-snapshot UPDATE with a
+-- scoped 60s statement_timeout (see migrations/014 for the full,
+-- live-measured reasoning behind both the RPC-wrapping approach and the
+-- 60s figure specifically). SET LOCAL only lasts for this function's own
+-- transaction -- PostgREST runs every request, including this RPC call, as
+-- one transaction -- so it reverts automatically without touching the
+-- default timeout any other query on this database uses, including the
+-- cheap, frequent saveArchiveStreamPosition writes on this SAME table.
+CREATE OR REPLACE FUNCTION update_archive_stream_accumulator_snapshot(
+  p_archive_dataset_id text,
+  p_accumulator_snapshot_last_processed_id text,
+  p_accumulator_state jsonb
+)
+RETURNS SETOF archive_stream_checkpoint
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  SET LOCAL statement_timeout = '60s';
+
+  RETURN QUERY
+    UPDATE archive_stream_checkpoint
+    SET accumulator_snapshot_last_processed_id = p_accumulator_snapshot_last_processed_id,
+        accumulator_state = p_accumulator_state
+    WHERE archive_dataset_id = p_archive_dataset_id
+    RETURNING *;
+END;
+$$;
+
+COMMENT ON FUNCTION update_archive_stream_accumulator_snapshot(text, text, jsonb) IS
+  'Updates archive_stream_checkpoint''s accumulator snapshot fields with a scoped 60s statement_timeout (via SET LOCAL, reverting automatically at the end of this function''s own transaction), instead of whatever shorter default applies to every other query on this database. Called via supabase-js''s .rpc() from saveArchiveStreamAccumulatorSnapshot (streamArchiveWithResume.ts) instead of a plain .update(), specifically to survive the real, load-dependent Postgres statement timeouts observed on this table''s large accumulator_state writes. Returns the updated row (zero rows if archive_dataset_id had no existing checkpoint -- the caller''s row-count check treats that as a real, structural error, not a case to retry).';
+
+-- Same "server-side batch job only" restriction as every other operation on
+-- this internal checkpoint table: no legitimate public-facing caller, so
+-- EXECUTE is revoked from the default PUBLIC/anon/authenticated grants and
+-- restricted to service_role alone.
+REVOKE EXECUTE ON FUNCTION update_archive_stream_accumulator_snapshot(text, text, jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION update_archive_stream_accumulator_snapshot(text, text, jsonb) TO service_role;

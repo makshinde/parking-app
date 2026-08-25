@@ -664,6 +664,10 @@ function makeMockCheckpointClient(existingRow: Record<string, unknown> | null) {
         upsert: async () => ({ data: null, error: null }),
         delete: () => ({ eq: async () => ({ data: [], error: null }) }),
       }) as unknown as ReturnType<ArchiveStreamCheckpointSupabaseClient["from"]>,
+    // Not exercised by these tests (initializeAccumulators never calls
+    // saveArchiveStreamAccumulatorSnapshot directly) -- present only to
+    // satisfy the interface.
+    rpc: async () => ({ data: null, error: null }),
   };
   return client;
 }
