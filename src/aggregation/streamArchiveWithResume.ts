@@ -1,6 +1,6 @@
 import type { SupabaseQueryResult } from "../importers/upsertBlockface.ts";
 import { buildRequestHeaders, type SocrataRecord } from "../utils/fetchSocrataRecords.ts";
-import type { AccumulatorSnapshot } from "./incrementalWeightedStats.ts";
+import { buildAccumulatorBucketKey, parseAccumulatorBucketKey, type AccumulatorSnapshot, type WeightedStatsAccumulator } from "./incrementalWeightedStats.ts";
 
 const SOCRATA_BASE_URL = "https://data.seattle.gov/resource";
 
@@ -8,31 +8,25 @@ const SOCRATA_BASE_URL = "https://data.seattle.gov/resource";
 // per-request cap, so a chunk maps to exactly one Socrata page.
 export const DEFAULT_STREAM_CHUNK_SIZE = 50000;
 
-// How often (in chunks) to persist the expensive accumulator_state
-// snapshot, versus the cheap last_processed_id/readings_processed_count
-// position update that happens every chunk regardless. Derived from real,
-// live-measured numbers, not a guess:
-//
-//   - A realistic ~94,064-bucket AccumulatorSnapshot (last night's real
-//     observed bucket count) serializes to ~13.66MB and, written as part of
-//     a checkpoint upsert against the live archive_stream_checkpoint table,
-//     averaged 17,890ms/write across 3 successful live attempts -- and
-//     outright failed with a Postgres statement timeout on 2 of 5 attempts.
-//     That's ~175x slower than the ~102ms/write lightweight position-only
-//     checkpoint measured earlier (9.5s / 93 chunks).
-//   - The full archive is ceil(300,055,806 / 50,000) = 6,002 chunks.
-//   - Target: keep total accumulator-snapshot overhead to roughly 5% of the
-//     ~5-hour (18,000,000ms) honest full-archive estimate, i.e. a budget of
-//     900,000ms.
-//   - Solving (totalChunks / N) * measuredSnapshotWriteMs <= budgetMs for N:
-//       N >= totalChunks * measuredSnapshotWriteMs / budgetMs
-//          = 6,002 * 17,890 / 900,000
-//          ~= 119.37
-//   - Rounded UP to 120 (rounding up means fewer, not more, snapshots --
-//     the direction that keeps overhead at or under the target rather than
-//     over it): ceil(6002/120) = 51 snapshots x 17.89s ~= 912.9s ~= 15.2
-//     minutes, ~5.07% of the 5-hour estimate -- matching the "roughly 5%"
-//     target this was solved for.
+// How often (in chunks) to persist the accumulator snapshot (now a batch of
+// per-bucket upserts into archive_stream_accumulator_buckets -- see
+// saveArchiveStreamAccumulatorSnapshot), versus the cheap
+// last_processed_id/readings_processed_count position update that happens
+// every chunk regardless. This number predates the per-bucket-row rewrite
+// (it was derived from the old single-JSONB-blob write's cost, back when a
+// realistic ~94,064-bucket snapshot averaged ~17,890ms/write and outright
+// failed a real, load-independent ~20s external timeout on the larger,
+// completely realistic end of this job's actual bucket counts -- see this
+// module's git history for the full investigation). The batched-upsert
+// rewrite removes that specific failure mode (no single request ever again
+// carries the full accumulator state at once), but doesn't change the
+// reasoning for why snapshotting every single chunk would still be
+// wasteful -- every snapshot event still serializes and writes the ENTIRE
+// current accumulator state, not a delta, so a smaller interval still just
+// repeats the same total work more often. 120 is kept as the existing,
+// still-reasonable value pending a fresh cost measurement against the new
+// write path; see DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS's own test
+// for the original derivation this constant is pinned to.
 export const DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS = 120;
 
 // How often (in chunks) to print archive-streaming progress. Matches
@@ -53,14 +47,14 @@ export interface ArchiveStreamCheckpoint {
   // Cheap pair: updated every chunk via saveArchiveStreamPosition.
   lastProcessedId: string;
   readingsProcessedCount: number;
-  // Expensive pair: updated only every
-  // DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS chunks via
-  // saveArchiveStreamAccumulatorSnapshot, written atomically together (see
-  // that function's own comment for why those two specifically must never
-  // drift apart from EACH OTHER). accumulatorSnapshotLastProcessedId is
-  // null when no snapshot has been taken yet (a fresh run, or one still
-  // short of its first snapshot boundary) -- accumulatorState is then just
-  // the default empty '{}'.
+  // The :id cursor the accumulator was last snapshotted at (see
+  // saveArchiveStreamAccumulatorSnapshot) -- updated only every
+  // snapshotIntervalChunks chunks, unlike lastProcessedId above. null means
+  // no snapshot has been taken yet (a fresh run, or one still short of its
+  // first snapshot boundary). The accumulator's actual per-bucket values
+  // live in archive_stream_accumulator_buckets, not on this row -- see
+  // fetchAccumulatorBuckets -- this cursor is only the pointer saying how
+  // far that table's contents reflect.
   //
   // This pair is deliberately allowed to lag BEHIND lastProcessedId --
   // that's the whole point of the split (see DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS's
@@ -73,7 +67,6 @@ export interface ArchiveStreamCheckpoint {
   // lastProcessedId on one end and accumulatorSnapshotLastProcessedId, or
   // the start of the dataset, on the other).
   accumulatorSnapshotLastProcessedId: string | null;
-  accumulatorState: AccumulatorSnapshot;
 }
 
 interface ArchiveStreamCheckpointRow {
@@ -81,32 +74,36 @@ interface ArchiveStreamCheckpointRow {
   last_processed_id: string;
   readings_processed_count: number;
   accumulator_snapshot_last_processed_id: string | null;
-  accumulator_state: AccumulatorSnapshot;
 }
 
-// Same DI shape as BackfillFailuresSupabaseClient (backfill-occupancy-stats.ts):
-// a chainable .eq() query builder resolving via .maybeSingle() (zero rows is
-// a valid, expected outcome -- a fresh archive with no checkpoint yet --
-// not an error), plus upsert and delete.
 export interface ArchiveStreamCheckpointQueryBuilder extends PromiseLike<SupabaseQueryResult<ArchiveStreamCheckpointRow[]>> {
   eq(column: string, value: string): ArchiveStreamCheckpointQueryBuilder;
   maybeSingle(): PromiseLike<SupabaseQueryResult<ArchiveStreamCheckpointRow>>;
 }
 
+// Returned by .update(), then narrowed by .eq() to the one row being
+// updated, then .select()ed to get the affected row(s) back -- PostgREST
+// (and by extension supabase-js) doesn't report an UPDATE's affected row
+// count any other way, and a plain UPDATE matching zero rows isn't itself
+// an error, so this is what lets saveArchiveStreamAccumulatorSnapshot's
+// row-count check work.
+export interface ArchiveStreamCheckpointUpdateEqBuilder {
+  select(columns: string): PromiseLike<SupabaseQueryResult<ArchiveStreamCheckpointRow[]>>;
+}
+
+export interface ArchiveStreamCheckpointUpdateQueryBuilder {
+  eq(column: string, value: string): ArchiveStreamCheckpointUpdateEqBuilder;
+}
+
 export interface ArchiveStreamCheckpointSupabaseTableBuilder {
   select(columns: string): ArchiveStreamCheckpointQueryBuilder;
   upsert(values: Record<string, unknown>, options: { onConflict: string }): PromiseLike<SupabaseQueryResult>;
+  update(values: Record<string, unknown>): ArchiveStreamCheckpointUpdateQueryBuilder;
   delete(): { eq(column: string, value: string): PromiseLike<SupabaseQueryResult> };
 }
 
 export interface ArchiveStreamCheckpointSupabaseClient {
   from(table: string): ArchiveStreamCheckpointSupabaseTableBuilder;
-  // Used only by saveArchiveStreamAccumulatorSnapshot, to call
-  // update_archive_stream_accumulator_snapshot (migrations/014) instead of
-  // a plain .from(table).update() -- see that function's own comment for
-  // why a scoped statement_timeout requires going through a database
-  // function rather than anything expressible via .from().
-  rpc(fn: string, params: Record<string, unknown>): PromiseLike<SupabaseQueryResult<ArchiveStreamCheckpointRow[]>>;
 }
 
 // Reads back the checkpoint for one archive, if any. Returns null (not an
@@ -120,7 +117,7 @@ export async function fetchArchiveStreamCheckpoint(
   const { data, error } = await client
     .from("archive_stream_checkpoint")
     .select(
-      "archive_dataset_id, last_processed_id, readings_processed_count, accumulator_snapshot_last_processed_id, accumulator_state",
+      "archive_dataset_id, last_processed_id, readings_processed_count, accumulator_snapshot_last_processed_id",
     )
     .eq("archive_dataset_id", archiveDatasetId)
     .maybeSingle();
@@ -139,22 +136,22 @@ export async function fetchArchiveStreamCheckpoint(
     lastProcessedId: data.last_processed_id,
     readingsProcessedCount: data.readings_processed_count,
     accumulatorSnapshotLastProcessedId: data.accumulator_snapshot_last_processed_id,
-    accumulatorState: data.accumulator_state,
   };
 }
 
 // Cheap: updates ONLY the stream's own position. Deliberately does NOT
-// include accumulator_snapshot_last_processed_id/accumulator_state in the
-// upsert payload, so PostgREST's ON CONFLICT DO UPDATE only touches (and
-// the client only ever transmits) these two small columns -- whatever
-// accumulator snapshot already exists on this row is left completely
-// untouched, which is what keeps this cheap even after a multi-megabyte
-// snapshot has been written to the same row (real per-chunk cost target:
-// the ~102ms/write this project measured before accumulator_state existed
-// at all). Called after every chunk, unconditionally.
+// include accumulator_snapshot_last_processed_id in the upsert payload, so
+// PostgREST's ON CONFLICT DO UPDATE only touches (and the client only ever
+// transmits) these two small columns -- whatever snapshot cursor already
+// exists on this row is left completely untouched. Called after every
+// chunk, unconditionally.
 export async function saveArchiveStreamPosition(
   client: ArchiveStreamCheckpointSupabaseClient,
-  position: { archiveDatasetId: string; lastProcessedId: string; readingsProcessedCount: number },
+  position: {
+    archiveDatasetId: string;
+    lastProcessedId: string;
+    readingsProcessedCount: number;
+  },
 ): Promise<void> {
   const { error } = await client.from("archive_stream_checkpoint").upsert(
     {
@@ -172,111 +169,259 @@ export async function saveArchiveStreamPosition(
   }
 }
 
-// Expensive: writes accumulator_state and the :id cursor it reflects
-// (accumulator_snapshot_last_processed_id) together, in one write. These
-// two specifically must never drift apart from EACH OTHER -- that pairing
-// is what "the accumulator exactly as of this :id position" means, and
-// losing it would reintroduce the original double-counting/undercounting
-// risk this design exists to fix, just between these two fields instead of
-// against last_processed_id.
+// --- archive_stream_accumulator_buckets persistence ----------------------
 //
-// A genuine UPDATE, not an upsert -- live-confirmed as a real, would-have-
-// broken-every-production-run bug: an .upsert() with onConflict targeting
-// archive_dataset_id's UNIQUE constraint, for a payload that omits
-// last_processed_id (a NOT NULL column with no default), reproducibly
-// failed with a "null value in column last_processed_id violates not-null
-// constraint" error EVEN AGAINST AN ALREADY-EXISTING ROW -- confirmed via
-// direct, isolated testing against a disposable row (not this project's
-// real data) that Postgres was genuinely attempting a fresh INSERT (a new,
-// randomly-generated id in the failing-row detail) rather than recognizing
-// the conflict, while a plain UPDATE against that identical row succeeded
-// immediately. A genuine UPDATE is also the more semantically correct
-// operation here regardless of that bug: this function is only ever called
-// immediately after saveArchiveStreamPosition has run for the same chunk
-// (see streamArchiveWithResume), or against a checkpoint row
-// fetchArchiveStreamCheckpoint has just confirmed exists (gap-replay's
-// catch-up write) -- there is no legitimate case where this row doesn't
-// already exist, unlike saveArchiveStreamPosition, which genuinely does
-// need upsert's create-or-update behavior for a truly fresh run's first
-// chunk.
+// The accumulator's per-bucket state (WeightedStatsAccumulator, one entry
+// per blockface/iso_day/hour) used to be written as a single JSONB blob on
+// archive_stream_checkpoint (accumulator_state), snapshotted as one big
+// write. Real, live, controlled testing found that write hitting a hard,
+// SIZE-INDEPENDENT ~20-second failure ceiling at realistic bucket counts
+// (~110,000+ buckets): payloads ranging from 12.4MB to 16.9MB (a 36% size
+// spread) all failed within about 1.4 seconds of each other, which is not
+// what a genuine Postgres statement_timeout raised well above that (even a
+// SET LOCAL-scoped 60s, tried and live-verified NOT to fix this) should
+// look like -- a real per-query timeout would either let all of these
+// succeed or fail with times that scale with payload size. That clustering
+// is much better explained by an external, fixed-duration cutoff upstream
+// of Postgres itself (most plausibly Supabase's connection pooler or API
+// gateway) that no amount of raising Postgres's own statement_timeout can
+// reach.
 //
-// Goes through update_archive_stream_accumulator_snapshot (a Postgres
-// function, migrations/014), called via .rpc(), rather than a plain
-// .from("archive_stream_checkpoint").update() -- because this write also
-// needs a longer statement_timeout than whatever this database's default
-// is, and that can only be scoped to just this one operation (not every
-// other query on the shared service-role connection, including the cheap,
-// frequent saveArchiveStreamPosition writes on this SAME table) via
-// Postgres's SET LOCAL inside a function's own transaction. See
-// migrations/014's comment for the full reasoning and the real,
-// live-measured numbers (including why 60s) behind that choice; there is
-// no client-side option in @supabase/postgrest-js that can scope
-// statement_timeout per request -- confirmed directly against the actual
-// installed client, not assumed.
-//
-// The function returns the updated row (SETOF, zero or one row) so the row
-// count can still be checked here exactly as before -- an UPDATE matching
-// zero rows is not an error Postgres/PostgREST reports on its own, and
-// silently doing nothing here would be exactly the kind of quiet,
-// hard-to-detect failure this whole checkpoint design exists to avoid.
-//
+// This table replaces that single blob with one row per bucket, written via
+// many small batched upserts (see upsertAccumulatorBuckets) instead of one
+// large write -- structurally avoiding the failure mode regardless of its
+// exact external cause, since no individual request ever again carries the
+// full accumulator state.
+export interface ArchiveStreamAccumulatorBucketRow {
+  blockface_id: string;
+  iso_day: number;
+  hour: number;
+  count: number;
+  total_weight: number;
+  mean: number;
+  sum_squared_diff: number;
+}
+
+export interface ArchiveStreamAccumulatorBucketsQueryBuilder extends PromiseLike<SupabaseQueryResult<ArchiveStreamAccumulatorBucketRow[]>> {
+  eq(column: string, value: string): ArchiveStreamAccumulatorBucketsQueryBuilder;
+  order(column: string): ArchiveStreamAccumulatorBucketsQueryBuilder;
+  range(from: number, to: number): PromiseLike<SupabaseQueryResult<ArchiveStreamAccumulatorBucketRow[]>>;
+}
+
+export interface ArchiveStreamAccumulatorBucketsSupabaseTableBuilder {
+  select(columns: string): ArchiveStreamAccumulatorBucketsQueryBuilder;
+  upsert(values: Record<string, unknown>[], options: { onConflict: string }): PromiseLike<SupabaseQueryResult>;
+}
+
+export interface ArchiveStreamAccumulatorBucketsSupabaseClient {
+  from(table: string): ArchiveStreamAccumulatorBucketsSupabaseTableBuilder;
+}
+
+// Same DI pattern used throughout this module: both clients are typically
+// the same real supabase-js client cast to two different, narrow,
+// purpose-specific interfaces (see backfill-occupancy-stats.ts's main()),
+// kept separate here because they genuinely target different tables with
+// different shapes.
+export interface ArchiveStreamClients {
+  checkpointClient: ArchiveStreamCheckpointSupabaseClient;
+  bucketsClient: ArchiveStreamAccumulatorBucketsSupabaseClient;
+}
+
+// Read page size for fetchAccumulatorBuckets -- much larger than the 500
+// used for writes (upsertAccumulatorBuckets), since PostgREST reads via
+// .range() are cheap, ordinary SELECTs (no write-side timeout risk at all),
+// and this table's realistic upper bound (~1,500 blockfaces x 7 days x 24
+// hours ~= 252,000 rows max, per archive) is nowhere near the depth where
+// even ordinary offset-based pagination would degrade -- that concern
+// (CLAUDE.md's Architecture section) is specific to Socrata's
+// hundreds-of-millions-of-rows scale, not this table's.
+const ACCUMULATOR_BUCKET_READ_PAGE_SIZE = 1000;
+
+// Reads every accumulator bucket row for one archive back into an
+// AccumulatorSnapshot, paginating until a short page confirms the end --
+// same "page until shorter than the page size" idiom used elsewhere in this
+// project (e.g. fetchSocrataRecordsPaginated). Ordered by id for a stable,
+// gap-free/duplicate-free .range() walk.
+export async function fetchAccumulatorBuckets(
+  client: ArchiveStreamAccumulatorBucketsSupabaseClient,
+  archiveDatasetId: string,
+): Promise<AccumulatorSnapshot> {
+  const snapshot: AccumulatorSnapshot = {};
+  let from = 0;
+
+  while (true) {
+    const to = from + ACCUMULATOR_BUCKET_READ_PAGE_SIZE - 1;
+    const { data, error } = await client
+      .from("archive_stream_accumulator_buckets")
+      .select(
+        "blockface_id, iso_day, hour, count, total_weight, mean, sum_squared_diff",
+      )
+      .eq("archive_dataset_id", archiveDatasetId)
+      .order("id")
+      .range(from, to);
+
+    if (error !== null) {
+      throw new Error(
+        `fetchAccumulatorBuckets: reading accumulator buckets for archive_dataset_id=${archiveDatasetId} failed: ${error.message}`,
+      );
+    }
+
+    const page = data ?? [];
+    for (const row of page) {
+      const bucketKey = buildAccumulatorBucketKey(
+        row.blockface_id,
+        row.iso_day,
+        row.hour,
+      );
+      snapshot[bucketKey] = {
+        count: row.count,
+        totalWeight: row.total_weight,
+        mean: row.mean,
+        sumSquaredDiff: row.sum_squared_diff,
+      };
+    }
+
+    if (page.length < ACCUMULATOR_BUCKET_READ_PAGE_SIZE) {
+      break;
+    }
+    from += ACCUMULATOR_BUCKET_READ_PAGE_SIZE;
+  }
+
+  return snapshot;
+}
+
+// Chosen to match upsertOccupancyStatsBatch's already-proven batch size
+// (upsertOccupancyStats.ts): 200 rows/call measured at 129.8ms (0.65ms/row),
+// 500 rows/call at 165.7ms (0.33ms/row), both comfortably fast and, more
+// importantly here, comfortably far from the ~20s external ceiling this
+// table's design exists to avoid.
+const ACCUMULATOR_BUCKET_WRITE_CHUNK_SIZE = 500;
+
+function buildAccumulatorBucketRow(
+  archiveDatasetId: string,
+  bucketKey: string,
+  accumulator: WeightedStatsAccumulator,
+): Record<string, unknown> {
+  const { blockfaceId, isoDay, hour } = parseAccumulatorBucketKey(bucketKey);
+  return {
+    archive_dataset_id: archiveDatasetId,
+    blockface_id: blockfaceId,
+    iso_day: isoDay,
+    hour,
+    count: accumulator.count,
+    total_weight: accumulator.totalWeight,
+    mean: accumulator.mean,
+    sum_squared_diff: accumulator.sumSquaredDiff,
+  };
+}
+
+// Writes the ENTIRE current accumulator state (not a delta -- same as the
+// old single-blob design, and same as how occupancy_stats itself is always
+// written as a full row) as many small batched upserts instead of one large
+// write. Unlike upsertOccupancyStatsBatch, a batch that fails here is NOT
+// retried row-by-row with the failure swallowed: occupancy_stats' row-level
+// fallback exists because THAT table ingests externally-computed stats that
+// could genuinely contain one bad row needing isolation from its batch-
+// mates. This table's rows are internal, structurally-controlled
+// accumulator state (every field is always a finite number, by
+// construction of WeightedStatsAccumulator) -- there's no realistic "one
+// row is bad" case to isolate, and a retry-with-backoff wrapper already
+// sits above this whole function (saveArchiveStreamAccumulatorSnapshot), so
+// throwing on the first batch error and letting that wrapper retry the
+// whole (idempotent) upsert is simpler and just as safe.
+async function upsertAccumulatorBuckets(
+  client: ArchiveStreamAccumulatorBucketsSupabaseClient,
+  archiveDatasetId: string,
+  accumulatorState: AccumulatorSnapshot,
+): Promise<void> {
+  const rows = Object.entries(accumulatorState).map(
+    ([bucketKey, accumulator]) =>
+      buildAccumulatorBucketRow(archiveDatasetId, bucketKey, accumulator),
+  );
+
+  for (let i = 0; i < rows.length; i += ACCUMULATOR_BUCKET_WRITE_CHUNK_SIZE) {
+    const chunk = rows.slice(i, i + ACCUMULATOR_BUCKET_WRITE_CHUNK_SIZE);
+    const { error } = await client
+      .from("archive_stream_accumulator_buckets")
+      .upsert(chunk, {
+        onConflict: "archive_dataset_id,blockface_id,iso_day,hour",
+      });
+
+    if (error !== null) {
+      throw new Error(
+        `upsertAccumulatorBuckets: batch upsert failed for archive_dataset_id=${archiveDatasetId} (rows ${i}-${i + chunk.length - 1} of ${rows.length}): ${error.message}`,
+      );
+    }
+  }
+}
+
 // Marks the one kind of failure known to be structural, not transient: the
-// row-count check above finding zero matching rows. Retrying that would
-// never succeed -- there's no row to update, and no amount of waiting
-// creates one -- so it's classified separately from every other failure
-// this write can hit, which defaults to retryable (see
-// saveArchiveStreamAccumulatorSnapshot's own comment for why a default-
-// retryable-except-one-known-case design, not per-error-type handling, is
-// what this project already learned to do here).
+// cursor-update row-count check below finding zero matching rows. Retrying
+// that would never succeed -- there's no row to update, and no amount of
+// waiting creates one -- so it's classified separately from every other
+// failure this write can hit (bucket upsert errors included), which
+// defaults to retryable.
 class SnapshotRowNotFoundError extends Error {}
 
+// Expensive-ish step (many small requests instead of one big one -- see
+// upsertAccumulatorBuckets), followed by a cheap cursor advance. The cursor
+// (archive_stream_checkpoint.accumulator_snapshot_last_processed_id) is
+// updated ONLY after every bucket row has landed successfully -- preserving
+// the same atomicity guarantee the old design had (those two specifically
+// must never drift apart from EACH OTHER): if the bucket upsert throws, this
+// function never reaches the cursor update at all, so a resume correctly
+// still sees the OLD snapshot cursor and re-attempts (an idempotent, safe
+// redo) rather than believing a snapshot exists that doesn't.
+//
+// A genuine UPDATE, not an upsert -- same reasoning established for this
+// write previously (see this module's git history / PR history): this
+// function is only ever called after saveArchiveStreamPosition has already
+// created the row for this chunk, or against a checkpoint
+// fetchArchiveStreamCheckpoint has just confirmed exists (gap-replay's
+// catch-up write), so there's no legitimate case where this row doesn't
+// already exist. .select() after .update().eq() is what makes the affected
+// row count visible -- PostgREST doesn't report it any other way, and an
+// UPDATE matching zero rows isn't itself a PostgREST error.
 async function saveArchiveStreamAccumulatorSnapshotOnce(
-  client: ArchiveStreamCheckpointSupabaseClient,
-  snapshot: { archiveDatasetId: string; accumulatorSnapshotLastProcessedId: string; accumulatorState: AccumulatorSnapshot },
+  clients: ArchiveStreamClients,
+  snapshot: {
+    archiveDatasetId: string;
+    accumulatorSnapshotLastProcessedId: string;
+    accumulatorState: AccumulatorSnapshot;
+  },
 ): Promise<void> {
-  const { data, error } = await client.rpc("update_archive_stream_accumulator_snapshot", {
-    p_archive_dataset_id: snapshot.archiveDatasetId,
-    p_accumulator_snapshot_last_processed_id: snapshot.accumulatorSnapshotLastProcessedId,
-    p_accumulator_state: snapshot.accumulatorState,
-  });
+  await upsertAccumulatorBuckets(clients.bucketsClient, snapshot.archiveDatasetId, snapshot.accumulatorState);
+
+  const { data, error } = await clients.checkpointClient
+    .from("archive_stream_checkpoint")
+    .update({
+      accumulator_snapshot_last_processed_id:
+        snapshot.accumulatorSnapshotLastProcessedId,
+    })
+    .eq("archive_dataset_id", snapshot.archiveDatasetId)
+    .select("archive_dataset_id");
 
   if (error !== null) {
     throw new Error(
-      `saveArchiveStreamAccumulatorSnapshot: writing accumulator snapshot for archive_dataset_id=${snapshot.archiveDatasetId} failed: ${error.message}`,
+      `saveArchiveStreamAccumulatorSnapshot: advancing the snapshot cursor for archive_dataset_id=${snapshot.archiveDatasetId} failed: ${error.message}`,
     );
   }
 
   if (data === null || data.length !== 1) {
     throw new SnapshotRowNotFoundError(
-      `saveArchiveStreamAccumulatorSnapshot: expected exactly one existing archive_stream_checkpoint row for archive_dataset_id=${snapshot.archiveDatasetId}, but the update affected ${data?.length ?? 0} row(s) -- this function is only ever called after saveArchiveStreamPosition has already created the row for this chunk, so a missing row signals a real bug upstream, not a normal case to handle gracefully`,
+      `saveArchiveStreamAccumulatorSnapshot: expected exactly one existing archive_stream_checkpoint row for archive_dataset_id=${snapshot.archiveDatasetId}, but the cursor update affected ${data?.length ?? 0} row(s) -- this function is only ever called after saveArchiveStreamPosition has already created the row for this chunk, so a missing row signals a real bug upstream, not a normal case to handle gracefully`,
     );
   }
 }
 
 // One initial attempt plus up to 3 retries, exponential backoff (1s, 2s,
-// 4s) -- same shape as fetchSocrataRecords.ts's fetchPage retry logic.
-// Kept as a real, meaningful second layer alongside the 60s scoped
-// statement_timeout above (migrations/014), not made redundant by it:
-// direct testing found the IDENTICAL ~94,064-bucket payload fail at 18.65s
-// in one attempt and succeed at 39.78s in the very next, with no code or
-// data difference between them, and a real run separately hit 4
-// consecutive timeouts in a row even with retry already in place --
-// confirming this write's failures are genuinely transient and
-// load-dependent, not a fixed ceiling either layer alone fully closes off.
-// A longer per-attempt timeout makes each individual attempt more likely
-// to succeed; retry-with-backoff is what covers the case where even a
-// generous timeout is exceeded under a sustained bad stretch. Belt and
-// suspenders, not either-or.
-//
-// Lowering DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS was separately
-// investigated and rejected as a fix for this: every snapshot write
-// serializes the FULL accumulator state (onChunk always returns
-// Object.fromEntries(accumulators), never a delta -- see
-// backfill-occupancy-stats.ts's main()), and that state's size is
-// dominated by the rolling window's one-time initial fold (~100K+ buckets,
-// live-verified), not by how many chunks have elapsed since the last
-// snapshot -- so a smaller interval doesn't shrink any individual write,
-// it only attempts the same already-risky size more often.
+// 4s) -- same shape as fetchSocrataRecords.ts's fetchPage retry logic, kept
+// as a real, meaningful layer even now that no individual request in this
+// sequence is large: many small requests still each have their own
+// (small) chance of a transient failure, and retrying the whole sequence is
+// cheap and safe (upsertAccumulatorBuckets is idempotent; a failure before
+// the cursor update simply means the next attempt redoes the upsert
+// against a checkpoint cursor that hasn't moved yet).
 export const MAX_SNAPSHOT_WRITE_ATTEMPTS = 4;
 const SNAPSHOT_WRITE_RETRY_BASE_DELAY_MS = 1000;
 
@@ -285,12 +430,16 @@ function sleep(ms: number): Promise<void> {
 }
 
 export async function saveArchiveStreamAccumulatorSnapshot(
-  client: ArchiveStreamCheckpointSupabaseClient,
-  snapshot: { archiveDatasetId: string; accumulatorSnapshotLastProcessedId: string; accumulatorState: AccumulatorSnapshot },
+  clients: ArchiveStreamClients,
+  snapshot: {
+    archiveDatasetId: string;
+    accumulatorSnapshotLastProcessedId: string;
+    accumulatorState: AccumulatorSnapshot;
+  },
 ): Promise<void> {
   for (let attempt = 1; attempt <= MAX_SNAPSHOT_WRITE_ATTEMPTS; attempt++) {
     try {
-      await saveArchiveStreamAccumulatorSnapshotOnce(client, snapshot);
+      await saveArchiveStreamAccumulatorSnapshotOnce(clients, snapshot);
       return;
     } catch (err) {
       const retryable = !(err instanceof SnapshotRowNotFoundError);
@@ -316,12 +465,22 @@ export async function saveArchiveStreamAccumulatorSnapshot(
 // deliberate, not just convenient, choice: both cases want exactly the same
 // next action (start fresh, no cursors) on a future call for this
 // archive_dataset_id, so collapsing them onto one "no checkpoint exists"
-// state doesn't lose any information a caller needs.
+// state doesn't lose any information a caller needs. Deliberately does NOT
+// also delete this archive's rows from archive_stream_accumulator_buckets --
+// those hold the actual accumulated stats, which main() still needs to read
+// from the in-memory Map immediately after this returns; deleting them here
+// would risk data loss if the subsequent occupancy_stats write step crashes
+// before completing (see the buckets-cleanup note in this project's own
+// design discussion -- deliberately left as a known non-issue for now, not
+// built).
 export async function clearArchiveStreamCheckpoint(
   client: ArchiveStreamCheckpointSupabaseClient,
   archiveDatasetId: string,
 ): Promise<void> {
-  const { error } = await client.from("archive_stream_checkpoint").delete().eq("archive_dataset_id", archiveDatasetId);
+  const { error } = await client
+    .from("archive_stream_checkpoint")
+    .delete()
+    .eq("archive_dataset_id", archiveDatasetId);
 
   if (error !== null) {
     throw new Error(
@@ -489,25 +648,30 @@ async function replayAccumulatorGap(
 // Checkpointing is split into two independently-paced pieces (see
 // DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS for the real cost numbers
 // behind this): a cheap stream-position update every chunk, and an
-// expensive accumulator-state snapshot only every snapshotIntervalChunks
-// chunks. A resume reconciles the resulting gap between the two by
-// re-fetching and re-folding exactly that bounded range before continuing
-// normal streaming -- never the whole dataset, and never double-counting,
-// since the gap is fetched and folded exactly once into the restored
-// snapshot.
-export async function streamArchiveWithResume(
-  checkpointClient: ArchiveStreamCheckpointSupabaseClient,
-  options: StreamArchiveOptions,
-): Promise<void> {
+// accumulator-state snapshot (many small batched upserts into
+// archive_stream_accumulator_buckets, see saveArchiveStreamAccumulatorSnapshot)
+// only every snapshotIntervalChunks chunks. A resume reconciles the
+// resulting gap between the two by re-fetching and re-folding exactly that
+// bounded range before continuing normal streaming -- never the whole
+// dataset, and never double-counting, since the gap is fetched and folded
+// exactly once into the restored snapshot.
+export async function streamArchiveWithResume(clients: ArchiveStreamClients, options: StreamArchiveOptions): Promise<void> {
+  const { checkpointClient, bucketsClient } = clients;
   const chunkSize = options.chunkSize ?? DEFAULT_STREAM_CHUNK_SIZE;
   const snapshotIntervalChunks = options.snapshotIntervalChunks ?? DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS;
 
   const existingCheckpoint = await fetchArchiveStreamCheckpoint(checkpointClient, options.archiveDatasetId);
   let cursorId: string | null = existingCheckpoint?.lastProcessedId ?? null;
   let readingsProcessedCount = existingCheckpoint?.readingsProcessedCount ?? 0;
-  let accumulatorState: AccumulatorSnapshot = existingCheckpoint?.accumulatorState ?? {};
+  let accumulatorState: AccumulatorSnapshot = {};
 
   if (existingCheckpoint !== null) {
+    // Read back whatever accumulator state has been durably snapshotted so
+    // far for this archive (empty if no snapshot has ever landed yet -- see
+    // fetchAccumulatorBuckets, which simply returns {} for zero matching
+    // rows, same as a fresh run).
+    accumulatorState = await fetchAccumulatorBuckets(bucketsClient, options.archiveDatasetId);
+
     // Fires FIRST, before any onChunk call (including gap-replay's below)
     // -- this is what seeds the caller's own local accumulator (e.g. a
     // Map<bucketKey, WeightedStatsAccumulator>) with the last snapshotted
@@ -538,7 +702,7 @@ export async function streamArchiveWithResume(
       // Persist the now-caught-up snapshot immediately -- the expensive
       // recompute has already been paid for, so a future crash shouldn't
       // have to redo this same replay.
-      await saveArchiveStreamAccumulatorSnapshot(checkpointClient, {
+      await saveArchiveStreamAccumulatorSnapshot(clients, {
         archiveDatasetId: options.archiveDatasetId,
         accumulatorSnapshotLastProcessedId: existingCheckpoint.lastProcessedId,
         accumulatorState,
@@ -576,15 +740,14 @@ export async function streamArchiveWithResume(
     }
 
     if (chunksSinceLastSnapshot >= snapshotIntervalChunks) {
-      // Expensive, only every snapshotIntervalChunks chunks. Written AFTER
-      // the position update above (never before): that ordering guarantees
-      // accumulator_snapshot_last_processed_id can only ever be behind or
-      // equal to last_processed_id, never ahead of it -- if it could get
-      // ahead (e.g. this write landed but the position write above then
-      // failed), a resume would under-fetch and silently skip readings the
-      // snapshot already counted, rather than the safe, bounded-replay gap
-      // this design is built to handle.
-      await saveArchiveStreamAccumulatorSnapshot(checkpointClient, {
+      // Written AFTER the position update above (never before): that
+      // ordering guarantees accumulator_snapshot_last_processed_id can
+      // only ever be behind or equal to last_processed_id, never ahead of
+      // it -- if it could get ahead (e.g. this write landed but the
+      // position write above then failed), a resume would under-fetch and
+      // silently skip readings the snapshot already counted, rather than
+      // the safe, bounded-replay gap this design is built to handle.
+      await saveArchiveStreamAccumulatorSnapshot(clients, {
         archiveDatasetId: options.archiveDatasetId,
         accumulatorSnapshotLastProcessedId: cursorId,
         accumulatorState,

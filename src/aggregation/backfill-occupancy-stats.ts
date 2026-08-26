@@ -18,10 +18,18 @@ import {
   type OccupancyStatsWriteRequest,
 } from "./upsertOccupancyStats.ts";
 import { calculateRecencyWeight } from "../scoring/recencyWeight.ts";
-import { addReading, createEmptyAccumulator, type AccumulatorSnapshot, type WeightedStatsAccumulator } from "./incrementalWeightedStats.ts";
+import {
+  addReading,
+  buildAccumulatorBucketKey,
+  createEmptyAccumulator,
+  parseAccumulatorBucketKey,
+  type AccumulatorSnapshot,
+  type WeightedStatsAccumulator,
+} from "./incrementalWeightedStats.ts";
 import {
   fetchArchiveStreamCheckpoint,
   streamArchiveWithResume,
+  type ArchiveStreamAccumulatorBucketsSupabaseClient,
   type ArchiveStreamCheckpointSupabaseClient,
 } from "./streamArchiveWithResume.ts";
 
@@ -130,40 +138,14 @@ export function parseRawReadings(records: SocrataRecord[]): ParseRawReadingsResu
 
 // --- Streaming aggregation: bucket keys and folding -----------------------
 
-// blockfaceId is a uuid (schema.sql's blockfaces.id), which never contains
-// a colon, so joining with ':' and splitting back apart (below) is
-// unambiguous. Unlike the old per-combo design (where isoDay/hour were
-// constant for an entire archive query and only blockfaceId varied), a
-// single streamed chunk can contain readings spanning every bucket at
-// once -- :id keyset pagination has no correlation with time (see
-// CLAUDE.md's Architecture section) -- so the accumulator Map needs the
-// full (blockfaceId, isoDay, hour) triple as its key, not blockfaceId alone.
-export function buildAccumulatorBucketKey(blockfaceId: string, isoDay: number, hour: number): string {
-  return `${blockfaceId}:${isoDay}:${hour}`;
-}
-
-export interface AccumulatorBucketKeyComponents {
-  blockfaceId: string;
-  isoDay: number;
-  hour: number;
-}
-
-const ACCUMULATOR_BUCKET_KEY_PATTERN = /^(.+):(\d+):(\d+)$/;
-
-// Inverse of buildAccumulatorBucketKey, used when iterating the final
-// accumulator Map to write occupancy_stats rows. A bucket key is a fixed,
-// structural format this module itself produces, not external input, so a
-// malformed key signals a real bug -- same discrete/categorical-input
-// reasoning isoDayToSocrataDow uses for an out-of-range day -- and throws
-// rather than guessing at a best-effort parse.
-export function parseAccumulatorBucketKey(key: string): AccumulatorBucketKeyComponents {
-  const match = ACCUMULATOR_BUCKET_KEY_PATTERN.exec(key);
-  if (match === null) {
-    throw new Error(`parseAccumulatorBucketKey: malformed bucket key "${key}"`);
-  }
-  const [, blockfaceId, isoDay, hour] = match;
-  return { blockfaceId: blockfaceId as string, isoDay: Number(isoDay), hour: Number(hour) };
-}
+// buildAccumulatorBucketKey/parseAccumulatorBucketKey now live in
+// incrementalWeightedStats.ts (streamArchiveWithResume.ts needs them too,
+// to convert an AccumulatorSnapshot's string-keyed buckets into
+// archive_stream_accumulator_buckets' relational columns, and putting them
+// there avoids a circular import between the two modules). Re-exported here
+// unchanged so existing callers/imports of this module don't need to
+// change.
+export { buildAccumulatorBucketKey, parseAccumulatorBucketKey, type AccumulatorBucketKeyComponents } from "./incrementalWeightedStats.ts";
 
 export interface FoldReadingsResult {
   unmatchedCount: number;
@@ -652,6 +634,7 @@ export async function main(): Promise<void> {
   const occupancyStatsClient = rawSupabaseClient as unknown as OccupancyStatsSupabaseClient;
   const failuresClient = rawSupabaseClient as unknown as BackfillFailuresSupabaseClient;
   const checkpointClient = rawSupabaseClient as unknown as ArchiveStreamCheckpointSupabaseClient;
+  const accumulatorBucketsClient = rawSupabaseClient as unknown as ArchiveStreamAccumulatorBucketsSupabaseClient;
 
   const now = new Date();
   const priorYear = getPriorYear(now);
@@ -680,7 +663,7 @@ export async function main(): Promise<void> {
 
   let chunksProcessed = 0;
   try {
-    await streamArchiveWithResume(checkpointClient, {
+    await streamArchiveWithResume({ checkpointClient, bucketsClient: accumulatorBucketsClient }, {
       archiveDatasetId,
       onResume: (snapshot) => {
         const restoredCount = mergeAccumulatorSnapshot(accumulators, snapshot);
