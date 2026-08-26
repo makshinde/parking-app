@@ -429,34 +429,23 @@ CREATE TABLE archive_stream_checkpoint (
   -- used to decide where to resume from, that's last_processed_id's job.
   readings_processed_count bigint NOT NULL,
 
-  -- The :id cursor value accumulator_state (below) was last snapshotted
-  -- at -- distinct from last_processed_id, which advances every chunk
-  -- while this only advances every snapshotIntervalChunks chunks (see
-  -- streamArchiveWithResume.ts). Null means no snapshot has been taken yet
-  -- (a fresh run, or one still short of its first snapshot boundary).
+  -- The :id cursor value the accumulator (archive_stream_accumulator_buckets)
+  -- was last snapshotted at -- distinct from last_processed_id, which
+  -- advances every chunk while this only advances every
+  -- snapshotIntervalChunks chunks (see streamArchiveWithResume.ts). Null
+  -- means no snapshot has been taken yet (a fresh run, or one still short
+  -- of its first snapshot boundary).
   --
-  -- This is a deliberate split, not the original design: live-measured,
-  -- writing a realistic ~94,064-bucket accumulator_state blob (~13.66MB
-  -- serialized) averaged 17,890ms/write against this table across 3
-  -- successful attempts, and outright failed with a Postgres statement
-  -- timeout on 2 of 5 -- ~175x slower than the ~102ms/write lightweight
-  -- position-only checkpoint. Snapshotting on every chunk would cost
-  -- roughly 30 hours across the full archive's ~6,002 chunks, dwarfing the
-  -- ~5 hour honest full-archive estimate for everything else combined. A
-  -- gap where this lags behind last_processed_id is expected and normal --
-  -- a resume re-fetches and re-folds exactly that bounded gap, never the
-  -- whole dataset, before continuing.
+  -- This is a deliberate split, not the original design: the accumulator's
+  -- per-bucket state is expensive enough to persist (previously a single
+  -- large JSONB blob, now many small batched upserts into
+  -- archive_stream_accumulator_buckets -- see that table's own comment for
+  -- the full history) that snapshotting on every chunk would be far too
+  -- slow across the full archive's ~6,002 chunks. A gap where this lags
+  -- behind last_processed_id is expected and normal -- a resume re-fetches
+  -- and re-folds exactly that bounded gap, never the whole dataset, before
+  -- continuing.
   accumulator_snapshot_last_processed_id text,
-
-  -- Serialized per-bucket incremental accumulator state (AccumulatorSnapshot,
-  -- see incrementalWeightedStats.ts), exactly as it stood when
-  -- accumulator_snapshot_last_processed_id was last written -- NOT
-  -- necessarily as of last_processed_id (see that column's comment above).
-  -- Written atomically together with accumulator_snapshot_last_processed_id
-  -- (streamArchiveWithResume.ts's saveArchiveStreamAccumulatorSnapshot),
-  -- never separately from it, so those two specifically can never disagree
-  -- with each other about what's actually been counted.
-  accumulator_state jsonb NOT NULL DEFAULT '{}'::jsonb,
 
   updated_at timestamptz NOT NULL DEFAULT now()
 );
@@ -468,9 +457,7 @@ COMMENT ON COLUMN archive_stream_checkpoint.archive_dataset_id IS
 COMMENT ON COLUMN archive_stream_checkpoint.last_processed_id IS
   'Socrata''s own :id system field value for the last row successfully processed -- not a timestamp. Live-verified unique per row, gap-free and duplicate-free under keyset pagination, and 10-40x faster at depth than an occupancydatetime-based cursor. Resuming from this can never skip or duplicate a row the way a timestamp cursor can when multiple readings share the same timestamp at a resume boundary. Updated every chunk (cheap -- see saveArchiveStreamPosition), unlike accumulator_snapshot_last_processed_id below.';
 COMMENT ON COLUMN archive_stream_checkpoint.accumulator_snapshot_last_processed_id IS
-  'The :id cursor value accumulator_state was last snapshotted at -- distinct from last_processed_id (the stream''s own fetch position), which advances every chunk while this only advances every snapshotIntervalChunks chunks (see streamArchiveWithResume.ts). Null means no snapshot has been taken yet. A gap where this lags behind last_processed_id is expected and normal -- a resume re-fetches and re-folds exactly that bounded gap, never the whole dataset, before continuing.';
-COMMENT ON COLUMN archive_stream_checkpoint.accumulator_state IS
-  'Serialized per-bucket incremental accumulator state (AccumulatorSnapshot, see incrementalWeightedStats.ts), exactly as it stood when accumulator_snapshot_last_processed_id was last written -- NOT necessarily as of last_processed_id. Written atomically together with accumulator_snapshot_last_processed_id, never separately from it, so those two can never disagree with each other about what''s actually been counted.';
+  'The :id cursor value the accumulator (archive_stream_accumulator_buckets) was last snapshotted at -- distinct from last_processed_id (the stream''s own fetch position), which advances every chunk while this only advances every snapshotIntervalChunks chunks (see streamArchiveWithResume.ts). Null means no snapshot has been taken yet. A gap where this lags behind last_processed_id is expected and normal -- a resume re-fetches and re-folds exactly that bounded gap, never the whole dataset, before continuing.';
 COMMENT ON COLUMN archive_stream_checkpoint.readings_processed_count IS
   'Running count of readings processed so far in this archive''s streaming run. Informational only (progress reporting) -- resuming is driven by last_processed_id, not this count.';
 
@@ -481,40 +468,76 @@ ALTER TABLE archive_stream_checkpoint ENABLE ROW LEVEL SECURITY;
 -- to any role without BYPASSRLS -- only the service-role key (used
 -- server-side by the batch job) can read or write it.
 
--- Wraps archive_stream_checkpoint's accumulator-snapshot UPDATE with a
--- scoped 60s statement_timeout (see migrations/014 for the full,
--- live-measured reasoning behind both the RPC-wrapping approach and the
--- 60s figure specifically). SET LOCAL only lasts for this function's own
--- transaction -- PostgREST runs every request, including this RPC call, as
--- one transaction -- so it reverts automatically without touching the
--- default timeout any other query on this database uses, including the
--- cheap, frequent saveArchiveStreamPosition writes on this SAME table.
-CREATE OR REPLACE FUNCTION update_archive_stream_accumulator_snapshot(
-  p_archive_dataset_id text,
-  p_accumulator_snapshot_last_processed_id text,
-  p_accumulator_state jsonb
-)
-RETURNS SETOF archive_stream_checkpoint
-LANGUAGE plpgsql
-AS $$
-BEGIN
-  SET LOCAL statement_timeout = '60s';
+-- One row per (archive_dataset_id, blockface_id, iso_day, hour) bucket,
+-- replacing the old single-JSONB-blob accumulator_state column (previously
+-- on archive_stream_checkpoint, removed by migrations/016) with one row per
+-- bucket, written via many small batched upserts instead of one large
+-- write. See migrations/015 and streamArchiveWithResume.ts for the full,
+-- live-verified reasoning: the old blob write hit a hard, size-independent
+-- ~20-second failure ceiling (payloads 12.4MB-16.9MB all failed within
+-- ~1.4s of each other, evidence of an external timeout layer, not
+-- Postgres's own statement_timeout) that this design avoids structurally,
+-- since no individual request ever again carries the full accumulator
+-- state.
+CREATE TABLE archive_stream_accumulator_buckets (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
 
-  RETURN QUERY
-    UPDATE archive_stream_checkpoint
-    SET accumulator_snapshot_last_processed_id = p_accumulator_snapshot_last_processed_id,
-        accumulator_state = p_accumulator_state
-    WHERE archive_dataset_id = p_archive_dataset_id
-    RETURNING *;
-END;
-$$;
+  -- Plain text, NOT a foreign key to archive_stream_checkpoint.archive_dataset_id
+  -- -- clearArchiveStreamCheckpoint deletes the checkpoint row on
+  -- successful completion, and an FK with ON DELETE CASCADE here would wipe
+  -- these bucket rows at exactly the moment a crash-recovery scenario might
+  -- still need them.
+  archive_dataset_id text NOT NULL,
 
-COMMENT ON FUNCTION update_archive_stream_accumulator_snapshot(text, text, jsonb) IS
-  'Updates archive_stream_checkpoint''s accumulator snapshot fields with a scoped 60s statement_timeout (via SET LOCAL, reverting automatically at the end of this function''s own transaction), instead of whatever shorter default applies to every other query on this database. Called via supabase-js''s .rpc() from saveArchiveStreamAccumulatorSnapshot (streamArchiveWithResume.ts) instead of a plain .update(), specifically to survive the real, load-dependent Postgres statement timeouts observed on this table''s large accumulator_state writes. Returns the updated row (zero rows if archive_dataset_id had no existing checkpoint -- the caller''s row-count check treats that as a real, structural error, not a case to retry).';
+  blockface_id uuid NOT NULL REFERENCES blockfaces(id) ON DELETE CASCADE,
 
--- Same "server-side batch job only" restriction as every other operation on
--- this internal checkpoint table: no legitimate public-facing caller, so
--- EXECUTE is revoked from the default PUBLIC/anon/authenticated grants and
--- restricted to service_role alone.
-REVOKE EXECUTE ON FUNCTION update_archive_stream_accumulator_snapshot(text, text, jsonb) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION update_archive_stream_accumulator_snapshot(text, text, jsonb) TO service_role;
+  -- ISO 8601 day-of-week numbering (1=Monday..7=Sunday), matching
+  -- occupancy_stats.day_of_week and every other iso_day column in this
+  -- schema.
+  iso_day smallint NOT NULL CHECK (iso_day BETWEEN 1 AND 7),
+  hour smallint NOT NULL CHECK (hour BETWEEN 0 AND 23),
+
+  -- WeightedStatsAccumulator's own fields (incrementalWeightedStats.ts).
+  -- double precision, not real: these rows are read back into the
+  -- in-memory accumulator and continue being folded via addReading()
+  -- across further snapshots, so real's precision loss would compound on
+  -- every round trip over a multi-hour run.
+  count integer NOT NULL,
+  total_weight double precision NOT NULL,
+  mean double precision NOT NULL,
+  sum_squared_diff double precision NOT NULL,
+
+  updated_at timestamptz NOT NULL DEFAULT now(),
+
+  -- One row per bucket; re-snapshotting (the entire current accumulator
+  -- state is written every snapshot, not a delta) upserts each bucket's row
+  -- in place. Also the index a resume's paginated
+  -- WHERE archive_dataset_id = ... read-back (fetchAccumulatorBuckets)
+  -- uses -- no separate index needed for that.
+  UNIQUE (archive_dataset_id, blockface_id, iso_day, hour)
+);
+
+COMMENT ON TABLE archive_stream_accumulator_buckets IS
+  'One row per (archive_dataset_id, blockface_id, iso_day, hour) bucket, holding that bucket''s incremental accumulator state (see incrementalWeightedStats.ts) as of the archive stream''s last accumulator snapshot. Replaces the old archive_stream_checkpoint.accumulator_state JSONB blob with many small batched upserts -- see streamArchiveWithResume.ts for the full reasoning. Purely internal/operational bookkeeping for the batch job itself, not part of the public-facing schema.';
+COMMENT ON COLUMN archive_stream_accumulator_buckets.archive_dataset_id IS
+  'Socrata dataset id for the yearly archive this bucket belongs to (e.g. "7c2e-uany" for 2025). Not a foreign key -- see this table''s own comment for why not.';
+COMMENT ON COLUMN archive_stream_accumulator_buckets.count IS
+  'WeightedStatsAccumulator.count: number of readings folded into this bucket so far.';
+COMMENT ON COLUMN archive_stream_accumulator_buckets.total_weight IS
+  'WeightedStatsAccumulator.totalWeight: sum of recency weights folded into this bucket so far.';
+COMMENT ON COLUMN archive_stream_accumulator_buckets.mean IS
+  'WeightedStatsAccumulator.mean: running weighted mean occupancy ratio for this bucket.';
+COMMENT ON COLUMN archive_stream_accumulator_buckets.sum_squared_diff IS
+  'WeightedStatsAccumulator.sumSquaredDiff: running variance accumulator term (West''s algorithm) for this bucket.';
+
+-- Postgres does not automatically index foreign key columns; without this,
+-- looking up a blockface's accumulator buckets (or cascading its delete)
+-- would force a sequential scan of this table as it grows.
+CREATE INDEX idx_archive_stream_accumulator_buckets_blockface_id ON archive_stream_accumulator_buckets (blockface_id);
+
+ALTER TABLE archive_stream_accumulator_buckets ENABLE ROW LEVEL SECURITY;
+-- No CREATE POLICY statements, intentionally: same reasoning as
+-- archive_stream_checkpoint. With RLS enabled and zero policies, Postgres
+-- denies all access by default to any role without BYPASSRLS -- only the
+-- service-role key (used server-side by the batch job) can read or write
+-- it.

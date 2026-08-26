@@ -82,6 +82,43 @@ export function addReading(acc: WeightedStatsAccumulator, value: number, weight:
   return { count: newCount, totalWeight: newTotalWeight, mean: newMean, sumSquaredDiff: newSumSquaredDiff };
 }
 
+// --- Bucket keys -----------------------------------------------------------
+
+// blockfaceId is a uuid (schema.sql's blockfaces.id), which never contains a
+// colon, so joining with ':' and splitting back apart (below) is
+// unambiguous. Lives here (not backfill-occupancy-stats.ts, where it
+// originated) because streamArchiveWithResume.ts also needs it, to convert
+// between an AccumulatorSnapshot's string-keyed buckets and
+// archive_stream_accumulator_buckets' relational (blockface_id, iso_day,
+// hour) columns -- putting it here, next to AccumulatorSnapshot itself,
+// avoids a circular import between those two modules (backfill-occupancy-
+// stats.ts already imports from streamArchiveWithResume.ts).
+export function buildAccumulatorBucketKey(blockfaceId: string, isoDay: number, hour: number): string {
+  return `${blockfaceId}:${isoDay}:${hour}`;
+}
+
+export interface AccumulatorBucketKeyComponents {
+  blockfaceId: string;
+  isoDay: number;
+  hour: number;
+}
+
+const ACCUMULATOR_BUCKET_KEY_PATTERN = /^(.+):(\d+):(\d+)$/;
+
+// Inverse of buildAccumulatorBucketKey. A bucket key is a fixed, structural
+// format this module itself produces, not external input, so a malformed
+// key signals a real bug -- same discrete/categorical-input reasoning
+// isoDayToSocrataDow uses for an out-of-range day -- and throws rather than
+// guessing at a best-effort parse.
+export function parseAccumulatorBucketKey(key: string): AccumulatorBucketKeyComponents {
+  const match = ACCUMULATOR_BUCKET_KEY_PATTERN.exec(key);
+  if (match === null) {
+    throw new Error(`parseAccumulatorBucketKey: malformed bucket key "${key}"`);
+  }
+  const [, blockfaceId, isoDay, hour] = match;
+  return { blockfaceId: blockfaceId as string, isoDay: Number(isoDay), hour: Number(hour) };
+}
+
 // Converts a finished accumulator into the same {mean, stdDev, sampleCount}
 // shape calculateWeightedStats/decideBucketStats already produce, so
 // downstream code doesn't need to know or care whether the stats came from

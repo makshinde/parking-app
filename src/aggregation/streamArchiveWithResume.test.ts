@@ -4,122 +4,260 @@ import {
   clearArchiveStreamCheckpoint,
   DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS,
   DEFAULT_STREAM_CHUNK_SIZE,
+  fetchAccumulatorBuckets,
   fetchArchiveStreamCheckpoint,
   MAX_SNAPSHOT_WRITE_ATTEMPTS,
   saveArchiveStreamAccumulatorSnapshot,
   saveArchiveStreamPosition,
   streamArchiveWithResume,
+  type ArchiveStreamAccumulatorBucketsSupabaseClient,
   type ArchiveStreamCheckpointSupabaseClient,
 } from "./streamArchiveWithResume.ts";
-import { addReading, createEmptyAccumulator } from "./incrementalWeightedStats.ts";
+import {
+  addReading,
+  createEmptyAccumulator,
+} from "./incrementalWeightedStats.ts";
 import type { SocrataRecord } from "../utils/fetchSocrataRecords.ts";
-import type { AccumulatorSnapshot, WeightedStatsAccumulator } from "./incrementalWeightedStats.ts";
+import type {
+  AccumulatorSnapshot,
+  WeightedStatsAccumulator,
+} from "./incrementalWeightedStats.ts";
 
 const ARCHIVE_DATASET_ID = "7c2e-uany";
 
 const SAMPLE_ACCUMULATOR_SNAPSHOT: AccumulatorSnapshot = {
-  "bf-1:1:9": { count: 240, totalWeight: 118.4, mean: 0.62, sumSquaredDiff: 7.68 },
-  "bf-2:1:9": { count: 180, totalWeight: 90.1, mean: 0.41, sumSquaredDiff: 5.02 },
+  "bf-1:1:9": {
+    count: 240,
+    totalWeight: 118.4,
+    mean: 0.62,
+    sumSquaredDiff: 7.68,
+  },
+  "bf-2:1:9": {
+    count: 180,
+    totalWeight: 90.1,
+    mean: 0.41,
+    sumSquaredDiff: 5.02,
+  },
 };
 
-// --- Checkpoint client mock, same shape as backfill-occupancy-stats.test.ts's
-// createMockFailuresClient (eq-chainable select/maybeSingle, upsert,
-// delete/eq, plus a top-level .rpc()). Tracks a mutable currentRow
-// (starting from existingRow, if any) so .rpc() can genuinely simulate
-// matching-vs-not-matching rows -- the same distinction
-// saveArchiveStreamAccumulatorSnapshot's row-count check depends on --
-// rather than always succeeding regardless of whether a row actually
-// exists. .upsert() (still used by saveArchiveStreamPosition) creates/
-// merges into currentRow, exactly mirroring the real precondition that a
-// snapshot update always follows a position upsert for the same chunk, or
-// a checkpoint fetchArchiveStreamCheckpoint has already confirmed exists
-// (gap-replay's catch-up write). .rpc() mocks
-// update_archive_stream_accumulator_snapshot (migrations/014), called
-// instead of a plain .from(table).update() so the real write can go
-// through a scoped statement_timeout -- see streamArchiveWithResume.ts's
-// own comment for why.
-function makeMockCheckpointClient(options: {
-  existingRow?: Record<string, unknown> | null;
-  selectError?: { message: string } | null;
-  upsertError?: { message: string } | null;
-  updateError?: { message: string } | null;
-  // Per-call override for .rpc(), consumed in call order -- undefined for
-  // a given index falls back to updateError (or success). Lets tests
-  // simulate "fails once, then succeeds" without a single static error
-  // applying to every retry attempt.
-  updateErrorSequence?: ({ message: string } | null)[];
-  deleteError?: { message: string } | null;
-} = {}) {
-  let currentRow: Record<string, unknown> | null = options.existingRow ?? null;
+// Mirrors buildAccumulatorBucketRow (streamArchiveWithResume.ts) -- written
+// independently here rather than importing it, since that function isn't
+// exported (an internal implementation detail), so this test constructs the
+// same row shape a real write would produce to seed the mock bucket store.
+function accumulatorSnapshotToBucketRows(
+  archiveDatasetId: string,
+  snapshot: AccumulatorSnapshot,
+): Record<string, unknown>[] {
+  return Object.entries(snapshot).map(([bucketKey, acc]) => {
+    const [blockfaceId, isoDay, hour] = bucketKey.split(":");
+    return {
+      archive_dataset_id: archiveDatasetId,
+      blockface_id: blockfaceId,
+      iso_day: Number(isoDay),
+      hour: Number(hour),
+      count: acc.count,
+      total_weight: acc.totalWeight,
+      mean: acc.mean,
+      sum_squared_diff: acc.sumSquaredDiff,
+    };
+  });
+}
+
+// --- Combined mock clients ---------------------------------------------
+//
+// checkpointClient and bucketsClient share ONE callOrder array (and one
+// underlying "database") -- real usage always passes the same underlying
+// supabase-js client cast to both narrow interfaces, and several tests
+// below need to assert the real cross-table interleaving (e.g. bucket rows
+// land before the checkpoint cursor advances).
+//
+// checkpointClient: eq-chainable select/maybeSingle, upsert (used by
+// saveArchiveStreamPosition), update/eq/select (used by
+// saveArchiveStreamAccumulatorSnapshot's cursor advance -- a genuine UPDATE,
+// not an upsert, so .select() after .eq() is what makes the affected row
+// count visible), and delete/eq.
+//
+// bucketsClient: eq/order/range-chainable select (paginated read-back, see
+// fetchAccumulatorBuckets) and a batched upsert (see upsertAccumulatorBuckets),
+// backed by an in-memory array keyed the same way the real table's UNIQUE
+// constraint is (archive_dataset_id, blockface_id, iso_day, hour).
+function makeMockClients(
+  options: {
+    existingCheckpointRow?: Record<string, unknown> | null;
+    existingBucketRows?: Record<string, unknown>[];
+    selectError?: { message: string } | null;
+    positionUpsertError?: { message: string } | null;
+    cursorUpdateError?: { message: string } | null;
+    // Per-call override for the cursor update, consumed in call order --
+    // undefined for a given index falls back to cursorUpdateError (or
+    // success). Lets tests simulate "fails once, then succeeds" without a
+    // single static error applying to every retry attempt.
+    cursorUpdateErrorSequence?: ({ message: string } | null)[];
+    bucketUpsertError?: { message: string } | null;
+    bucketUpsertErrorSequence?: ({ message: string } | null)[];
+    deleteError?: { message: string } | null;
+  } = {},
+) {
+  let currentCheckpointRow: Record<string, unknown> | null =
+    options.existingCheckpointRow ?? null;
+  let bucketRows: Record<string, unknown>[] =
+    options.existingBucketRows !== undefined
+      ? [...options.existingBucketRows]
+      : [];
+
   const positionUpsertCalls: Record<string, unknown>[] = [];
-  const snapshotUpdateCalls: { archiveDatasetId: string; values: Record<string, unknown> }[] = [];
+  const cursorUpdateCalls: {
+    archiveDatasetId: string;
+    values: Record<string, unknown>;
+  }[] = [];
+  const bucketUpsertCalls: Record<string, unknown>[][] = [];
+  const bucketRangeCalls: { from: number; to: number }[] = [];
   const deleteCalls: unknown[] = [];
   const callOrder: string[] = [];
-  let updateCallIndex = 0;
+  let cursorUpdateCallIndex = 0;
+  let bucketUpsertCallIndex = 0;
 
   const selectQueryBuilder = {
     eq: () => selectQueryBuilder,
     maybeSingle: async () =>
       options.selectError !== undefined && options.selectError !== null
         ? { data: null, error: options.selectError }
-        : { data: currentRow, error: null },
+        : { data: currentCheckpointRow, error: null },
   };
 
-  const client = {
+  const checkpointClient = {
     from: () =>
       ({
         select: () => selectQueryBuilder,
         upsert: async (row: Record<string, unknown>) => {
           positionUpsertCalls.push(row);
           callOrder.push("position-upsert");
-          if (options.upsertError !== undefined && options.upsertError !== null) {
-            return { data: null, error: options.upsertError };
+          if (
+            options.positionUpsertError !== undefined &&
+            options.positionUpsertError !== null
+          ) {
+            return { data: null, error: options.positionUpsertError };
           }
-          currentRow = { ...currentRow, ...row };
+          currentCheckpointRow = { ...currentCheckpointRow, ...row };
           return { data: null, error: null };
         },
+        update: (values: Record<string, unknown>) => ({
+          eq: (_column: string, archiveDatasetId: string) => ({
+            select: async () => {
+              cursorUpdateCalls.push({ archiveDatasetId, values });
+              callOrder.push("cursor-update");
+
+              const sequenceError =
+                options.cursorUpdateErrorSequence?.[cursorUpdateCallIndex];
+              cursorUpdateCallIndex += 1;
+              const errorForThisCall =
+                sequenceError !== undefined
+                  ? sequenceError
+                  : options.cursorUpdateError;
+              if (errorForThisCall !== undefined && errorForThisCall !== null) {
+                return { data: null, error: errorForThisCall };
+              }
+              if (
+                currentCheckpointRow === null ||
+                currentCheckpointRow.archive_dataset_id !== archiveDatasetId
+              ) {
+                return { data: [], error: null };
+              }
+              currentCheckpointRow = { ...currentCheckpointRow, ...values };
+              return { data: [currentCheckpointRow], error: null };
+            },
+          }),
+        }),
         delete: () => ({
           eq: async (_column: string, value: unknown) => {
             deleteCalls.push(value);
             callOrder.push("delete");
-            currentRow = null;
-            return options.deleteError !== undefined && options.deleteError !== null
+            currentCheckpointRow = null;
+            return options.deleteError !== undefined &&
+              options.deleteError !== null
               ? { data: null, error: options.deleteError }
               : { data: [], error: null };
           },
         }),
-      }) as unknown as ReturnType<ArchiveStreamCheckpointSupabaseClient["from"]>,
-    rpc: async (_fn: string, params: Record<string, unknown>) => {
-      const archiveDatasetId = params.p_archive_dataset_id as string;
-      const values = {
-        accumulator_snapshot_last_processed_id: params.p_accumulator_snapshot_last_processed_id,
-        accumulator_state: params.p_accumulator_state,
-      };
-      snapshotUpdateCalls.push({ archiveDatasetId, values });
-      callOrder.push("snapshot-update");
-
-      const sequenceError = options.updateErrorSequence?.[updateCallIndex];
-      updateCallIndex += 1;
-      const errorForThisCall = sequenceError !== undefined ? sequenceError : options.updateError;
-      if (errorForThisCall !== undefined && errorForThisCall !== null) {
-        return { data: null, error: errorForThisCall };
-      }
-      if (currentRow === null || currentRow.archive_dataset_id !== archiveDatasetId) {
-        // Mirrors the real function's RETURNS SETOF behavior: an UPDATE
-        // matching zero rows just returns an empty set, not an error --
-        // exactly what saveArchiveStreamAccumulatorSnapshot's row-count
-        // check exists to catch.
-        return { data: [], error: null };
-      }
-      currentRow = { ...currentRow, ...values };
-      return { data: [currentRow], error: null };
-    },
+      }) as unknown as ReturnType<
+        ArchiveStreamCheckpointSupabaseClient["from"]
+      >,
   } as unknown as ArchiveStreamCheckpointSupabaseClient;
 
-  return { client, positionUpsertCalls, snapshotUpdateCalls, deleteCalls, callOrder };
+  function bucketRowKey(row: Record<string, unknown>): string {
+    return `${row.archive_dataset_id}:${row.blockface_id}:${row.iso_day}:${row.hour}`;
+  }
+
+  const bucketsClient = {
+    from: () =>
+      ({
+        select: () => {
+          let filterArchiveDatasetId: string | undefined;
+          const builder = {
+            eq: (_column: string, value: string) => {
+              filterArchiveDatasetId = value;
+              return builder;
+            },
+            order: () => builder,
+            range: async (from: number, to: number) => {
+              bucketRangeCalls.push({ from, to });
+              const filtered = bucketRows.filter(
+                (row) => row.archive_dataset_id === filterArchiveDatasetId,
+              );
+              return { data: filtered.slice(from, to + 1), error: null };
+            },
+          };
+          return builder;
+        },
+        upsert: async (batch: Record<string, unknown>[]) => {
+          bucketUpsertCalls.push(batch);
+          callOrder.push("bucket-upsert");
+
+          const sequenceError =
+            options.bucketUpsertErrorSequence?.[bucketUpsertCallIndex];
+          bucketUpsertCallIndex += 1;
+          const errorForThisCall =
+            sequenceError !== undefined
+              ? sequenceError
+              : options.bucketUpsertError;
+          if (errorForThisCall !== undefined && errorForThisCall !== null) {
+            return { data: null, error: errorForThisCall };
+          }
+
+          for (const row of batch) {
+            const key = bucketRowKey(row);
+            const idx = bucketRows.findIndex(
+              (existing) => bucketRowKey(existing) === key,
+            );
+            if (idx >= 0) {
+              bucketRows[idx] = { ...bucketRows[idx], ...row };
+            } else {
+              bucketRows.push(row);
+            }
+          }
+          return { data: null, error: null };
+        },
+      }) as unknown as ReturnType<
+        ArchiveStreamAccumulatorBucketsSupabaseClient["from"]
+      >,
+  } as unknown as ArchiveStreamAccumulatorBucketsSupabaseClient;
+
+  return {
+    clients: { checkpointClient, bucketsClient },
+    positionUpsertCalls,
+    cursorUpdateCalls,
+    bucketUpsertCalls,
+    bucketRangeCalls,
+    deleteCalls,
+    callOrder,
+    bucketRows: () => bucketRows,
+  };
 }
 
-function jsonResponse(body: unknown, init?: { ok?: boolean; status?: number; statusText?: string }) {
+function jsonResponse(
+  body: unknown,
+  init?: { ok?: boolean; status?: number; statusText?: string },
+) {
   return {
     ok: init?.ok ?? true,
     status: init?.status ?? 200,
@@ -129,77 +267,220 @@ function jsonResponse(body: unknown, init?: { ok?: boolean; status?: number; sta
 }
 
 function makeRecords(count: number, idPrefix: string): SocrataRecord[] {
-  return Array.from({ length: count }, (_, i) => ({ ":id": `row-${idPrefix}-${i}`, occupancydatetime: "2025-06-10T09:00:00" }));
+  return Array.from({ length: count }, (_, i) => ({
+    ":id": `row-${idPrefix}-${i}`,
+    occupancydatetime: "2025-06-10T09:00:00",
+  }));
 }
 
 describe("fetchArchiveStreamCheckpoint", () => {
   it("returns null when no checkpoint row exists yet", async () => {
-    const { client } = makeMockCheckpointClient({ existingRow: null });
+    const { clients } = makeMockClients({ existingCheckpointRow: null });
 
-    await expect(fetchArchiveStreamCheckpoint(client, ARCHIVE_DATASET_ID)).resolves.toBeNull();
+    await expect(
+      fetchArchiveStreamCheckpoint(
+        clients.checkpointClient,
+        ARCHIVE_DATASET_ID,
+      ),
+    ).resolves.toBeNull();
   });
 
-  it("returns the parsed checkpoint, including both cursors and accumulator_state, when a row exists", async () => {
-    const { client } = makeMockCheckpointClient({
-      existingRow: {
+  it("returns the parsed checkpoint, including both cursors, when a row exists", async () => {
+    const { clients } = makeMockClients({
+      existingCheckpointRow: {
         archive_dataset_id: ARCHIVE_DATASET_ID,
         last_processed_id: "row-abc",
         readings_processed_count: 1500,
         accumulator_snapshot_last_processed_id: "row-xyz",
-        accumulator_state: SAMPLE_ACCUMULATOR_SNAPSHOT,
       },
     });
 
-    await expect(fetchArchiveStreamCheckpoint(client, ARCHIVE_DATASET_ID)).resolves.toEqual({
+    await expect(
+      fetchArchiveStreamCheckpoint(
+        clients.checkpointClient,
+        ARCHIVE_DATASET_ID,
+      ),
+    ).resolves.toEqual({
       archiveDatasetId: ARCHIVE_DATASET_ID,
       lastProcessedId: "row-abc",
       readingsProcessedCount: 1500,
       accumulatorSnapshotLastProcessedId: "row-xyz",
-      accumulatorState: SAMPLE_ACCUMULATOR_SNAPSHOT,
     });
   });
 
   it("returns null accumulatorSnapshotLastProcessedId when no snapshot has been taken yet", async () => {
-    const { client } = makeMockCheckpointClient({
-      existingRow: {
+    const { clients } = makeMockClients({
+      existingCheckpointRow: {
         archive_dataset_id: ARCHIVE_DATASET_ID,
         last_processed_id: "row-abc",
         readings_processed_count: 3,
         accumulator_snapshot_last_processed_id: null,
-        accumulator_state: {},
       },
     });
 
-    const result = await fetchArchiveStreamCheckpoint(client, ARCHIVE_DATASET_ID);
+    const result = await fetchArchiveStreamCheckpoint(
+      clients.checkpointClient,
+      ARCHIVE_DATASET_ID,
+    );
     expect(result?.accumulatorSnapshotLastProcessedId).toBeNull();
   });
 
   it("throws a clear error when reading the checkpoint fails", async () => {
-    const { client } = makeMockCheckpointClient({ selectError: { message: "connection reset" } });
+    const { clients } = makeMockClients({
+      selectError: { message: "connection reset" },
+    });
 
-    await expect(fetchArchiveStreamCheckpoint(client, ARCHIVE_DATASET_ID)).rejects.toThrow(
+    await expect(
+      fetchArchiveStreamCheckpoint(
+        clients.checkpointClient,
+        ARCHIVE_DATASET_ID,
+      ),
+    ).rejects.toThrow(
       new RegExp(`archive_dataset_id=${ARCHIVE_DATASET_ID}.*connection reset`),
     );
   });
 });
 
 describe("saveArchiveStreamPosition", () => {
-  it("upserts ONLY the position fields, never accumulator_state or its cursor", async () => {
-    const { client, positionUpsertCalls } = makeMockCheckpointClient();
+  it("upserts ONLY the position fields, never the accumulator snapshot cursor", async () => {
+    const { clients, positionUpsertCalls } = makeMockClients();
 
-    await saveArchiveStreamPosition(client, { archiveDatasetId: ARCHIVE_DATASET_ID, lastProcessedId: "row-xyz", readingsProcessedCount: 250 });
+    await saveArchiveStreamPosition(clients.checkpointClient, {
+      archiveDatasetId: ARCHIVE_DATASET_ID,
+      lastProcessedId: "row-xyz",
+      readingsProcessedCount: 250,
+    });
 
     expect(positionUpsertCalls).toEqual([
-      { archive_dataset_id: ARCHIVE_DATASET_ID, last_processed_id: "row-xyz", readings_processed_count: 250 },
+      {
+        archive_dataset_id: ARCHIVE_DATASET_ID,
+        last_processed_id: "row-xyz",
+        readings_processed_count: 250,
+      },
     ]);
   });
 
   it("throws a clear error when saving the position fails", async () => {
-    const { client } = makeMockCheckpointClient({ upsertError: { message: "constraint violation" } });
+    const { clients } = makeMockClients({
+      positionUpsertError: { message: "constraint violation" },
+    });
 
     await expect(
-      saveArchiveStreamPosition(client, { archiveDatasetId: ARCHIVE_DATASET_ID, lastProcessedId: "row-1", readingsProcessedCount: 1 }),
-    ).rejects.toThrow(new RegExp(`archive_dataset_id=${ARCHIVE_DATASET_ID}.*constraint violation`));
+      saveArchiveStreamPosition(clients.checkpointClient, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        lastProcessedId: "row-1",
+        readingsProcessedCount: 1,
+      }),
+    ).rejects.toThrow(
+      new RegExp(
+        `archive_dataset_id=${ARCHIVE_DATASET_ID}.*constraint violation`,
+      ),
+    );
+  });
+});
+
+describe("fetchAccumulatorBuckets", () => {
+  it("returns an empty snapshot when no bucket rows exist for this archive", async () => {
+    const { clients } = makeMockClients();
+
+    await expect(
+      fetchAccumulatorBuckets(clients.bucketsClient, ARCHIVE_DATASET_ID),
+    ).resolves.toEqual({});
+  });
+
+  it("reconstructs an AccumulatorSnapshot from stored rows", async () => {
+    const { clients } = makeMockClients({
+      existingBucketRows: accumulatorSnapshotToBucketRows(
+        ARCHIVE_DATASET_ID,
+        SAMPLE_ACCUMULATOR_SNAPSHOT,
+      ),
+    });
+
+    await expect(
+      fetchAccumulatorBuckets(clients.bucketsClient, ARCHIVE_DATASET_ID),
+    ).resolves.toEqual(SAMPLE_ACCUMULATOR_SNAPSHOT);
+  });
+
+  it("only reads rows for the requested archive_dataset_id, not other archives", async () => {
+    const { clients } = makeMockClients({
+      existingBucketRows: [
+        ...accumulatorSnapshotToBucketRows(
+          ARCHIVE_DATASET_ID,
+          SAMPLE_ACCUMULATOR_SNAPSHOT,
+        ),
+        ...accumulatorSnapshotToBucketRows("wtpb-jp8d", {
+          "bf-other:2:10": {
+            count: 5,
+            totalWeight: 5,
+            mean: 0.9,
+            sumSquaredDiff: 0.1,
+          },
+        }),
+      ],
+    });
+
+    await expect(
+      fetchAccumulatorBuckets(clients.bucketsClient, ARCHIVE_DATASET_ID),
+    ).resolves.toEqual(SAMPLE_ACCUMULATOR_SNAPSHOT);
+  });
+
+  // Confirms the "page until a short page" pagination idiom actually walks
+  // multiple pages rather than silently truncating at the first one --
+  // real per-archive bucket counts can run into the tens or hundreds of
+  // thousands (~1,500 blockfaces x 7 days x 24 hours max), far beyond one
+  // page's worth of rows.
+  it("paginates across multiple pages when there are more rows than one page holds", async () => {
+    const snapshot: AccumulatorSnapshot = {};
+    for (let i = 0; i < 1500; i++) {
+      snapshot[`bf-${i}:1:9`] = {
+        count: 1,
+        totalWeight: 1,
+        mean: 0.5,
+        sumSquaredDiff: 0,
+      };
+    }
+    const { clients, bucketRangeCalls } = makeMockClients({
+      existingBucketRows: accumulatorSnapshotToBucketRows(
+        ARCHIVE_DATASET_ID,
+        snapshot,
+      ),
+    });
+
+    const result = await fetchAccumulatorBuckets(
+      clients.bucketsClient,
+      ARCHIVE_DATASET_ID,
+    );
+
+    expect(Object.keys(result)).toHaveLength(1500);
+    expect(result).toEqual(snapshot);
+    // A 1000-row page size means 1500 rows needs exactly 2 .range() calls:
+    // one full page (proving pagination continues), one short page (proving
+    // it correctly stops there).
+    expect(bucketRangeCalls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("throws a clear error when reading accumulator buckets fails", async () => {
+    const failingBucketsClient = {
+      from: () => ({
+        select: () => {
+          const builder = {
+            eq: () => builder,
+            order: () => builder,
+            range: async () => ({
+              data: null,
+              error: { message: "connection reset" },
+            }),
+          };
+          return builder;
+        },
+      }),
+    } as unknown as ArchiveStreamAccumulatorBucketsSupabaseClient;
+
+    await expect(
+      fetchAccumulatorBuckets(failingBucketsClient, ARCHIVE_DATASET_ID),
+    ).rejects.toThrow(
+      new RegExp(`archive_dataset_id=${ARCHIVE_DATASET_ID}.*connection reset`),
+    );
   });
 });
 
@@ -213,27 +494,102 @@ describe("saveArchiveStreamAccumulatorSnapshot", () => {
     last_processed_id: "row-xyz",
     readings_processed_count: 500,
     accumulator_snapshot_last_processed_id: null,
-    accumulator_state: {},
   };
 
-  it("updates ONLY the snapshot fields on the existing row, never last_processed_id or readings_processed_count", async () => {
-    const { client, snapshotUpdateCalls } = makeMockCheckpointClient({ existingRow: EXISTING_ROW });
+  it("batch-upserts every bucket in the accumulator state, then advances ONLY the snapshot cursor -- never last_processed_id or readings_processed_count", async () => {
+    const { clients, bucketUpsertCalls, cursorUpdateCalls } = makeMockClients({
+      existingCheckpointRow: EXISTING_ROW,
+    });
 
-    await saveArchiveStreamAccumulatorSnapshot(client, {
+    await saveArchiveStreamAccumulatorSnapshot(clients, {
       archiveDatasetId: ARCHIVE_DATASET_ID,
       accumulatorSnapshotLastProcessedId: "row-xyz",
       accumulatorState: SAMPLE_ACCUMULATOR_SNAPSHOT,
     });
 
-    expect(snapshotUpdateCalls).toEqual([
+    expect(bucketUpsertCalls).toEqual([
+      accumulatorSnapshotToBucketRows(
+        ARCHIVE_DATASET_ID,
+        SAMPLE_ACCUMULATOR_SNAPSHOT,
+      ),
+    ]);
+    expect(cursorUpdateCalls).toEqual([
       {
         archiveDatasetId: ARCHIVE_DATASET_ID,
-        values: {
-          accumulator_snapshot_last_processed_id: "row-xyz",
-          accumulator_state: SAMPLE_ACCUMULATOR_SNAPSHOT,
-        },
+        values: { accumulator_snapshot_last_processed_id: "row-xyz" },
       },
     ]);
+  });
+
+  it("chunks a large accumulator state into multiple batched upserts of 500 rows each", async () => {
+    const { clients, bucketUpsertCalls } = makeMockClients({
+      existingCheckpointRow: EXISTING_ROW,
+    });
+    const largeState: AccumulatorSnapshot = {};
+    for (let i = 0; i < 750; i++) {
+      largeState[`bf-${i}:1:9`] = {
+        count: 1,
+        totalWeight: 1,
+        mean: 0.5,
+        sumSquaredDiff: 0,
+      };
+    }
+
+    await saveArchiveStreamAccumulatorSnapshot(clients, {
+      archiveDatasetId: ARCHIVE_DATASET_ID,
+      accumulatorSnapshotLastProcessedId: "row-xyz",
+      accumulatorState: largeState,
+    });
+
+    expect(bucketUpsertCalls).toHaveLength(2);
+    expect(bucketUpsertCalls[0]).toHaveLength(500);
+    expect(bucketUpsertCalls[1]).toHaveLength(250);
+  });
+
+  it("writes nothing and advances the cursor cleanly when the accumulator state is empty", async () => {
+    const { clients, bucketUpsertCalls, cursorUpdateCalls } = makeMockClients({
+      existingCheckpointRow: EXISTING_ROW,
+    });
+
+    await saveArchiveStreamAccumulatorSnapshot(clients, {
+      archiveDatasetId: ARCHIVE_DATASET_ID,
+      accumulatorSnapshotLastProcessedId: "row-xyz",
+      accumulatorState: {},
+    });
+
+    expect(bucketUpsertCalls).toEqual([]);
+    expect(cursorUpdateCalls).toHaveLength(1);
+  });
+
+  // Regression coverage for the atomicity guarantee this design depends on:
+  // the cursor must NEVER advance if even one bucket row failed to land,
+  // otherwise a resume would believe a snapshot exists that doesn't fully
+  // exist.
+  it("does not advance the snapshot cursor at all when the bucket upsert fails", async () => {
+    vi.useFakeTimers();
+    try {
+      const { clients, bucketUpsertCalls, cursorUpdateCalls } = makeMockClients(
+        {
+          existingCheckpointRow: EXISTING_ROW,
+          bucketUpsertError: { message: "connection reset" },
+        },
+      );
+
+      const assertion = expect(
+        saveArchiveStreamAccumulatorSnapshot(clients, {
+          archiveDatasetId: ARCHIVE_DATASET_ID,
+          accumulatorSnapshotLastProcessedId: "row-xyz",
+          accumulatorState: SAMPLE_ACCUMULATOR_SNAPSHOT,
+        }),
+      ).rejects.toThrow(/connection reset/);
+      await vi.runAllTimersAsync();
+      await assertion;
+
+      expect(bucketUpsertCalls.length).toBeGreaterThan(0);
+      expect(cursorUpdateCalls).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // Regression test for a real, live-confirmed bug: an .upsert() with a
@@ -250,17 +606,23 @@ describe("saveArchiveStreamAccumulatorSnapshot", () => {
   // structural, not transient -- confirmed here by asserting only a single
   // call happened, not up to MAX_SNAPSHOT_WRITE_ATTEMPTS of them.
   it("throws a clear, specific error when no existing checkpoint row matches this archive dataset, WITHOUT retrying", async () => {
-    const { client, snapshotUpdateCalls } = makeMockCheckpointClient({ existingRow: null });
+    const { clients, cursorUpdateCalls } = makeMockClients({
+      existingCheckpointRow: null,
+    });
 
     await expect(
-      saveArchiveStreamAccumulatorSnapshot(client, {
+      saveArchiveStreamAccumulatorSnapshot(clients, {
         archiveDatasetId: ARCHIVE_DATASET_ID,
         accumulatorSnapshotLastProcessedId: "row-1",
         accumulatorState: {},
       }),
-    ).rejects.toThrow(new RegExp(`expected exactly one existing archive_stream_checkpoint row for archive_dataset_id=${ARCHIVE_DATASET_ID}.*affected 0 row`));
+    ).rejects.toThrow(
+      new RegExp(
+        `expected exactly one existing archive_stream_checkpoint row for archive_dataset_id=${ARCHIVE_DATASET_ID}.*affected 0 row`,
+      ),
+    );
 
-    expect(snapshotUpdateCalls).toHaveLength(1);
+    expect(cursorUpdateCalls).toHaveLength(1);
   });
 
   describe("retry-with-backoff on transient write failures", () => {
@@ -273,19 +635,18 @@ describe("saveArchiveStreamAccumulatorSnapshot", () => {
       vi.restoreAllMocks();
     });
 
-    // Live-confirmed evidence this retries on: the IDENTICAL ~94,064-bucket
-    // payload failed with "canceling statement due to statement timeout" at
-    // 18.65s in one direct-testing attempt, then succeeded at 39.78s in the
-    // very next attempt with no code or data difference -- a transient,
-    // load-dependent failure, not a fixed function of payload size.
-    it("retries a statement timeout once and succeeds on the next attempt, logging the retry attempt", async () => {
-      const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      const { client, snapshotUpdateCalls } = makeMockCheckpointClient({
-        existingRow: EXISTING_ROW,
-        updateErrorSequence: [{ message: "canceling statement due to statement timeout" }],
+    it("retries a cursor-update statement timeout once and succeeds on the next attempt, logging the retry attempt", async () => {
+      const consoleWarnSpy = vi
+        .spyOn(console, "warn")
+        .mockImplementation(() => {});
+      const { clients, cursorUpdateCalls } = makeMockClients({
+        existingCheckpointRow: EXISTING_ROW,
+        cursorUpdateErrorSequence: [
+          { message: "canceling statement due to statement timeout" },
+        ],
       });
 
-      const resultPromise = saveArchiveStreamAccumulatorSnapshot(client, {
+      const resultPromise = saveArchiveStreamAccumulatorSnapshot(clients, {
         archiveDatasetId: ARCHIVE_DATASET_ID,
         accumulatorSnapshotLastProcessedId: "row-xyz",
         accumulatorState: SAMPLE_ACCUMULATOR_SNAPSHOT,
@@ -293,40 +654,92 @@ describe("saveArchiveStreamAccumulatorSnapshot", () => {
       await vi.runAllTimersAsync();
       await resultPromise;
 
-      expect(snapshotUpdateCalls).toHaveLength(2);
-      const warnLines = consoleWarnSpy.mock.calls.map((call) => String(call[0]));
-      expect(warnLines.some((line) => line.includes("attempt 1") && line.includes("statement timeout") && line.includes("retrying in 1000ms"))).toBe(true);
+      expect(cursorUpdateCalls).toHaveLength(2);
+      const warnLines = consoleWarnSpy.mock.calls.map((call) =>
+        String(call[0]),
+      );
+      expect(
+        warnLines.some(
+          (line) =>
+            line.includes("attempt 1") &&
+            line.includes("statement timeout") &&
+            line.includes("retrying in 1000ms"),
+        ),
+      ).toBe(true);
+    });
+
+    // A meaningfully different code path from the cursor-update timeout
+    // above: the bucket batch upsert itself can also fail transiently, and
+    // the same whole-sequence retry wrapper must cover it too.
+    it("retries a transient bucket upsert failure and succeeds on the next attempt", async () => {
+      const consoleWarnSpy = vi
+        .spyOn(console, "warn")
+        .mockImplementation(() => {});
+      const { clients, bucketUpsertCalls, cursorUpdateCalls } = makeMockClients(
+        {
+          existingCheckpointRow: EXISTING_ROW,
+          bucketUpsertErrorSequence: [{ message: "connection reset" }],
+        },
+      );
+
+      const resultPromise = saveArchiveStreamAccumulatorSnapshot(clients, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        accumulatorSnapshotLastProcessedId: "row-xyz",
+        accumulatorState: SAMPLE_ACCUMULATOR_SNAPSHOT,
+      });
+      await vi.runAllTimersAsync();
+      await resultPromise;
+
+      expect(bucketUpsertCalls).toHaveLength(2);
+      expect(cursorUpdateCalls).toHaveLength(1); // only the (successful) second attempt reaches the cursor update
+      const warnLines = consoleWarnSpy.mock.calls.map((call) =>
+        String(call[0]),
+      );
+      expect(
+        warnLines.some(
+          (line) =>
+            line.includes("attempt 1") && line.includes("connection reset"),
+        ),
+      ).toBe(true);
     });
 
     it("surfaces a clear final error after exhausting all retries on a sustained statement timeout", async () => {
-      const { client, snapshotUpdateCalls } = makeMockCheckpointClient({
-        existingRow: EXISTING_ROW,
-        updateError: { message: "canceling statement due to statement timeout" },
+      const { clients, cursorUpdateCalls } = makeMockClients({
+        existingCheckpointRow: EXISTING_ROW,
+        cursorUpdateError: {
+          message: "canceling statement due to statement timeout",
+        },
       });
 
       const assertion = expect(
-        saveArchiveStreamAccumulatorSnapshot(client, {
+        saveArchiveStreamAccumulatorSnapshot(clients, {
           archiveDatasetId: ARCHIVE_DATASET_ID,
           accumulatorSnapshotLastProcessedId: "row-1",
           accumulatorState: {},
         }),
-      ).rejects.toThrow(new RegExp(`archive_dataset_id=${ARCHIVE_DATASET_ID}.*statement timeout`));
+      ).rejects.toThrow(
+        new RegExp(
+          `archive_dataset_id=${ARCHIVE_DATASET_ID}.*statement timeout`,
+        ),
+      );
       await vi.runAllTimersAsync();
       await assertion;
 
       // Initial attempt plus every retry, no more -- confirms the backoff
       // loop actually stops instead of retrying forever.
-      expect(snapshotUpdateCalls).toHaveLength(MAX_SNAPSHOT_WRITE_ATTEMPTS);
+      expect(cursorUpdateCalls).toHaveLength(MAX_SNAPSHOT_WRITE_ATTEMPTS);
     });
 
     it("waits with increasing delay between retries rather than a fixed interval", async () => {
-      const { client, snapshotUpdateCalls } = makeMockCheckpointClient({
-        existingRow: EXISTING_ROW,
-        updateError: { message: "canceling statement due to statement timeout" },
+      const { clients, cursorUpdateCalls } = makeMockClients({
+        existingCheckpointRow: EXISTING_ROW,
+        cursorUpdateError: {
+          message: "canceling statement due to statement timeout",
+        },
       });
 
       const assertion = expect(
-        saveArchiveStreamAccumulatorSnapshot(client, {
+        saveArchiveStreamAccumulatorSnapshot(clients, {
           archiveDatasetId: ARCHIVE_DATASET_ID,
           accumulatorSnapshotLastProcessedId: "row-1",
           accumulatorState: {},
@@ -334,69 +747,84 @@ describe("saveArchiveStreamAccumulatorSnapshot", () => {
       ).rejects.toThrow(/statement timeout/);
 
       await vi.advanceTimersByTimeAsync(0);
-      expect(snapshotUpdateCalls).toHaveLength(1);
+      expect(cursorUpdateCalls).toHaveLength(1);
 
       // First backoff (1s) elapses -> second attempt fires.
       await vi.advanceTimersByTimeAsync(1000);
-      expect(snapshotUpdateCalls).toHaveLength(2);
+      expect(cursorUpdateCalls).toHaveLength(2);
 
       // A second 1s wait alone should NOT be enough to trigger the third
       // attempt -- the delay after attempt 2 is 2s, not 1s.
       await vi.advanceTimersByTimeAsync(1000);
-      expect(snapshotUpdateCalls).toHaveLength(2);
+      expect(cursorUpdateCalls).toHaveLength(2);
 
       // The remaining 1s of the 2s backoff elapses -> third attempt fires.
       await vi.advanceTimersByTimeAsync(1000);
-      expect(snapshotUpdateCalls).toHaveLength(3);
+      expect(cursorUpdateCalls).toHaveLength(3);
 
       await vi.runAllTimersAsync();
       await assertion;
-      expect(snapshotUpdateCalls).toHaveLength(MAX_SNAPSHOT_WRITE_ATTEMPTS);
+      expect(cursorUpdateCalls).toHaveLength(MAX_SNAPSHOT_WRITE_ATTEMPTS);
     });
 
     // Confirms the structural "row not found" case still fails immediately
     // even inside this describe block's fake-timer setup -- no behavior
     // change from the previous fix, retry-with-backoff included.
     it("still does not retry the structural row-not-found error", async () => {
-      const { client, snapshotUpdateCalls } = makeMockCheckpointClient({ existingRow: null });
+      const { clients, cursorUpdateCalls } = makeMockClients({
+        existingCheckpointRow: null,
+      });
 
       await expect(
-        saveArchiveStreamAccumulatorSnapshot(client, {
+        saveArchiveStreamAccumulatorSnapshot(clients, {
           archiveDatasetId: ARCHIVE_DATASET_ID,
           accumulatorSnapshotLastProcessedId: "row-1",
           accumulatorState: {},
         }),
-      ).rejects.toThrow(/expected exactly one existing archive_stream_checkpoint row/);
+      ).rejects.toThrow(
+        /expected exactly one existing archive_stream_checkpoint row/,
+      );
 
-      expect(snapshotUpdateCalls).toHaveLength(1);
+      expect(cursorUpdateCalls).toHaveLength(1);
     });
   });
 });
 
 describe("clearArchiveStreamCheckpoint", () => {
   it("deletes the checkpoint row keyed on archive_dataset_id", async () => {
-    const { client, deleteCalls } = makeMockCheckpointClient();
+    const { clients, deleteCalls } = makeMockClients();
 
-    await clearArchiveStreamCheckpoint(client, ARCHIVE_DATASET_ID);
+    await clearArchiveStreamCheckpoint(
+      clients.checkpointClient,
+      ARCHIVE_DATASET_ID,
+    );
 
     expect(deleteCalls).toEqual([ARCHIVE_DATASET_ID]);
   });
 
   it("throws a clear error when clearing the checkpoint fails", async () => {
-    const { client } = makeMockCheckpointClient({ deleteError: { message: "network error" } });
+    const { clients } = makeMockClients({
+      deleteError: { message: "network error" },
+    });
 
-    await expect(clearArchiveStreamCheckpoint(client, ARCHIVE_DATASET_ID)).rejects.toThrow(
+    await expect(
+      clearArchiveStreamCheckpoint(
+        clients.checkpointClient,
+        ARCHIVE_DATASET_ID,
+      ),
+    ).rejects.toThrow(
       new RegExp(`archive_dataset_id=${ARCHIVE_DATASET_ID}.*network error`),
     );
   });
 });
 
 describe("DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS", () => {
-  it("is 120, derived from the real measured 17,890ms/write snapshot cost against a ~6,002-chunk full archive targeting ~5% overhead", () => {
-    // N >= totalChunks * measuredSnapshotWriteMs / budgetMs
-    //    = 6002 * 17890 / (0.05 * 5 * 3600 * 1000) ~= 119.37 -> rounded up to 120.
-    // This test pins the constant so a future change to it is a deliberate,
-    // reviewed edit, not an accidental drift.
+  it("is 120, the value carried over from the old single-blob write's cost measurement", () => {
+    // This constant predates the per-bucket-row rewrite (see this module's
+    // own comment on it) -- 120 is kept unchanged pending a fresh cost
+    // measurement against the new batched-upsert write path, not
+    // re-derived here. This test pins the constant so a future change to
+    // it is a deliberate, reviewed edit, not an accidental drift.
     expect(DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS).toBe(120);
   });
 });
@@ -414,13 +842,21 @@ describe("streamArchiveWithResume", () => {
   });
 
   it("starts fresh with no $where clause, and never calls onResume, when no checkpoint exists", async () => {
-    const { client, positionUpsertCalls, snapshotUpdateCalls, deleteCalls } = makeMockCheckpointClient({ existingRow: null });
+    const {
+      clients,
+      positionUpsertCalls,
+      bucketUpsertCalls,
+      cursorUpdateCalls,
+      deleteCalls,
+    } = makeMockClients({ existingCheckpointRow: null });
     fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(3, "a")));
     const chunks: SocrataRecord[][] = [];
     const onResume = vi.fn();
-    const returnedSnapshot: AccumulatorSnapshot = { "bf-1:1:9": { count: 3, totalWeight: 3, mean: 0.5, sumSquaredDiff: 0.1 } };
+    const returnedSnapshot: AccumulatorSnapshot = {
+      "bf-1:1:9": { count: 3, totalWeight: 3, mean: 0.5, sumSquaredDiff: 0.1 },
+    };
 
-    await streamArchiveWithResume(client, {
+    await streamArchiveWithResume(clients, {
       archiveDatasetId: ARCHIVE_DATASET_ID,
       chunkSize: 50,
       onResume,
@@ -450,79 +886,137 @@ describe("streamArchiveWithResume", () => {
     // snapshot interval (120) and only 1 chunk processed, no snapshot write
     // happens at all before the short page ends the run and clears the row.
     expect(positionUpsertCalls).toEqual([
-      { archive_dataset_id: ARCHIVE_DATASET_ID, last_processed_id: "row-a-2", readings_processed_count: 3 },
+      {
+        archive_dataset_id: ARCHIVE_DATASET_ID,
+        last_processed_id: "row-a-2",
+        readings_processed_count: 3,
+      },
     ]);
-    expect(snapshotUpdateCalls).toEqual([]);
+    expect(bucketUpsertCalls).toEqual([]);
+    expect(cursorUpdateCalls).toEqual([]);
     expect(deleteCalls).toEqual([ARCHIVE_DATASET_ID]);
   });
 
   it("snapshots the accumulator only every snapshotIntervalChunks chunks, saving position every chunk regardless", async () => {
-    const { client, positionUpsertCalls, snapshotUpdateCalls, callOrder } = makeMockCheckpointClient({ existingRow: null });
+    const {
+      clients,
+      positionUpsertCalls,
+      bucketUpsertCalls,
+      cursorUpdateCalls,
+      callOrder,
+    } = makeMockClients({ existingCheckpointRow: null });
     fetchMock
       .mockResolvedValueOnce(jsonResponse(makeRecords(2, "c1")))
       .mockResolvedValueOnce(jsonResponse(makeRecords(2, "c2")))
       .mockResolvedValueOnce(jsonResponse(makeRecords(2, "c3")))
       .mockResolvedValueOnce(jsonResponse(makeRecords(1, "c4"))); // short -> stop
 
-    await streamArchiveWithResume(client, {
+    await streamArchiveWithResume(clients, {
       archiveDatasetId: ARCHIVE_DATASET_ID,
       chunkSize: 2,
       snapshotIntervalChunks: 3,
-      onChunk: () => ({ bucket: { count: 1, totalWeight: 1, mean: 1, sumSquaredDiff: 0 } }),
+      onChunk: () => ({
+        "bf-1:1:9": { count: 1, totalWeight: 1, mean: 1, sumSquaredDiff: 0 },
+      }),
     });
 
-    // 4 chunks processed -> 4 position writes, but only 1 snapshot write
-    // (after the 3rd chunk, at snapshotIntervalChunks=3) before the run ends.
+    // 4 chunks processed -> 4 position writes, but only 1 snapshot event
+    // (after the 3rd chunk, at snapshotIntervalChunks=3) before the run
+    // ends -- one bucket batch-upsert plus one cursor update.
     expect(positionUpsertCalls).toHaveLength(4);
-    expect(snapshotUpdateCalls).toHaveLength(1);
-    expect(snapshotUpdateCalls[0]?.values).toMatchObject({ accumulator_snapshot_last_processed_id: "row-c3-1" });
+    expect(bucketUpsertCalls).toHaveLength(1);
+    expect(bucketUpsertCalls[0]).toEqual([
+      {
+        archive_dataset_id: ARCHIVE_DATASET_ID,
+        blockface_id: "bf-1",
+        iso_day: 1,
+        hour: 9,
+        count: 1,
+        total_weight: 1,
+        mean: 1,
+        sum_squared_diff: 0,
+      },
+    ]);
+    expect(cursorUpdateCalls).toHaveLength(1);
+    expect(cursorUpdateCalls[0]?.values).toEqual({
+      accumulator_snapshot_last_processed_id: "row-c3-1",
+    });
 
     // On the snapshotting chunk (the 3rd), position is saved BEFORE the
-    // snapshot -- this ordering is what guarantees the snapshot cursor can
-    // never get ahead of the stream position.
+    // snapshot's bucket upsert and cursor update -- this ordering is what
+    // guarantees the snapshot cursor can never get ahead of the stream
+    // position, and the bucket upsert lands before the cursor advances
+    // (the atomicity guarantee this design depends on).
     expect(callOrder).toEqual([
       "position-upsert", // chunk 1
       "position-upsert", // chunk 2
       "position-upsert", // chunk 3
-      "snapshot-update", // chunk 3's snapshot, after its position write
+      "bucket-upsert", // chunk 3's snapshot: bucket rows land first
+      "cursor-update", // ...then the cursor advances
       "position-upsert", // chunk 4
       "delete",
     ]);
   });
 
   it("resumes with no gap-replay fetch when the snapshot cursor already equals the stream position", async () => {
-    const { client, snapshotUpdateCalls } = makeMockCheckpointClient({
-      existingRow: {
+    const { clients, bucketUpsertCalls, cursorUpdateCalls } = makeMockClients({
+      existingCheckpointRow: {
         archive_dataset_id: ARCHIVE_DATASET_ID,
         last_processed_id: "row-old-1",
         readings_processed_count: 2,
         accumulator_snapshot_last_processed_id: "row-old-1",
-        accumulator_state: SAMPLE_ACCUMULATOR_SNAPSHOT,
       },
+      existingBucketRows: accumulatorSnapshotToBucketRows(
+        ARCHIVE_DATASET_ID,
+        SAMPLE_ACCUMULATOR_SNAPSHOT,
+      ),
     });
     fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(2, "b")));
     const onResume = vi.fn();
 
-    await streamArchiveWithResume(client, { archiveDatasetId: ARCHIVE_DATASET_ID, chunkSize: 50, onResume, onChunk: () => ({}) });
+    await streamArchiveWithResume(clients, {
+      archiveDatasetId: ARCHIVE_DATASET_ID,
+      chunkSize: 50,
+      onResume,
+      onChunk: () => ({}),
+    });
 
     // Only the main loop's one fetch -- no gap-replay fetch, and no
     // redundant re-snapshot write, since there was nothing to catch up.
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(new URL(fetchMock.mock.calls[0]?.[0] as string).searchParams.get("$where")).toBe(":id > 'row-old-1'");
-    expect(snapshotUpdateCalls).toEqual([]);
-    expect(onResume).toHaveBeenCalledExactlyOnceWith(SAMPLE_ACCUMULATOR_SNAPSHOT);
+    expect(
+      new URL(fetchMock.mock.calls[0]?.[0] as string).searchParams.get(
+        "$where",
+      ),
+    ).toBe(":id > 'row-old-1'");
+    expect(bucketUpsertCalls).toEqual([]);
+    expect(cursorUpdateCalls).toEqual([]);
+    expect(onResume).toHaveBeenCalledExactlyOnceWith(
+      SAMPLE_ACCUMULATOR_SNAPSHOT,
+    );
   });
 
   it("replays exactly the bounded gap between the snapshot cursor and the stream position on resume, then re-snapshots and continues", async () => {
-    const { client, snapshotUpdateCalls, callOrder } = makeMockCheckpointClient({
-      existingRow: {
-        archive_dataset_id: ARCHIVE_DATASET_ID,
-        last_processed_id: "row-g-3", // stream got 2 chunks ahead of the snapshot before crashing
-        readings_processed_count: 4,
-        accumulator_snapshot_last_processed_id: "row-g-1",
-        accumulator_state: { seed: { count: 2, totalWeight: 2, mean: 1, sumSquaredDiff: 0 } },
-      },
-    });
+    const { clients, bucketUpsertCalls, cursorUpdateCalls, callOrder } =
+      makeMockClients({
+        existingCheckpointRow: {
+          archive_dataset_id: ARCHIVE_DATASET_ID,
+          last_processed_id: "row-g-3", // stream got 2 chunks ahead of the snapshot before crashing
+          readings_processed_count: 4,
+          accumulator_snapshot_last_processed_id: "row-g-1",
+        },
+        existingBucketRows: accumulatorSnapshotToBucketRows(
+          ARCHIVE_DATASET_ID,
+          {
+            "bf-seed:1:9": {
+              count: 2,
+              totalWeight: 2,
+              mean: 1,
+              sumSquaredDiff: 0,
+            },
+          },
+        ),
+      });
     // Gap replay should fetch exactly (row-g-1, row-g-3], i.e. rows g-2 and g-3.
     fetchMock
       .mockResolvedValueOnce(jsonResponse(makeRecords(4, "g").slice(2, 4))) // row-g-2, row-g-3
@@ -530,7 +1024,7 @@ describe("streamArchiveWithResume", () => {
     const onResumeStates: AccumulatorSnapshot[] = [];
     const onChunkPages: SocrataRecord[][] = [];
 
-    await streamArchiveWithResume(client, {
+    await streamArchiveWithResume(clients, {
       archiveDatasetId: ARCHIVE_DATASET_ID,
       chunkSize: 50,
       onResume: (state) => {
@@ -538,29 +1032,59 @@ describe("streamArchiveWithResume", () => {
       },
       onChunk: (readings) => {
         onChunkPages.push(readings);
-        return { seed: { count: 2 + readings.length, totalWeight: 2 + readings.length, mean: 1, sumSquaredDiff: 0 } };
+        return {
+          "bf-seed:1:9": {
+            count: 2 + readings.length,
+            totalWeight: 2 + readings.length,
+            mean: 1,
+            sumSquaredDiff: 0,
+          },
+        };
       },
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     const gapCallUrl = new URL(fetchMock.mock.calls[0]?.[0] as string);
-    expect(gapCallUrl.searchParams.get("$where")).toBe(":id > 'row-g-1' AND :id <= 'row-g-3'");
+    expect(gapCallUrl.searchParams.get("$where")).toBe(
+      ":id > 'row-g-1' AND :id <= 'row-g-3'",
+    );
 
     // onResume fires FIRST, with the raw (not-yet-caught-up) snapshot --
     // it's what seeds the caller's own state before gap-replay's onChunk
     // call can correctly build on it. The gap chunk then genuinely goes
     // through onChunk (real re-fold, not skipped), producing the caught-up
-    // state reflected in the snapshot upsert below.
-    expect(onResumeStates).toEqual([{ seed: { count: 2, totalWeight: 2, mean: 1, sumSquaredDiff: 0 } }]);
-    expect(onChunkPages[0]?.map((r) => r[":id"])).toEqual(["row-g-2", "row-g-3"]);
+    // state reflected in the bucket upsert below.
+    expect(onResumeStates).toEqual([
+      {
+        "bf-seed:1:9": { count: 2, totalWeight: 2, mean: 1, sumSquaredDiff: 0 },
+      },
+    ]);
+    expect(onChunkPages[0]?.map((r) => r[":id"])).toEqual([
+      "row-g-2",
+      "row-g-3",
+    ]);
 
     // The caught-up snapshot is persisted immediately, at the stream's
     // cursor (row-g-3), before the main loop's own next chunk runs.
-    expect(snapshotUpdateCalls[0]?.values).toMatchObject({
+    expect(bucketUpsertCalls[0]).toEqual([
+      {
+        archive_dataset_id: ARCHIVE_DATASET_ID,
+        blockface_id: "bf-seed",
+        iso_day: 1,
+        hour: 9,
+        count: 4,
+        total_weight: 4,
+        mean: 1,
+        sum_squared_diff: 0,
+      },
+    ]);
+    expect(cursorUpdateCalls[0]?.values).toEqual({
       accumulator_snapshot_last_processed_id: "row-g-3",
-      accumulator_state: { seed: { count: 4, totalWeight: 4, mean: 1, sumSquaredDiff: 0 } },
     });
-    expect(callOrder[0]).toBe("snapshot-update"); // the catch-up snapshot, before any main-loop write
+    // the catch-up snapshot (bucket upsert, then cursor update), before any
+    // main-loop write
+    expect(callOrder[0]).toBe("bucket-upsert");
+    expect(callOrder[1]).toBe("cursor-update");
 
     // Main loop then continues forward from row-g-3, not from row-g-1.
     const mainLoopCallUrl = new URL(fetchMock.mock.calls[1]?.[0] as string);
@@ -568,20 +1092,24 @@ describe("streamArchiveWithResume", () => {
   });
 
   it("replays from the very start of the dataset when no snapshot has ever been taken (null cursor)", async () => {
-    const { client } = makeMockCheckpointClient({
-      existingRow: {
+    const { clients } = makeMockClients({
+      existingCheckpointRow: {
         archive_dataset_id: ARCHIVE_DATASET_ID,
         last_processed_id: "row-i-1",
         readings_processed_count: 2,
         accumulator_snapshot_last_processed_id: null,
-        accumulator_state: {},
       },
+      existingBucketRows: [],
     });
     fetchMock
       .mockResolvedValueOnce(jsonResponse(makeRecords(2, "i"))) // gap replay: full dataset start through row-i-1
       .mockResolvedValueOnce(jsonResponse([])); // main loop: nothing new yet
 
-    await streamArchiveWithResume(client, { archiveDatasetId: ARCHIVE_DATASET_ID, chunkSize: 50, onChunk: () => ({ x: createEmptyAccumulator() }) });
+    await streamArchiveWithResume(clients, {
+      archiveDatasetId: ARCHIVE_DATASET_ID,
+      chunkSize: 50,
+      onChunk: () => ({ "bf-i:1:9": createEmptyAccumulator() }),
+    });
 
     const gapCallUrl = new URL(fetchMock.mock.calls[0]?.[0] as string);
     expect(gapCallUrl.searchParams.get("$where")).toBe(":id <= 'row-i-1'");
@@ -594,6 +1122,7 @@ describe("streamArchiveWithResume", () => {
     // "resumed" simulates a crash after chunk 1 was snapshotted but chunk 2
     // only reached the (cheap) position checkpoint before crashing, so a
     // gap-replay re-folds chunk 2 before chunk 3 is fetched fresh.
+    const BUCKET_KEY = "bf-shared:1:9";
     const readings: { id: string; value: number; weight: number }[] = [
       { id: "row-r-0", value: 1, weight: 1 },
       { id: "row-r-1", value: 2, weight: 2 },
@@ -603,12 +1132,17 @@ describe("streamArchiveWithResume", () => {
       { id: "row-r-5", value: 6, weight: 3 },
     ];
 
-    function foldPage(acc: WeightedStatsAccumulator, page: SocrataRecord[]): WeightedStatsAccumulator {
+    function foldPage(
+      acc: WeightedStatsAccumulator,
+      page: SocrataRecord[],
+    ): WeightedStatsAccumulator {
       let result = acc;
       for (const record of page) {
         const match = readings.find((r) => r.id === record[":id"]);
         if (match === undefined) {
-          throw new Error(`test setup error: unknown reading id ${String(record[":id"])}`);
+          throw new Error(
+            `test setup error: unknown reading id ${String(record[":id"])}`,
+          );
         }
         result = addReading(result, match.value, match.weight);
       }
@@ -629,30 +1163,38 @@ describe("streamArchiveWithResume", () => {
     let snapshotAcc = createEmptyAccumulator();
     snapshotAcc = foldPage(snapshotAcc, chunk1Records);
 
-    const { client } = makeMockCheckpointClient({
-      existingRow: {
+    const { clients } = makeMockClients({
+      existingCheckpointRow: {
         archive_dataset_id: ARCHIVE_DATASET_ID,
         last_processed_id: "row-r-3",
         readings_processed_count: 4,
         accumulator_snapshot_last_processed_id: "row-r-1",
-        accumulator_state: { bucket: snapshotAcc },
       },
+      existingBucketRows: accumulatorSnapshotToBucketRows(ARCHIVE_DATASET_ID, {
+        [BUCKET_KEY]: snapshotAcc,
+      }),
     });
 
     fetchMock
-      .mockResolvedValueOnce(jsonResponse([{ ":id": "row-r-2" }, { ":id": "row-r-3" }])) // gap replay: chunk 2
-      .mockResolvedValueOnce(jsonResponse([{ ":id": "row-r-4" }, { ":id": "row-r-5" }])); // main loop: chunk 3, short -> stop
+      .mockResolvedValueOnce(
+        jsonResponse([{ ":id": "row-r-2" }, { ":id": "row-r-3" }]),
+      ) // gap replay: chunk 2
+      .mockResolvedValueOnce(
+        jsonResponse([{ ":id": "row-r-4" }, { ":id": "row-r-5" }]),
+      ); // main loop: chunk 3, short -> stop
 
     let resumedAcc = createEmptyAccumulator();
-    await streamArchiveWithResume(client, {
+    await streamArchiveWithResume(clients, {
       archiveDatasetId: ARCHIVE_DATASET_ID,
       chunkSize: 50,
       onResume: (state) => {
-        resumedAcc = (state.bucket as WeightedStatsAccumulator | undefined) ?? resumedAcc;
+        resumedAcc =
+          (state[BUCKET_KEY] as WeightedStatsAccumulator | undefined) ??
+          resumedAcc;
       },
       onChunk: (page) => {
         resumedAcc = foldPage(resumedAcc, page);
-        return { bucket: resumedAcc };
+        return { [BUCKET_KEY]: resumedAcc };
       },
     });
 
@@ -663,13 +1205,13 @@ describe("streamArchiveWithResume", () => {
   });
 
   it("stops as soon as a chunk shorter than chunkSize arrives, without an extra fetch", async () => {
-    const { client } = makeMockCheckpointClient({ existingRow: null });
+    const { clients } = makeMockClients({ existingCheckpointRow: null });
     fetchMock
       .mockResolvedValueOnce(jsonResponse(makeRecords(5, "d1"))) // exactly chunkSize
       .mockResolvedValueOnce(jsonResponse(makeRecords(3, "d2"))); // short -> stop, no 3rd fetch
     const chunks: SocrataRecord[][] = [];
 
-    await streamArchiveWithResume(client, {
+    await streamArchiveWithResume(clients, {
       archiveDatasetId: ARCHIVE_DATASET_ID,
       chunkSize: 5,
       onChunk: (readings) => {
@@ -683,52 +1225,83 @@ describe("streamArchiveWithResume", () => {
   });
 
   it("calls onResume (with the caught-up state) even when the first main-loop page is already empty, and never calls onChunk from the main loop", async () => {
-    const { client, positionUpsertCalls, deleteCalls } = makeMockCheckpointClient({
-      existingRow: {
+    const { clients, positionUpsertCalls, deleteCalls } = makeMockClients({
+      existingCheckpointRow: {
         archive_dataset_id: ARCHIVE_DATASET_ID,
         last_processed_id: "row-last",
         readings_processed_count: 999,
         accumulator_snapshot_last_processed_id: "row-last",
-        accumulator_state: SAMPLE_ACCUMULATOR_SNAPSHOT,
       },
+      existingBucketRows: accumulatorSnapshotToBucketRows(
+        ARCHIVE_DATASET_ID,
+        SAMPLE_ACCUMULATOR_SNAPSHOT,
+      ),
     });
     fetchMock.mockResolvedValueOnce(jsonResponse([]));
     const onChunk = vi.fn();
     const onResume = vi.fn();
 
-    await streamArchiveWithResume(client, { archiveDatasetId: ARCHIVE_DATASET_ID, chunkSize: 50, onResume, onChunk });
+    await streamArchiveWithResume(clients, {
+      archiveDatasetId: ARCHIVE_DATASET_ID,
+      chunkSize: 50,
+      onResume,
+      onChunk,
+    });
 
-    expect(onResume).toHaveBeenCalledExactlyOnceWith(SAMPLE_ACCUMULATOR_SNAPSHOT);
+    expect(onResume).toHaveBeenCalledExactlyOnceWith(
+      SAMPLE_ACCUMULATOR_SNAPSHOT,
+    );
     expect(onChunk).not.toHaveBeenCalled();
     expect(positionUpsertCalls).toEqual([]);
     expect(deleteCalls).toEqual([ARCHIVE_DATASET_ID]);
   });
 
   it("uses DEFAULT_STREAM_CHUNK_SIZE when chunkSize is not specified", async () => {
-    const { client } = makeMockCheckpointClient({ existingRow: null });
+    const { clients } = makeMockClients({ existingCheckpointRow: null });
     fetchMock.mockResolvedValueOnce(jsonResponse([]));
 
-    await streamArchiveWithResume(client, { archiveDatasetId: ARCHIVE_DATASET_ID, onChunk: () => ({}) });
+    await streamArchiveWithResume(clients, {
+      archiveDatasetId: ARCHIVE_DATASET_ID,
+      onChunk: () => ({}),
+    });
 
     const firstCallUrl = new URL(fetchMock.mock.calls[0]?.[0] as string);
-    expect(firstCallUrl.searchParams.get("$limit")).toBe(String(DEFAULT_STREAM_CHUNK_SIZE));
+    expect(firstCallUrl.searchParams.get("$limit")).toBe(
+      String(DEFAULT_STREAM_CHUNK_SIZE),
+    );
   });
 
   it("throws when a fetched row is missing a valid :id field", async () => {
-    const { client } = makeMockCheckpointClient({ existingRow: null });
-    fetchMock.mockResolvedValueOnce(jsonResponse([{ occupancydatetime: "2025-06-10T09:00:00" }]));
+    const { clients } = makeMockClients({ existingCheckpointRow: null });
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse([{ occupancydatetime: "2025-06-10T09:00:00" }]),
+    );
 
     await expect(
-      streamArchiveWithResume(client, { archiveDatasetId: ARCHIVE_DATASET_ID, chunkSize: 50, onChunk: () => ({}) }),
+      streamArchiveWithResume(clients, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        chunkSize: 50,
+        onChunk: () => ({}),
+      }),
     ).rejects.toThrow(/missing a valid :id field/);
   });
 
   it("throws rather than continuing on a non-200 Socrata response", async () => {
-    const { client } = makeMockCheckpointClient({ existingRow: null });
-    fetchMock.mockResolvedValueOnce(jsonResponse([], { ok: false, status: 503, statusText: "Service Unavailable" }));
+    const { clients } = makeMockClients({ existingCheckpointRow: null });
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse([], {
+        ok: false,
+        status: 503,
+        statusText: "Service Unavailable",
+      }),
+    );
 
     await expect(
-      streamArchiveWithResume(client, { archiveDatasetId: ARCHIVE_DATASET_ID, chunkSize: 50, onChunk: () => ({}) }),
+      streamArchiveWithResume(clients, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        chunkSize: 50,
+        onChunk: () => ({}),
+      }),
     ).rejects.toThrow(/503/);
   });
 
@@ -738,33 +1311,57 @@ describe("streamArchiveWithResume", () => {
     });
 
     it("does not log progress before ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS chunks have been processed", async () => {
-      const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-      const { client } = makeMockCheckpointClient({ existingRow: null });
-      for (let i = 0; i < ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS - 1; i++) {
+      const consoleLogSpy = vi
+        .spyOn(console, "log")
+        .mockImplementation(() => {});
+      const { clients } = makeMockClients({ existingCheckpointRow: null });
+      for (
+        let i = 0;
+        i < ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS - 1;
+        i++
+      ) {
         fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(2, `q${i}`))); // full chunkSize-2 pages, never short
       }
       fetchMock.mockResolvedValueOnce(jsonResponse([])); // empty page -> stop BEFORE processing a 20th chunk
 
-      await streamArchiveWithResume(client, { archiveDatasetId: ARCHIVE_DATASET_ID, chunkSize: 2, onChunk: () => ({}) });
+      await streamArchiveWithResume(clients, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        chunkSize: 2,
+        onChunk: () => ({}),
+      });
 
-      const progressLines = consoleLogSpy.mock.calls.filter((call) => String(call[0]).includes("Archive streaming progress"));
+      const progressLines = consoleLogSpy.mock.calls.filter((call) =>
+        String(call[0]).includes("Archive streaming progress"),
+      );
       expect(progressLines).toHaveLength(0);
     });
 
     it("logs cumulative chunks processed and total readings once the interval is reached", async () => {
-      const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-      const { client } = makeMockCheckpointClient({ existingRow: null });
+      const consoleLogSpy = vi
+        .spyOn(console, "log")
+        .mockImplementation(() => {});
+      const { clients } = makeMockClients({ existingCheckpointRow: null });
       for (let i = 0; i < ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS; i++) {
         fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(2, `p${i}`))); // 2 readings/chunk
       }
       fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(1, "last"))); // short -> stop
 
-      await streamArchiveWithResume(client, { archiveDatasetId: ARCHIVE_DATASET_ID, chunkSize: 2, onChunk: () => ({}) });
+      await streamArchiveWithResume(clients, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        chunkSize: 2,
+        onChunk: () => ({}),
+      });
 
-      const progressLines = consoleLogSpy.mock.calls.filter((call) => String(call[0]).includes("Archive streaming progress"));
+      const progressLines = consoleLogSpy.mock.calls.filter((call) =>
+        String(call[0]).includes("Archive streaming progress"),
+      );
       expect(progressLines).toHaveLength(1);
-      expect(progressLines[0]?.[0]).toContain(`${ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS} chunks processed`);
-      expect(progressLines[0]?.[0]).toContain(`${ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS * 2} total readings processed`);
+      expect(progressLines[0]?.[0]).toContain(
+        `${ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS} chunks processed`,
+      );
+      expect(progressLines[0]?.[0]).toContain(
+        `${ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS * 2} total readings processed`,
+      );
     });
 
     // Also proves the logged reading count reflects the TRUE cumulative
@@ -773,15 +1370,20 @@ describe("streamArchiveWithResume", () => {
     // process's own main loop -- the same distinction that matters for
     // readings_processed_count itself (see saveArchiveStreamPosition).
     it("logs again after a second interval, with cumulative totals that include readings resumed from a prior run", async () => {
-      const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-      const { client } = makeMockCheckpointClient({
-        existingRow: {
+      const consoleLogSpy = vi
+        .spyOn(console, "log")
+        .mockImplementation(() => {});
+      const { clients } = makeMockClients({
+        existingCheckpointRow: {
           archive_dataset_id: ARCHIVE_DATASET_ID,
           last_processed_id: "row-old-1",
           readings_processed_count: 1000,
           accumulator_snapshot_last_processed_id: "row-old-1",
-          accumulator_state: SAMPLE_ACCUMULATOR_SNAPSHOT,
         },
+        existingBucketRows: accumulatorSnapshotToBucketRows(
+          ARCHIVE_DATASET_ID,
+          SAMPLE_ACCUMULATOR_SNAPSHOT,
+        ),
       });
       const totalChunks = ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS * 2;
       for (let i = 0; i < totalChunks; i++) {
@@ -789,14 +1391,28 @@ describe("streamArchiveWithResume", () => {
       }
       fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(1, "last"))); // short -> stop
 
-      await streamArchiveWithResume(client, { archiveDatasetId: ARCHIVE_DATASET_ID, chunkSize: 2, onChunk: () => ({}) });
+      await streamArchiveWithResume(clients, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        chunkSize: 2,
+        onChunk: () => ({}),
+      });
 
-      const progressLines = consoleLogSpy.mock.calls.filter((call) => String(call[0]).includes("Archive streaming progress"));
+      const progressLines = consoleLogSpy.mock.calls.filter((call) =>
+        String(call[0]).includes("Archive streaming progress"),
+      );
       expect(progressLines).toHaveLength(2);
-      expect(progressLines[0]?.[0]).toContain(`${ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS} chunks processed`);
-      expect(progressLines[0]?.[0]).toContain(`${1000 + ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS * 2} total readings processed`);
-      expect(progressLines[1]?.[0]).toContain(`${totalChunks} chunks processed`);
-      expect(progressLines[1]?.[0]).toContain(`${1000 + totalChunks * 2} total readings processed`);
+      expect(progressLines[0]?.[0]).toContain(
+        `${ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS} chunks processed`,
+      );
+      expect(progressLines[0]?.[0]).toContain(
+        `${1000 + ARCHIVE_STREAM_PROGRESS_LOG_INTERVAL_CHUNKS * 2} total readings processed`,
+      );
+      expect(progressLines[1]?.[0]).toContain(
+        `${totalChunks} chunks processed`,
+      );
+      expect(progressLines[1]?.[0]).toContain(
+        `${1000 + totalChunks * 2} total readings processed`,
+      );
     });
   });
 });
