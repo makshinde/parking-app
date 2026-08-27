@@ -5,12 +5,53 @@ export type SocrataRecord = Record<string, unknown>;
 // regardless of the specific dataset being queried.
 export const SOCRATA_PAGE_LIMIT = 50000;
 
-function buildQueryUrl(datasetUrl: string, whereClause: string, offset: number): string {
+// Keyset (:id-based) pagination, not $offset -- see streamArchiveWithResume.ts
+// for the same approach, already proven against the yearly archive
+// datasets. This module used to paginate via $offset, which was a real,
+// live-confirmed bug against rke9-rsvs (the rolling window dataset, used by
+// initializeAccumulators): rke9-rsvs is continuously growing, and an
+// $offset position isn't anchored to anything -- if a page's request
+// failed mid-stream and was retried (this module's own retry-with-backoff
+// below), new rows inserted into the dataset in the meantime could shift
+// what "offset N" now points to, causing the retry to return a different
+// row set than the original attempt would have -- some rows counted twice,
+// some skipped. A real production run hit exactly this: two mid-fetch
+// retries during the rolling-window phase correlated with a confirmed 1-3%
+// sample-count overcount in occupancy_stats, independently verified against
+// direct Socrata queries. Keyset pagination is immune to this by
+// construction: :id > cursor is anchored to a specific, already-seen row,
+// so retrying the identical request always resolves to the same rows
+// regardless of what else has been inserted elsewhere in the dataset.
+// Live-verified against rke9-rsvs directly (not assumed to work just
+// because the archive datasets support it): it exposes the same :id system
+// field, in the same "row-xxxx" format, and $where=:id > cursor&$order=:id
+// pagination behaves identically.
+function buildQueryUrl(datasetUrl: string, whereClause: string, cursorId: string | null): string {
   const url = new URL(datasetUrl);
-  url.searchParams.set("$where", whereClause);
+  // SoQL requires a star selection to come first in the select-list --
+  // live-verified against the real API (see streamArchiveWithResume.ts):
+  // "*,:id" succeeds, ":id,*" fails with query.compiler.malformed.
+  url.searchParams.set("$select", "*,:id");
+  url.searchParams.set("$order", ":id");
   url.searchParams.set("$limit", String(SOCRATA_PAGE_LIMIT));
-  url.searchParams.set("$offset", String(offset));
+  // Parenthesized so an AND'd :id condition can't have its precedence
+  // changed by whatever the caller's own whereClause contains (e.g. an OR).
+  const combinedWhere = cursorId !== null ? `(${whereClause}) AND :id > '${cursorId}'` : whereClause;
+  url.searchParams.set("$where", combinedWhere);
   return url.toString();
+}
+
+// Socrata's own per-row system identifier (e.g. "row-km8v~rgdh.iue6"),
+// requested via $select above. Every row genuinely has one, so a missing or
+// malformed value here signals a real problem with the response, not an
+// expected case to handle gracefully -- same reasoning
+// streamArchiveWithResume.ts's getRecordId uses.
+function getRecordId(record: SocrataRecord): string {
+  const id = record[":id"];
+  if (typeof id !== "string" || id.trim() === "") {
+    throw new Error(`fetchSocrataRecords: row missing a valid :id field, got ${JSON.stringify(id)}`);
+  }
+  return id;
 }
 
 // Socrata heavily rate-limits unauthenticated requests, shared across every
@@ -78,8 +119,8 @@ async function fetchPageOnce(url: string): Promise<SocrataRecord[]> {
   return (await response.json()) as SocrataRecord[];
 }
 
-async function fetchPage(datasetUrl: string, whereClause: string, offset: number): Promise<SocrataRecord[]> {
-  const url = buildQueryUrl(datasetUrl, whereClause, offset);
+async function fetchPage(datasetUrl: string, whereClause: string, cursorId: string | null): Promise<SocrataRecord[]> {
+  const url = buildQueryUrl(datasetUrl, whereClause, cursorId);
 
   for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
     try {
@@ -121,20 +162,21 @@ async function fetchPage(datasetUrl: string, whereClause: string, offset: number
 }
 
 // Queries a Socrata (SODA) API dataset and returns every matching record,
-// automatically following $limit/$offset pagination.
+// automatically following :id-keyset pagination (no $offset -- see
+// buildQueryUrl's comment for why).
 export async function fetchSocrataRecords(datasetUrl: string, whereClause: string): Promise<SocrataRecord[]> {
   const allRecords: SocrataRecord[] = [];
-  let offset = 0;
+  let cursorId: string | null = null;
 
   while (true) {
-    const page = await fetchPage(datasetUrl, whereClause, offset);
+    const page = await fetchPage(datasetUrl, whereClause, cursorId);
     allRecords.push(...page);
 
     // A page with fewer rows than the limit is necessarily the last page.
     // A page with exactly SOCRATA_PAGE_LIMIT rows might still be the last
     // page -- a dataset can happen to have a row count that's an exact
     // multiple of the page size -- and row count alone can't distinguish
-    // that from "there's more." So this always requests the next offset
+    // that from "there's more." So this always requests the next page
     // after a full page and relies on an empty (or short) page to stop,
     // rather than assuming either a full page always means more, or that
     // a full page is necessarily the end.
@@ -142,16 +184,16 @@ export async function fetchSocrataRecords(datasetUrl: string, whereClause: strin
       break;
     }
 
-    offset += SOCRATA_PAGE_LIMIT;
+    cursorId = getRecordId(page[page.length - 1] as SocrataRecord);
   }
 
   return allRecords;
 }
 
-// Same $where/$limit/$offset pagination as fetchSocrataRecords, but hands
-// each page to onPage as soon as it arrives instead of accumulating every
-// page into one array -- for datasets too large to hold entirely in memory
-// at once (live-verified: fetchSocrataRecords itself OOM'd, ~2GB heap,
+// Same $where/:id-keyset pagination as fetchSocrataRecords, but hands each
+// page to onPage as soon as it arrives instead of accumulating every page
+// into one array -- for datasets too large to hold entirely in memory at
+// once (live-verified: fetchSocrataRecords itself OOM'd, ~2GB heap,
 // wholesale-fetching the 27,080,827-row rolling window dataset -- see
 // CLAUDE.md's Architecture section). onPage is awaited before the next
 // page is fetched, so at most one page's worth of raw records is ever held
@@ -162,10 +204,10 @@ export async function fetchSocrataRecordsPaginated(
   whereClause: string,
   onPage: (page: SocrataRecord[]) => Promise<void> | void,
 ): Promise<void> {
-  let offset = 0;
+  let cursorId: string | null = null;
 
   while (true) {
-    const page = await fetchPage(datasetUrl, whereClause, offset);
+    const page = await fetchPage(datasetUrl, whereClause, cursorId);
     await onPage(page);
 
     // Same short-page stopping rule as fetchSocrataRecords -- see its own
@@ -175,6 +217,6 @@ export async function fetchSocrataRecordsPaginated(
       break;
     }
 
-    offset += SOCRATA_PAGE_LIMIT;
+    cursorId = getRecordId(page[page.length - 1] as SocrataRecord);
   }
 }

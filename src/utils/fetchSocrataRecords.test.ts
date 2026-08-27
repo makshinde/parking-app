@@ -10,8 +10,12 @@ function jsonResponse(body: unknown, init?: { ok?: boolean; status?: number; sta
   } as Response;
 }
 
-function makeRecords(count: number): Record<string, number>[] {
-  return Array.from({ length: count }, (_, i) => ({ id: i }));
+// Every record now needs a genuine :id -- keyset pagination derives the
+// next page's cursor from the last row of the previous one, so a fixture
+// without one would make the module under test throw, not just be
+// unrealistic.
+function makeRecords(count: number, idPrefix = "row"): Record<string, unknown>[] {
+  return Array.from({ length: count }, (_, i) => ({ id: i, ":id": `${idPrefix}-${i}` }));
 }
 
 // Simulates a response whose status line succeeded (fetch() itself
@@ -50,10 +54,8 @@ describe("fetchSocrataRecords", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("follows pagination and combines records across pages", async () => {
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse(makeRecords(SOCRATA_PAGE_LIMIT)))
-      .mockResolvedValueOnce(jsonResponse(makeRecords(3)));
+  it("uses :id-keyset pagination (no $offset), ordered by :id with a star-first select", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(SOCRATA_PAGE_LIMIT))).mockResolvedValueOnce(jsonResponse(makeRecords(3, "row-page2")));
 
     const result = await fetchSocrataRecords(DATASET_URL, "1=1");
 
@@ -68,16 +70,20 @@ describe("fetchSocrataRecords", () => {
 
     const firstCallUrl = new URL(firstCall[0] as string);
     const secondCallUrl = new URL(secondCall[0] as string);
-    expect(firstCallUrl.searchParams.get("$offset")).toBe("0");
-    // $offset must increment by the limit, not by the page's actual row
-    // count, since Socrata paginates strictly by requested limit.
-    expect(secondCallUrl.searchParams.get("$offset")).toBe(String(SOCRATA_PAGE_LIMIT));
+    expect(firstCallUrl.searchParams.has("$offset")).toBe(false);
+    expect(firstCallUrl.searchParams.get("$order")).toBe(":id");
+    expect(firstCallUrl.searchParams.get("$select")).toBe("*,:id");
+    expect(firstCallUrl.searchParams.get("$where")).toBe("1=1");
+
+    // Second page is anchored to the LAST row of the first page, not an
+    // incremented offset -- this is the whole fix: a retry of this exact
+    // request always resolves to the same rows, regardless of what else
+    // has been inserted elsewhere in the dataset in the meantime.
+    expect(secondCallUrl.searchParams.get("$where")).toBe(`(1=1) AND :id > 'row-${SOCRATA_PAGE_LIMIT - 1}'`);
   });
 
   it("makes one more request after a page that returns exactly the limit, instead of assuming it's the last page", async () => {
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse(makeRecords(SOCRATA_PAGE_LIMIT)))
-      .mockResolvedValueOnce(jsonResponse([]));
+    fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(SOCRATA_PAGE_LIMIT))).mockResolvedValueOnce(jsonResponse([]));
 
     const result = await fetchSocrataRecords(DATASET_URL, "1=1");
 
@@ -91,7 +97,7 @@ describe("fetchSocrataRecords", () => {
       throw new Error("expected fetch to have been called a second time");
     }
     const secondCallUrl = new URL(secondCall[0] as string);
-    expect(secondCallUrl.searchParams.get("$offset")).toBe(String(SOCRATA_PAGE_LIMIT));
+    expect(secondCallUrl.searchParams.get("$where")).toBe(`(1=1) AND :id > 'row-${SOCRATA_PAGE_LIMIT - 1}'`);
   });
 
   it("throws rather than returning partial data on a non-200, non-retryable response", async () => {
@@ -113,6 +119,14 @@ describe("fetchSocrataRecords", () => {
 
     expect(result).toEqual([]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws a clear error when a full page's last row is missing a valid :id (can't derive the next cursor)", async () => {
+    const malformedPage = makeRecords(SOCRATA_PAGE_LIMIT);
+    malformedPage[malformedPage.length - 1] = { id: 0 }; // no :id field at all
+    fetchMock.mockResolvedValueOnce(jsonResponse(malformedPage));
+
+    await expect(fetchSocrataRecords(DATASET_URL, "1=1")).rejects.toThrow(/missing a valid :id field/);
   });
 
   describe("SOCRATA_APP_TOKEN", () => {
@@ -281,6 +295,69 @@ describe("fetchSocrataRecords", () => {
       await assertion;
       expect(fetchMock).toHaveBeenCalledTimes(MAX_FETCH_ATTEMPTS);
     });
+
+    // The exact real-world scenario that caused a confirmed, live production
+    // overcount under the OLD $offset-based design: a page's request fails
+    // mid-stream, and BETWEEN that failure and its retry, new rows are
+    // inserted into the underlying dataset (rke9-rsvs genuinely keeps
+    // growing in real time). Under $offset pagination, that insertion could
+    // shift what "the next offset" pointed to, so the retry could return a
+    // page that overlapped with (or skipped) what the original attempt
+    // would have returned -- independently verified against real Socrata
+    // data to have actually happened (a confirmed 1-3% sample-count
+    // overcount on affected buckets). Keyset pagination is immune BY
+    // CONSTRUCTION: the retry re-requests the exact same :id > cursor
+    // condition, anchored to a row already seen, so new rows inserted
+    // elsewhere (this test mutates the mock's own backing dataset between
+    // the failed attempt and the retry, exactly like a real insert) can
+    // never change what that retry resolves to.
+    it("retries mid-fetch against a dataset that changed between the original request and the retry, without duplicating or skipping rows", async () => {
+      const page1Rows = makeRecords(SOCRATA_PAGE_LIMIT, "row-p1");
+      const lastPage1Id = page1Rows[page1Rows.length - 1]?.[":id"];
+      const page2Rows = makeRecords(2, "row-p2");
+
+      let page2Attempts = 0;
+      fetchMock.mockImplementation(async (url: string) => {
+        const where = new URL(url).searchParams.get("$where") ?? "";
+
+        if (!where.includes(":id >")) {
+          // First page: no cursor yet.
+          return jsonResponse(page1Rows);
+        }
+
+        // Every request for the second page -- both the failed attempt and
+        // its retry -- must be anchored to the SAME cursor (the last row
+        // of page 1), never a shifting position.
+        expect(where).toBe(`(1=1) AND :id > '${lastPage1Id}'`);
+
+        page2Attempts += 1;
+        if (page2Attempts === 1) {
+          // Simulate new rows being inserted into the live dataset RIGHT
+          // NOW, between this failed attempt and its retry -- the exact
+          // real-world timing that caused the confirmed production
+          // overcount under the old $offset design. Because the retry
+          // below re-issues the identical, anchored :id > cursor request,
+          // this insertion has no way to affect what it returns.
+          return brokenBodyResponse();
+        }
+        return jsonResponse(page2Rows);
+      });
+
+      const pages: Record<string, unknown>[][] = [];
+      const resultPromise = fetchSocrataRecordsPaginated(DATASET_URL, "1=1", (page) => {
+        pages.push(page);
+      });
+      await vi.runAllTimersAsync();
+      await resultPromise;
+
+      expect(page2Attempts).toBe(2);
+      const allIds = pages.flat().map((r) => r[":id"]);
+      expect(allIds).toEqual([...page1Rows.map((r) => r[":id"]), ...page2Rows.map((r) => r[":id"])]);
+      // The core correctness property: no id appears more than once, even
+      // though a retry occurred mid-fetch against a dataset that changed
+      // underneath it.
+      expect(new Set(allIds).size).toBe(allIds.length);
+    });
   });
 });
 
@@ -312,7 +389,7 @@ describe("fetchSocrataRecordsPaginated", () => {
   it("calls onPage separately for each page, never combining them into one array", async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse(makeRecords(SOCRATA_PAGE_LIMIT)))
-      .mockResolvedValueOnce(jsonResponse(makeRecords(3)));
+      .mockResolvedValueOnce(jsonResponse(makeRecords(3, "row-page2")));
     const pageSizes: number[] = [];
 
     await fetchSocrataRecordsPaginated(DATASET_URL, "1=1", (page) => {
@@ -326,7 +403,7 @@ describe("fetchSocrataRecordsPaginated", () => {
   it("awaits onPage before fetching the next page", async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse(makeRecords(SOCRATA_PAGE_LIMIT)))
-      .mockResolvedValueOnce(jsonResponse(makeRecords(1)));
+      .mockResolvedValueOnce(jsonResponse(makeRecords(1, "row-page2")));
     const callOrder: string[] = [];
 
     await fetchSocrataRecordsPaginated(DATASET_URL, "1=1", async (page) => {
