@@ -529,6 +529,54 @@ function buildArchivePageUrl(
   return url.toString();
 }
 
+// Marks the one kind of failure this can identify with certainty as
+// non-transient: a successfully-received response carrying a 4xx status --
+// same reasoning as fetchSocrataRecords.ts's SocrataRequestError. The
+// request itself is wrong (bad $where, bad dataset id) -- retrying it would
+// fail identically every time. Everything else (fetch() failing to connect,
+// response.json() failing to read/parse the body, a 5xx, or anything else
+// not explicitly classified here) defaults to retryable, same reasoning as
+// that module's fetchPage.
+class ArchiveFetchError extends Error {
+  readonly retryable: boolean;
+
+  constructor(message: string, retryable: boolean) {
+    super(message);
+    this.name = "ArchiveFetchError";
+    this.retryable = retryable;
+  }
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status >= 500 && status < 600;
+}
+
+// This was, until now, the one fetch path in the whole pipeline with NO
+// retry protection -- fetchSocrataRecords.ts's fetchPage (used for the
+// rolling window) already had this. Confirmed as a real, live gap, not a
+// hypothetical: a real production run hit a transient ECONNRESET (undici's
+// "TypeError: terminated" wrapping it) immediately on resuming, and a fresh
+// retry of that same run later died on a 10-second UND_ERR_CONNECT_TIMEOUT
+// after successfully processing 120 more chunks -- both exactly the class
+// of transient, non-4xx failure this retry logic exists to absorb. Same
+// shape as fetchSocrataRecords.ts's fetchPage: one initial attempt plus up
+// to 3 retries, exponential backoff (1s, 2s, 4s).
+export const MAX_ARCHIVE_FETCH_ATTEMPTS = 4;
+const ARCHIVE_FETCH_RETRY_BASE_DELAY_MS = 1000;
+
+async function fetchArchivePageOnce(url: string): Promise<SocrataRecord[]> {
+  const response = await fetch(url, { headers: buildRequestHeaders() });
+
+  if (!response.ok) {
+    throw new ArchiveFetchError(
+      `streamArchiveWithResume: request to ${url} failed with status ${response.status} ${response.statusText}`,
+      isRetryableStatus(response.status),
+    );
+  }
+
+  return (await response.json()) as SocrataRecord[];
+}
+
 async function fetchArchivePage(
   archiveDatasetId: string,
   cursorId: string | null,
@@ -536,13 +584,29 @@ async function fetchArchivePage(
   upperBoundId: string | null = null,
 ): Promise<SocrataRecord[]> {
   const url = buildArchivePageUrl(archiveDatasetId, cursorId, chunkSize, upperBoundId);
-  const response = await fetch(url, { headers: buildRequestHeaders() });
 
-  if (!response.ok) {
-    throw new Error(`streamArchiveWithResume: request to ${url} failed with status ${response.status} ${response.statusText}`);
+  for (let attempt = 1; attempt <= MAX_ARCHIVE_FETCH_ATTEMPTS; attempt++) {
+    try {
+      return await fetchArchivePageOnce(url);
+    } catch (err) {
+      const retryable = !(err instanceof ArchiveFetchError) || err.retryable;
+      const isLastAttempt = attempt === MAX_ARCHIVE_FETCH_ATTEMPTS;
+      if (!retryable || isLastAttempt) {
+        throw err;
+      }
+
+      const delayMs = ARCHIVE_FETCH_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+      const reason = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `streamArchiveWithResume: attempt ${attempt}/${MAX_ARCHIVE_FETCH_ATTEMPTS} failed to fetch archive page (${reason}); retrying in ${delayMs}ms`,
+      );
+      await sleep(delayMs);
+    }
   }
 
-  return (await response.json()) as SocrataRecord[];
+  // Unreachable: the loop above always either returns a page or throws on
+  // its final iteration.
+  throw new Error("streamArchiveWithResume: fetchArchivePage exhausted retries without a resolved result");
 }
 
 // Socrata's own per-row system identifier (e.g. "row-km8v~rgdh.iue6"),

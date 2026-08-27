@@ -6,6 +6,7 @@ import {
   DEFAULT_STREAM_CHUNK_SIZE,
   fetchAccumulatorBuckets,
   fetchArchiveStreamCheckpoint,
+  MAX_ARCHIVE_FETCH_ATTEMPTS,
   MAX_SNAPSHOT_WRITE_ATTEMPTS,
   saveArchiveStreamAccumulatorSnapshot,
   saveArchiveStreamPosition,
@@ -272,6 +273,20 @@ function makeRecords(count: number, idPrefix: string): SocrataRecord[] {
     ":id": `row-${idPrefix}-${i}`,
     occupancydatetime: "2025-06-10T09:00:00",
   }));
+}
+
+// Simulates a response whose status line succeeded (fetch() itself
+// resolved, response.ok is true) but whose body stream then dropped mid-read
+// -- the real shape of the live-observed "TypeError: terminated" /
+// ECONNRESET failure, which happens strictly after a successful fetch(). See
+// fetchSocrataRecords.test.ts's identical helper for the same reasoning.
+function brokenBodyResponse(): Response {
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    json: () => Promise.reject(new TypeError("terminated")),
+  } as Response;
 }
 
 describe("fetchArchiveStreamCheckpoint", () => {
@@ -1287,24 +1302,10 @@ describe("streamArchiveWithResume", () => {
     ).rejects.toThrow(/missing a valid :id field/);
   });
 
-  it("throws rather than continuing on a non-200 Socrata response", async () => {
-    const { clients } = makeMockClients({ existingCheckpointRow: null });
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse([], {
-        ok: false,
-        status: 503,
-        statusText: "Service Unavailable",
-      }),
-    );
-
-    await expect(
-      streamArchiveWithResume(clients, {
-        archiveDatasetId: ARCHIVE_DATASET_ID,
-        chunkSize: 50,
-        onChunk: () => ({}),
-      }),
-    ).rejects.toThrow(/503/);
-  });
+  // A non-retryable (4xx) non-200 response is covered by "fails immediately
+  // on a 404, without retrying" below, now that a 5xx (the case this test
+  // used to cover) retries instead of failing on the first attempt -- see
+  // "retry-with-backoff on transient archive-page fetch failures".
 
   // Real end-to-end proof of backfill-occupancy-stats.ts's --max-chunks
   // semantics, wired together exactly as main() wires them (real
@@ -1495,6 +1496,125 @@ describe("streamArchiveWithResume", () => {
       expect(progressLines[1]?.[0]).toContain(
         `${1000 + totalChunks * 2} total readings processed`,
       );
+    });
+  });
+
+  // Until now, this was the one fetch path in the whole pipeline with NO
+  // retry protection -- fetchSocrataRecords.ts's fetchPage (the
+  // rolling-window fetch) already had it. Confirmed as a real, live gap:
+  // a production run hit a transient ECONNRESET immediately on resuming,
+  // and a retry of that same run later died on a connect timeout after
+  // successfully processing 120 more chunks. These tests mirror
+  // fetchSocrataRecords.test.ts's own "retry-with-backoff on transient
+  // failures" coverage as closely as this module's shape allows --
+  // fetchArchivePage itself isn't exported (an internal implementation
+  // detail, same as fetchPage there), so every case here goes through the
+  // real, public streamArchiveWithResume entry point.
+  describe("retry-with-backoff on transient archive-page fetch failures", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    it("retries a page that fails once (network error) then succeeds on retry", async () => {
+      const { clients } = makeMockClients({ existingCheckpointRow: null });
+      fetchMock
+        .mockRejectedValueOnce(new TypeError("fetch failed"))
+        .mockResolvedValueOnce(jsonResponse(makeRecords(2, "a")));
+      const chunks: SocrataRecord[][] = [];
+
+      const resultPromise = streamArchiveWithResume(clients, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        chunkSize: 50,
+        onChunk: (records) => {
+          chunks.push(records);
+          return {};
+        },
+      });
+      await vi.runAllTimersAsync();
+      await resultPromise;
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]).toHaveLength(2);
+    });
+
+    it("retries a body-read failure (connection dropped mid-stream after a 200) and succeeds on retry, logging the attempt", async () => {
+      const consoleWarnSpy = vi
+        .spyOn(console, "warn")
+        .mockImplementation(() => {});
+      const { clients } = makeMockClients({ existingCheckpointRow: null });
+      fetchMock
+        .mockResolvedValueOnce(brokenBodyResponse())
+        .mockResolvedValueOnce(jsonResponse(makeRecords(1, "b")));
+
+      const resultPromise = streamArchiveWithResume(clients, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        chunkSize: 50,
+        onChunk: () => ({}),
+      });
+      await vi.runAllTimersAsync();
+      await resultPromise;
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const warnLines = consoleWarnSpy.mock.calls.map((call) => String(call[0]));
+      expect(
+        warnLines.some((line) => line.includes("attempt 1") && line.includes("terminated") && line.includes("retrying in 1000ms")),
+      ).toBe(true);
+    });
+
+    it("retries a transient 503 and succeeds once the next attempt goes through", async () => {
+      const { clients } = makeMockClients({ existingCheckpointRow: null });
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse([], { ok: false, status: 503, statusText: "Service Unavailable" }))
+        .mockResolvedValueOnce(jsonResponse(makeRecords(2, "c")));
+
+      const resultPromise = streamArchiveWithResume(clients, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        chunkSize: 50,
+        onChunk: () => ({}),
+      });
+      await vi.runAllTimersAsync();
+      await resultPromise;
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("fails immediately on a 404, without retrying", async () => {
+      const { clients } = makeMockClients({ existingCheckpointRow: null });
+      fetchMock.mockResolvedValueOnce(jsonResponse([], { ok: false, status: 404, statusText: "Not Found" }));
+
+      await expect(
+        streamArchiveWithResume(clients, {
+          archiveDatasetId: ARCHIVE_DATASET_ID,
+          chunkSize: 50,
+          onChunk: () => ({}),
+        }),
+      ).rejects.toThrow(/404/);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("surfaces a clear final error after exhausting all retries on a sustained outage", async () => {
+      const { clients } = makeMockClients({ existingCheckpointRow: null });
+      fetchMock.mockResolvedValue(jsonResponse([], { ok: false, status: 503, statusText: "Service Unavailable" }));
+
+      const assertion = expect(
+        streamArchiveWithResume(clients, {
+          archiveDatasetId: ARCHIVE_DATASET_ID,
+          chunkSize: 50,
+          onChunk: () => ({}),
+        }),
+      ).rejects.toThrow(/503/);
+      await vi.runAllTimersAsync();
+      await assertion;
+
+      // Initial attempt plus every retry, no more -- confirms the backoff
+      // loop actually stops instead of retrying forever.
+      expect(fetchMock).toHaveBeenCalledTimes(MAX_ARCHIVE_FETCH_ATTEMPTS);
     });
   });
 });
