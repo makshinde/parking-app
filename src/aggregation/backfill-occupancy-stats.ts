@@ -611,6 +611,42 @@ export class MaxChunksReachedError extends Error {
   }
 }
 
+export interface BoundedOnChunk {
+  onChunk: (records: SocrataRecord[]) => AccumulatorSnapshot;
+  getChunksProcessed: () => number;
+}
+
+// Wraps a real per-chunk fold callback with --max-chunks bookkeeping.
+// chunksProcessed is a counter local to THIS call, always starting at 0 --
+// this is what makes --max-chunks count chunks processed by the CURRENT
+// invocation (additive from wherever streamArchiveWithResume resumes),
+// never a cumulative total tracked across separate runs. There is no
+// persisted "total chunks processed" counter anywhere in this design for
+// it to check against instead: this script is invoked fresh via `node`/npm
+// each time (see CLAUDE.md's Architecture section), so a resumed run
+// (chunksProcessed starting at 0 again) with --max-chunks=300 processes
+// 300 MORE chunks on top of whatever a prior run already committed to the
+// checkpoint, not 300 total since the archive was first started.
+export function createMaxChunksOnChunk(
+  maxChunks: number | null,
+  fold: (records: SocrataRecord[]) => AccumulatorSnapshot,
+): BoundedOnChunk {
+  let chunksProcessed = 0;
+
+  const onChunk = (records: SocrataRecord[]): AccumulatorSnapshot => {
+    chunksProcessed += 1;
+    const snapshot = fold(records);
+
+    if (maxChunks !== null && chunksProcessed >= maxChunks) {
+      throw new MaxChunksReachedError(chunksProcessed);
+    }
+
+    return snapshot;
+  };
+
+  return { onChunk, getChunksProcessed: () => chunksProcessed };
+}
+
 export async function main(): Promise<void> {
   const { maxChunks } = parseCliOptions(process.argv.slice(2));
   console.log(maxChunks === null ? "Running the full backfill." : `Running a bounded test: stopping after ${maxChunks} archive chunk(s).`);
@@ -661,7 +697,13 @@ export async function main(): Promise<void> {
       : `Fresh run: folded the rolling window into ${accumulators.size} buckets (${totalParseFailures} unparseable, ${totalUnmatched} unmatched so far).`,
   );
 
-  let chunksProcessed = 0;
+  const { onChunk } = createMaxChunksOnChunk(maxChunks, (records) => {
+    const result = foldReadingsIntoAccumulators(records, accumulators, lookup, now);
+    totalUnmatched += result.unmatchedCount;
+    totalParseFailures += result.parseFailures;
+    return Object.fromEntries(accumulators);
+  });
+
   try {
     await streamArchiveWithResume({ checkpointClient, bucketsClient: accumulatorBucketsClient }, {
       archiveDatasetId,
@@ -669,19 +711,7 @@ export async function main(): Promise<void> {
         const restoredCount = mergeAccumulatorSnapshot(accumulators, snapshot);
         console.log(`Restored ${restoredCount} buckets from an existing checkpoint (${accumulators.size} total after merging with any rolling-window fold).`);
       },
-      onChunk: (records) => {
-        chunksProcessed += 1;
-        const result = foldReadingsIntoAccumulators(records, accumulators, lookup, now);
-        totalUnmatched += result.unmatchedCount;
-        totalParseFailures += result.parseFailures;
-        const snapshot = Object.fromEntries(accumulators);
-
-        if (maxChunks !== null && chunksProcessed >= maxChunks) {
-          throw new MaxChunksReachedError(chunksProcessed);
-        }
-
-        return snapshot;
-      },
+      onChunk,
     });
   } catch (error) {
     if (!(error instanceof MaxChunksReachedError)) {
