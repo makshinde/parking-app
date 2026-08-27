@@ -17,6 +17,7 @@ import {
   addReading,
   createEmptyAccumulator,
 } from "./incrementalWeightedStats.ts";
+import { createMaxChunksOnChunk, MaxChunksReachedError } from "./backfill-occupancy-stats.ts";
 import type { SocrataRecord } from "../utils/fetchSocrataRecords.ts";
 import type {
   AccumulatorSnapshot,
@@ -1303,6 +1304,87 @@ describe("streamArchiveWithResume", () => {
         onChunk: () => ({}),
       }),
     ).rejects.toThrow(/503/);
+  });
+
+  // Real end-to-end proof of backfill-occupancy-stats.ts's --max-chunks
+  // semantics, wired together exactly as main() wires them (real
+  // streamArchiveWithResume + real createMaxChunksOnChunk, sharing the same
+  // persisted checkpoint across two SEPARATE invocations, the same way two
+  // separate `node`/npm process runs would share the same real database
+  // row). snapshotIntervalChunks: 1 keeps every completed chunk's snapshot
+  // cursor caught up with its position cursor, so a resume never triggers
+  // gap-replay here -- gap-replay chunks legitimately also count toward
+  // --max-chunks (onChunk fires for them too, per this module's own
+  // contract), which is real and correct but a separate concern from the
+  // one this test isolates: does --max-chunks count fresh per invocation
+  // (correct, intended) or toward a total accumulated across runs (would be
+  // a bug)?
+  it("--max-chunks counts chunks processed by THIS invocation only: a run resuming from an existing checkpoint gets its own full --max-chunks budget of MORE chunks, not a budget reduced by chunks a prior run already committed", async () => {
+    const { clients } = makeMockClients({ existingCheckpointRow: null });
+
+    // A synthetic, effectively endless archive: each request's cursor
+    // determines exactly the single next row id, so two separate
+    // streamArchiveWithResume calls sharing `clients` naturally continue
+    // from wherever the checkpoint left off, just like a real resume would.
+    fetchMock.mockImplementation(async (url: string) => {
+      const where = new URL(url).searchParams.get("$where") ?? "";
+      const match = /:id > '(\d+)'/.exec(where);
+      const cursorNum = match?.[1] !== undefined ? Number(match[1]) : 0;
+      return jsonResponse([
+        { ":id": String(cursorNum + 1).padStart(10, "0") },
+      ]);
+    });
+
+    async function runOneInvocation(maxChunks: number): Promise<number> {
+      const { onChunk, getChunksProcessed } = createMaxChunksOnChunk(
+        maxChunks,
+        () => ({}),
+      );
+      try {
+        await streamArchiveWithResume(clients, {
+          archiveDatasetId: ARCHIVE_DATASET_ID,
+          chunkSize: 1,
+          snapshotIntervalChunks: 1,
+          onChunk,
+        });
+      } catch (err) {
+        if (!(err instanceof MaxChunksReachedError)) {
+          throw err;
+        }
+      }
+      return getChunksProcessed();
+    }
+
+    // First invocation: a fresh run, --max-chunks=150.
+    const firstRunChunks = await runOneInvocation(150);
+    expect(firstRunChunks).toBe(150);
+    const checkpointAfterFirstRun = await fetchArchiveStreamCheckpoint(
+      clients.checkpointClient,
+      ARCHIVE_DATASET_ID,
+    );
+    // The chunk that triggers MaxChunksReachedError throws before its own
+    // position is saved (thrown from inside onChunk, before
+    // saveArchiveStreamPosition runs) -- an accepted, documented gap for
+    // this testing-only flag (see MaxChunksReachedError's own comment in
+    // backfill-occupancy-stats.ts), so the durably checkpointed position
+    // after "150 chunks processed" is chunk 149's, not chunk 150's.
+    expect(checkpointAfterFirstRun?.lastProcessedId).toBe("0000000149");
+
+    // Second invocation: a separate call (a fresh createMaxChunksOnChunk,
+    // simulating a fresh process resuming from the checkpoint above) with
+    // --max-chunks=300. If this budget were instead measured toward an
+    // absolute total across both runs, this run would stop after only 150
+    // more chunks (150 already done + 150 more = 300) -- it must not.
+    const secondRunChunks = await runOneInvocation(300);
+    expect(secondRunChunks).toBe(300);
+    const checkpointAfterSecondRun = await fetchArchiveStreamCheckpoint(
+      clients.checkpointClient,
+      ARCHIVE_DATASET_ID,
+    );
+    // 149 (first run's committed position) + 299 (second run's 299
+    // successfully committed chunks, its 300th throwing before its own
+    // commit, same accepted gap as above) = 448.
+    expect(checkpointAfterSecondRun?.lastProcessedId).toBe("0000000448");
   });
 
   describe("archive-streaming progress logging", () => {

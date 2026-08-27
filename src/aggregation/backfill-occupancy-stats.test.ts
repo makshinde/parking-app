@@ -2,10 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   analyzeClampedOccupancy,
   buildAccumulatorBucketKey,
+  createMaxChunksOnChunk,
   foldReadingsIntoAccumulators,
   initializeAccumulators,
   logBucketFailure,
   MAX_RETRY_COUNT,
+  MaxChunksReachedError,
   mergeAccumulatorSnapshot,
   parseAccumulatorBucketKey,
   parseCliOptions,
@@ -43,6 +45,63 @@ describe("parseCliOptions", () => {
 
   it("throws for a non-integer value", () => {
     expect(() => parseCliOptions(["--max-chunks=2.5"])).toThrow(/must be a positive integer/);
+  });
+});
+
+// --- createMaxChunksOnChunk ----------------------------------------------
+
+describe("createMaxChunksOnChunk", () => {
+  it("never throws when maxChunks is null, regardless of how many chunks are processed", () => {
+    const { onChunk, getChunksProcessed } = createMaxChunksOnChunk(null, () => ({}));
+    for (let i = 0; i < 500; i++) {
+      expect(() => onChunk([])).not.toThrow();
+    }
+    expect(getChunksProcessed()).toBe(500);
+  });
+
+  it("calls the inner fold callback and returns its result on every chunk, including the last one before throwing", () => {
+    const fold = vi.fn((records: SocrataRecord[]) => ({ [`bucket-${records.length}`]: { count: 1, totalWeight: 1, mean: 0, sumSquaredDiff: 0 } }));
+    const { onChunk } = createMaxChunksOnChunk(2, fold);
+
+    expect(onChunk([{}])).toEqual({ "bucket-1": { count: 1, totalWeight: 1, mean: 0, sumSquaredDiff: 0 } });
+    expect(() => onChunk([{}, {}])).toThrow(MaxChunksReachedError);
+    expect(fold).toHaveBeenCalledTimes(2);
+  });
+
+  it("throws MaxChunksReachedError exactly on the maxChunks-th call, not before or after", () => {
+    const { onChunk, getChunksProcessed } = createMaxChunksOnChunk(3, () => ({}));
+    expect(() => onChunk([])).not.toThrow();
+    expect(() => onChunk([])).not.toThrow();
+    expect(() => onChunk([])).toThrow(MaxChunksReachedError);
+    expect(getChunksProcessed()).toBe(3);
+  });
+
+  // This is the exact --max-chunks resume scenario: each createMaxChunksOnChunk
+  // call represents one process invocation of backfill-occupancy-stats.ts
+  // (main() calls this exactly once per run -- see main()'s own comment).
+  // A resumed run gets a BRAND NEW counter starting at 0, with no memory of
+  // how many chunks a prior run already committed to the checkpoint -- that
+  // is what makes --max-chunks=300 on a resumed run process 300 MORE chunks
+  // on top of whatever was already done, landing at (prior total + 300)
+  // overall, rather than stopping once the grand total across all runs
+  // reaches 300.
+  it("counts additively from a fresh start on each new invocation, never toward a cumulative total across separate runs", () => {
+    const firstRun = createMaxChunksOnChunk(150, () => ({}));
+    for (let i = 0; i < 149; i++) {
+      expect(() => firstRun.onChunk([])).not.toThrow();
+    }
+    expect(() => firstRun.onChunk([])).toThrow(MaxChunksReachedError);
+    expect(firstRun.getChunksProcessed()).toBe(150);
+
+    // A second, independent invocation (simulating a fresh `node`/npm
+    // process resuming from the checkpoint the first run left behind) gets
+    // its own --max-chunks=300 budget in full, not "150 more to reach 300".
+    const secondRun = createMaxChunksOnChunk(300, () => ({}));
+    for (let i = 0; i < 299; i++) {
+      expect(() => secondRun.onChunk([])).not.toThrow();
+    }
+    expect(() => secondRun.onChunk([])).toThrow(MaxChunksReachedError);
+    expect(secondRun.getChunksProcessed()).toBe(300);
   });
 });
 
