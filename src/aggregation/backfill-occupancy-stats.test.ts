@@ -525,19 +525,27 @@ describe("logBucketFailure", () => {
 function createMockOccupancyStatsClient(failForBlockfaceIds: Set<string> = new Set()) {
   const upsertCalls: Record<string, unknown>[] = [];
   const upsertCallBatchSizes: number[] = [];
+  // This mock only ever exercises upsertOccupancyStats' single-row path
+  // (via runRetryPass below), which never chains .select() -- the no-op
+  // select() here exists only to satisfy OccupancyStatsSupabaseTableBuilder's
+  // shape, not because any test in this describe block calls it.
   const client: OccupancyStatsSupabaseClient = {
-    from: () => ({
-      upsert: async (rowOrRows: Record<string, unknown> | Record<string, unknown>[]) => {
-        const rows = Array.isArray(rowOrRows) ? rowOrRows : [rowOrRows];
-        upsertCallBatchSizes.push(rows.length);
-        const failingRow = rows.find((row) => failForBlockfaceIds.has(row.blockface_id as string));
-        if (failingRow !== undefined) {
-          return { data: null, error: { message: `simulated failure for ${failingRow.blockface_id}` } };
-        }
-        upsertCalls.push(...rows);
-        return { data: null, error: null };
-      },
-    }),
+    from: () =>
+      ({
+        upsert: (rowOrRows: Record<string, unknown> | Record<string, unknown>[]) => {
+          const rows = Array.isArray(rowOrRows) ? rowOrRows : [rowOrRows];
+          upsertCallBatchSizes.push(rows.length);
+          const failingRow = rows.find((row) => failForBlockfaceIds.has(row.blockface_id as string));
+          const result =
+            failingRow !== undefined
+              ? { data: null, error: { message: `simulated failure for ${failingRow.blockface_id}` } }
+              : (upsertCalls.push(...rows), { data: null, error: null });
+          return {
+            then: (resolve: (value: typeof result) => unknown, reject?: (reason: unknown) => unknown) => Promise.resolve(result).then(resolve, reject),
+            select: () => Promise.resolve({ data: null, error: null }),
+          };
+        },
+      }) as unknown as ReturnType<OccupancyStatsSupabaseClient["from"]>,
   };
   return { client, upsertCalls, upsertCallBatchSizes };
 }
