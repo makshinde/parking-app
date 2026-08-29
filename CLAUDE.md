@@ -446,6 +446,24 @@ function can have multiple kinds of input.
   existing clamp-to-1.0 handling (see src/aggregation/calculateOccupancyRatio.ts)
   is correct and sufficient regardless of which mechanism, if any, turns
   out to explain the overages.
+- After the final, complete backfill run and reconcile-occupancy-stats.ts
+  pass (both using the now-verified upsertOccupancyStatsBatch write path --
+  see that function's own comment for the real, live-confirmed silent-
+  write-failure bug it was built to catch), a systematic comparison of
+  every occupancy_stats row against its corresponding live
+  archive_stream_accumulator_buckets row found exactly 1 stale row out of
+  105,608 (99.999% clean). The row: blockface d3049893-f92b-432f-9a6d-
+  637837e8793b, day 1, hour 15, sitting right at the
+  MIN_READINGS_PER_BUCKET (30) threshold. occupancy_stats showed
+  sample_count=30 (written moments earlier by reconcile-occupancy-stats.ts,
+  meaning the accumulator row genuinely held count=30 at the moment it was
+  read); an independent re-read of the same accumulator row moments later
+  showed count=29 -- a decrease, which shouldn't be possible under the
+  current design (WeightedStatsAccumulator.count is only ever incremented,
+  never decremented, by addReading). Not investigated further given the
+  scale (1 row) -- worth revisiting only if this exact pattern (a live
+  accumulator count decreasing between two reads with no run actively
+  writing) ever recurs at meaningful scale.
 
 ## Out of scope (v1)
 
