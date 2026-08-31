@@ -6,6 +6,7 @@ import type { SupabaseQueryResult } from "../importers/upsertBlockface.ts";
 import { resolveYearlyArchiveDatasetId, getPriorYear } from "./resolveYearlyArchive.ts";
 import {
   buildBlockfaceLookup,
+  getPacificCalendarYear,
   normalizeReading,
   type RawReading,
   type BlockfaceLookupSupabaseClient,
@@ -169,6 +170,10 @@ export function foldReadingsIntoAccumulators(
 ): FoldReadingsResult {
   let unmatchedCount = 0;
   let parseFailures = 0;
+  // Loop-invariant -- "now" is the same instant for every record in this
+  // chunk, so its Pacific calendar year only needs resolving once per call,
+  // not once per record (see getPacificCalendarYear's own comment).
+  const currentYear = getPacificCalendarYear(now);
 
   for (const record of records) {
     let reading: RawReading;
@@ -186,7 +191,7 @@ export function foldReadingsIntoAccumulators(
     }
 
     const bucketKey = buildAccumulatorBucketKey(result.blockfaceId, result.isoDay, result.hour);
-    const weight = calculateRecencyWeight(result.ageInDays);
+    const weight = calculateRecencyWeight(result.ageInDays, result.readingYear, currentYear);
     const existing = accumulators.get(bucketKey) ?? createEmptyAccumulator();
     accumulators.set(bucketKey, addReading(existing, result.occupancyRatio, weight));
   }

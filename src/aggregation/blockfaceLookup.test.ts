@@ -3,6 +3,7 @@ import {
   buildBlockfaceLookup,
   buildLookupKey,
   extractIsoDayAndHour,
+  getPacificCalendarYear,
   normalizeReading,
 } from "./blockfaceLookup";
 import type { BlockfaceLookupRow, BlockfaceLookupSupabaseClient, RawReading } from "./blockfaceLookup";
@@ -149,6 +150,7 @@ describe("normalizeReading", () => {
       hour: 17,
       ageInDays: 3,
       occupancyRatio: 0.75, // 6 / 8
+      readingYear: 2026,
     });
   });
 
@@ -272,6 +274,47 @@ describe("normalizeReading", () => {
     expect((summerResult1 as { ageInDays: number }).ageInDays).toBeCloseTo(3, 10);
     expect((winterResult as { ageInDays: number }).ageInDays).toBeCloseTo(5, 10);
     expect(summerResult1).toEqual(summerResult2);
+  });
+
+  // readingYear feeds calculateRecencyWeight's exact-year-match gate
+  // (recencyWeight.ts) -- read directly off the naive wall-clock components
+  // parsed from occupancyDateTime, not derived from ageInDays or "now" in
+  // any way, so it stays correct even right at a year boundary regardless
+  // of how old the reading is relative to "now".
+  it("reads readingYear directly from the reading's own recorded date, independent of ageInDays or now's year", () => {
+    const lookup = new Map([["81189:NW", "blockface-1"]]);
+    const reading = makeReading({ occupancyDateTime: "2025-12-31T23:00:00.000" });
+    // now is well into the following year -- readingYear must still reflect
+    // 2025 (the reading's own year), not get pulled toward now's year.
+    const now = new Date("2026-08-02T17:38:00.000-07:00");
+
+    const result = normalizeReading(reading, lookup, now);
+
+    expect(result.matched).toBe(true);
+    expect((result as { readingYear: number }).readingYear).toBe(2025);
+  });
+});
+
+describe("getPacificCalendarYear", () => {
+  it("returns the Pacific-local calendar year for a UTC instant that's still the previous Pacific day/year", () => {
+    // 2026-01-01T02:00:00Z is 2025-12-31T18:00:00 Pacific (PST, UTC-8) --
+    // still December 31, 2025 in Pacific local time, despite already being
+    // January 1st in UTC. A naive .getUTCFullYear() or a local-timezone
+    // .getFullYear() (dependent on the host machine's own timezone) would
+    // both risk giving 2026 here; only a genuine Pacific-timezone resolution
+    // gives the correct 2025.
+    const instant = new Date("2026-01-01T02:00:00.000Z");
+    expect(getPacificCalendarYear(instant)).toBe(2025);
+  });
+
+  it("returns the correct year for an ordinary, non-boundary instant", () => {
+    const instant = new Date("2026-07-15T20:00:00.000Z"); // clearly midday Pacific in July
+    expect(getPacificCalendarYear(instant)).toBe(2026);
+  });
+
+  it("returns identical results across repeated calls using the same cached formatter", () => {
+    const instant = new Date("2026-03-10T12:00:00.000Z");
+    expect(getPacificCalendarYear(instant)).toBe(getPacificCalendarYear(instant));
   });
 });
 

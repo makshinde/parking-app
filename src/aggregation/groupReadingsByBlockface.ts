@@ -1,4 +1,4 @@
-import { normalizeReading, type RawReading } from "./blockfaceLookup.ts";
+import { getPacificCalendarYear, normalizeReading, type RawReading } from "./blockfaceLookup.ts";
 import { calculateRecencyWeight } from "../scoring/recencyWeight.ts";
 import type { WeightedReading } from "./weightedStats.ts";
 
@@ -22,6 +22,10 @@ export function groupReadingsByBlockface(
 ): GroupReadingsResult {
   const grouped = new Map<string, WeightedReading[]>();
   let unmatchedCount = 0;
+  // Loop-invariant -- "now" is the same instant for every reading in this
+  // batch, so its Pacific calendar year only needs resolving once, not
+  // once per reading (see getPacificCalendarYear's own comment).
+  const currentYear = getPacificCalendarYear(now);
 
   for (const reading of readings) {
     const result = normalizeReading(reading, lookup, now);
@@ -33,7 +37,7 @@ export function groupReadingsByBlockface(
 
     const weightedReading: WeightedReading = {
       value: result.occupancyRatio,
-      weight: calculateRecencyWeight(result.ageInDays),
+      weight: calculateRecencyWeight(result.ageInDays, result.readingYear, currentYear),
     };
 
     const existing = grouped.get(result.blockfaceId);

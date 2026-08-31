@@ -100,6 +100,13 @@ export interface NormalizedReading {
   hour: number;
   ageInDays: number;
   occupancyRatio: number;
+  // The reading's own recorded calendar year, for calculateRecencyWeight's
+  // current-calendar-year component (see that function's own comment).
+  // Read directly off the naive Pacific wall-clock components already
+  // parsed above -- no extra resolution needed, since (unlike ageInDays)
+  // this doesn't involve comparing against an absolute instant, just the
+  // year as recorded.
+  readingYear: number;
 }
 
 export interface UnmatchedReading {
@@ -258,5 +265,27 @@ export function normalizeReading(reading: RawReading, lookup: Map<string, string
 
   const occupancyRatio = calculateOccupancyRatio(reading.paidOccupancy, reading.parkingSpaceCount);
 
-  return { matched: true, blockfaceId, isoDay, hour, ageInDays, occupancyRatio };
+  return { matched: true, blockfaceId, isoDay, hour, ageInDays, occupancyRatio, readingYear: components.year };
+}
+
+// Cached the same way getCachedDateTimeFormat's formatter is (built once,
+// reused) -- a separate formatter/cache since this one extracts a plain
+// calendar year, not a UTC offset, so it needs different Intl options and
+// can't share that function's cache entry. Only ever called once per batch
+// (by this project's own callers, e.g. groupReadingsByBlockface,
+// foldReadingsIntoAccumulators -- "now" is loop-invariant across every
+// reading in one run), not once per reading, so there's no risk of
+// repeating the OOM-prone mistake documented above.
+let pacificYearFormatter: Intl.DateTimeFormat | undefined;
+
+// "now"'s calendar year, Pacific-local -- the counterpart to readingYear
+// above, needed for calculateRecencyWeight's exact-year-match gate. "now"
+// is an absolute instant (unlike a reading's own naive wall-clock string),
+// so getting its Pacific calendar year genuinely requires this Intl
+// resolution, the same reasoning resolveOccupancyInstant uses for ageInDays.
+export function getPacificCalendarYear(instant: Date): number {
+  if (pacificYearFormatter === undefined) {
+    pacificYearFormatter = new Intl.DateTimeFormat("en-US", { timeZone: SOURCE_TIME_ZONE, year: "numeric" });
+  }
+  return Number(pacificYearFormatter.format(instant));
 }
