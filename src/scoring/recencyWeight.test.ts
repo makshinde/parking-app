@@ -66,7 +66,17 @@ describe("calculateRecencyWeight", () => {
 
   // --- Current-calendar-year component ------------------------------------
 
+  // The baseline every guarantee test below is measured against: a
+  // prior-year reading sitting exactly on its seasonal peak (age 365,
+  // distance 0 from the anniversary). Computed once, precisely, rather than
+  // repeated as a hand-rounded literal in every test.
+  const SEASONAL_PEAK_BASELINE = calculateRecencyWeight(365, PRIOR_YEAR, CURRENT_YEAR);
+
   describe("current-calendar-year component", () => {
+    it("SEASONAL_PEAK_BASELINE is the real, precise value every guarantee below is measured against", () => {
+      expect(SEASONAL_PEAK_BASELINE).toBeCloseTo(0.75005, 5);
+    });
+
     it("gives a current-year, ~90-day-old reading meaningfully more combined weight than the two-component formula alone would", () => {
       // Old 2-component baseline at age 90 (prior year, so the new
       // component is inert): recency = 2^(-90/30) = 0.125, seasonal =
@@ -76,14 +86,16 @@ describe("calculateRecencyWeight", () => {
       expect(baseline).toBeCloseTo(0.13525, 5);
 
       // Same age, but the reading is now from the CURRENT year: the new
-      // component contributes 2^(-90/120) = 0.59460 on its own, combined via
-      // the same probabilistic-OR as the other two:
-      // combine(0.13525, 0.59460) = 0.13525 + 0.59460 - 0.13525*0.59460 = 0.64944.
+      // component contributes CURRENT_YEAR_PEAK_WEIGHT * 2^(-90/120) =
+      // 4.0 * 0.59460 = 2.37841 on its own (deliberately > 1 -- see
+      // recencyWeight.ts's own comment), combined via the same
+      // probabilistic-OR as the other two: combine(0.13525, 2.37841) =
+      // 0.13525 + 2.37841 - 0.13525*2.37841 = 2.19198.
       const currentYearWeight = calculateRecencyWeight(90, CURRENT_YEAR, CURRENT_YEAR);
-      expect(currentYearWeight).toBeCloseTo(0.64944, 4);
+      expect(currentYearWeight).toBeCloseTo(2.19198, 4);
 
-      // "Meaningfully more" -- over 4x the baseline, not a marginal bump.
-      expect(currentYearWeight).toBeGreaterThan(baseline * 4);
+      // "Meaningfully more" -- over 16x the baseline, not a marginal bump.
+      expect(currentYearWeight).toBeGreaterThan(baseline * 16);
     });
 
     // The critical test: an identical age, but from a PRIOR year, must NOT
@@ -95,12 +107,14 @@ describe("calculateRecencyWeight", () => {
       const currentYearWeight = calculateRecencyWeight(90, CURRENT_YEAR, CURRENT_YEAR);
 
       // Exactly the 2-component result -- the current-year component
-      // resolved to precisely 0, not just "smaller".
+      // resolved to precisely 0, not just "smaller". This value is
+      // unchanged by CURRENT_YEAR_PEAK_WEIGHT entirely -- raising that
+      // constant moves current-year weights, never prior-year ones.
       expect(priorYearWeight).toBeCloseTo(0.13525, 5);
       expect(priorYearWeight).toBeLessThan(currentYearWeight);
     });
 
-    it("still resolves a 400+ day old prior-year reading through the seasonal component alone, unaffected by the new component", () => {
+    it("still resolves a 400+ day old prior-year reading through the seasonal component alone, unaffected by the new component or its peak weight", () => {
       // distanceToNearestYear(400) = min(400 % 365, 365 - 400 % 365) =
       // min(35, 330) = 35. seasonal = 0.75 * 2^(-35/15) = 0.75 * 0.19842 =
       // 0.14881. recency(400) = 2^(-400/30) is negligible (~0.0000968).
@@ -112,9 +126,11 @@ describe("calculateRecencyWeight", () => {
       // impossible real-world combination -- a reading can't be 400 days
       // old AND from the current year -- but useful to isolate exactly how
       // much the gate alone changes the result): the current-year component
-      // would still contribute 2^(-400/120) = 0.09921 if it applied, which
-      // is NOT what a genuine prior-year reading at this age gets.
+      // would still contribute 4.0 * 2^(-400/120) = 0.39685 if it applied,
+      // giving a combined 0.48666 -- NOT what a genuine prior-year reading
+      // at this age gets.
       const wouldBeIfGated = calculateRecencyWeight(400, CURRENT_YEAR, CURRENT_YEAR);
+      expect(wouldBeIfGated).toBeCloseTo(0.48666, 4);
       expect(wouldBeIfGated).toBeGreaterThan(priorYearFarBack);
 
       // The actual prior-year case matches what calculateRecencyWeight
@@ -129,16 +145,55 @@ describe("calculateRecencyWeight", () => {
       // not as a fallback only consulted at larger ages.
       const priorYearFresh = calculateRecencyWeight(1, PRIOR_YEAR, CURRENT_YEAR);
       const currentYearFresh = calculateRecencyWeight(1, CURRENT_YEAR, CURRENT_YEAR);
-      // Both already near 1 from the recency component alone, so the two
-      // are close -- but the current-year one must still be >= the prior-year
-      // one, never less, confirming the component never subtracts weight.
-      expect(currentYearFresh).toBeGreaterThanOrEqual(priorYearFresh);
+      expect(priorYearFresh).toBeLessThan(1);
+      // The current-year one now genuinely exceeds 1 -- CURRENT_YEAR_PEAK_WEIGHT
+      // (4.0) makes the raw current-year component at 1 day old (~3.977)
+      // large enough to push the combined result above 1, unlike the old
+      // (peak=1.0) design where every value stayed capped at 1.
+      expect(currentYearFresh).toBeGreaterThan(1);
+      expect(currentYearFresh).toBeGreaterThan(priorYearFresh);
     });
 
-    it("never produces a value outside [0, 1] even at the current-year component's peak (age 0)", () => {
-      const weight = calculateRecencyWeight(0, CURRENT_YEAR, CURRENT_YEAR);
-      expect(weight).toBeLessThanOrEqual(1);
-      expect(weight).toBeGreaterThan(0);
+    // At exactly age=0, recency(0) = 2^0 = 1 exactly, and combine(1, y) =
+    // 1 + y - y = 1 for ANY y -- so the very first combine (recency with
+    // seasonal) already saturates the result to exactly 1, before the
+    // current-year component (however large) ever gets a chance to push it
+    // higher. This is a genuine, hand-verifiable invariant, not a design
+    // limitation: the current-year component's real effect shows up at any
+    // age > 0, once recency itself is no longer exactly 1 (see the age=1
+    // test above, where the combined result already exceeds 1).
+    it("resolves to exactly 1 at age=0, regardless of year or peak weight, since recency(0) itself already saturates the combine", () => {
+      expect(calculateRecencyWeight(0, PRIOR_YEAR, CURRENT_YEAR)).toBe(1);
+      expect(calculateRecencyWeight(0, CURRENT_YEAR, CURRENT_YEAR)).toBe(1);
+    });
+
+    // The guarantee this whole component's peak weight was solved for: even
+    // the oldest current-year reading expected in practice (~270 days, the
+    // age Q1 2026 data reaches roughly three-quarters through the year)
+    // must still outweigh a prior-year reading sitting exactly on its
+    // seasonal peak -- the strongest possible prior-year competitor.
+    it("guarantees a ~270-day-old current-year reading (the oldest realistic case) outweighs a prior-year reading exactly at its seasonal peak", () => {
+      const oldestRealisticCurrentYear = calculateRecencyWeight(270, CURRENT_YEAR, CURRENT_YEAR);
+      expect(oldestRealisticCurrentYear).toBeCloseTo(0.84268, 4);
+      expect(oldestRealisticCurrentYear).toBeGreaterThan(SEASONAL_PEAK_BASELINE);
+    });
+
+    // The same guarantee, confirmed at every distance requested, not just
+    // the worst-case edge -- current-year data must structurally outweigh
+    // the strongest possible prior-year competitor everywhere in this
+    // range, not only right at the boundary it was solved for.
+    it.each([
+      [30, 1.96021],
+      [90, 2.19198],
+      [150, 1.66000],
+      [240, 1.0], // mathematically exact (4.0 * 2^(-240/120) = 1.0, and combine(x, 1) = 1 for any x)
+      // but not floating-point bit-exact (live-checked: 0.9999999999999999,
+      // 1 ULP off) -- toBeCloseTo below, not toBe, is deliberate here.
+      [270, 0.84268],
+    ])("current-year weight at age=%i days (%f) exceeds the seasonal-peak baseline", (age, expected) => {
+      const weight = calculateRecencyWeight(age, CURRENT_YEAR, CURRENT_YEAR);
+      expect(weight).toBeCloseTo(expected, 4);
+      expect(weight).toBeGreaterThan(SEASONAL_PEAK_BASELINE);
     });
   });
 });
