@@ -9,23 +9,36 @@ const DAYS_PER_YEAR = 365;
 
 // Half-life for the current-calendar-year component (see
 // calculateCurrentYearComponent below). Chosen from real computed values
-// across the requested 90-120 day candidate range -- at age 90 (this
-// component's own headline test case), each candidate's raw decay value is:
-//   HL=90:  2^(-90/90)  = 0.5000
-//   HL=100: 2^(-90/100) = 0.5359
-//   HL=110: 2^(-90/110) = 0.5672
-//   HL=120: 2^(-90/120) = 0.5946
-// and the resulting full 3-component combined weight at age 90 (vs. the old
-// 2-component baseline of 0.13525 at that age) is:
-//   HL=90:  0.56763 (4.20x baseline)
-//   HL=100: 0.59866 (4.43x baseline)
-//   HL=110: 0.62570 (4.63x baseline)
-//   HL=120: 0.64944 (4.80x baseline)
-// All four are a meaningful, comparable improvement over the baseline --
-// this isn't a knife-edge choice sensitive to the exact value. 100 is the
-// clean midpoint of the requested range, used here; the values above are
-// what to recompute against if that choice ever needs revisiting.
-const CURRENT_YEAR_HALF_LIFE_DAYS = 100;
+// across the requested 90-120 day candidate range, checked at four
+// distances, not just the headline age-90 case -- the four candidates
+// track closely at small ages but diverge sharply as age grows:
+//
+// Raw current-year component value, 2^(-age/HL):
+//   age    HL=90   HL=100  HL=110  HL=120
+//    30    0.7937  0.8123  0.8278  0.8409
+//    90    0.5000  0.5359  0.5672  0.5946
+//   150    0.3150  0.3536  0.3886  0.4204
+//   250    0.1458  0.1768  0.2069  0.2360
+//
+// Full 3-component combined weight for a current-year reading (old
+// 2-component, prior-year baseline shown for reference -- unaffected by
+// this choice):
+//   age    HL=90    HL=100   HL=110   HL=120   baseline
+//    30    0.91619  0.92373  0.93002  0.93536  0.59375
+//    90    0.56763  0.59866  0.62570  0.64944  0.13525
+//   150    0.33687  0.37421  0.40814  0.43897  0.03196
+//   250    0.15161  0.18236  0.21232  0.24115  0.00678
+//
+// At 250 days the ratio-vs-baseline spans 22x (HL=90) to 36x (HL=120) --
+// a real, meaningful difference, not noise -- so this was picked
+// deliberately for the shape at the far end, not just as the range's
+// midpoint: 120 keeps a 250-day-old current-year reading meaningfully
+// weighted (0.236 raw, 0.241 combined) rather than letting it decay away
+// too quickly, on the reasoning that genuinely-current-year data stays
+// valuable evidence for longer than a 90-100 day half-life would allow.
+// The values above are what to recompute against if this ever needs
+// revisiting.
+const CURRENT_YEAR_HALF_LIFE_DAYS = 120;
 
 // ageInDays is continuous/estimated (an age, not a fixed category), so an
 // invalid value is clamped and logged rather than rejected outright.

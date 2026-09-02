@@ -76,11 +76,11 @@ describe("calculateRecencyWeight", () => {
       expect(baseline).toBeCloseTo(0.13525, 5);
 
       // Same age, but the reading is now from the CURRENT year: the new
-      // component contributes 2^(-90/100) = 0.53584 on its own, combined via
+      // component contributes 2^(-90/120) = 0.59460 on its own, combined via
       // the same probabilistic-OR as the other two:
-      // combine(0.13525, 0.53584) = 0.13525 + 0.53584 - 0.13525*0.53584 = 0.59867.
+      // combine(0.13525, 0.59460) = 0.13525 + 0.59460 - 0.13525*0.59460 = 0.64944.
       const currentYearWeight = calculateRecencyWeight(90, CURRENT_YEAR, CURRENT_YEAR);
-      expect(currentYearWeight).toBeCloseTo(0.59867, 4);
+      expect(currentYearWeight).toBeCloseTo(0.64944, 4);
 
       // "Meaningfully more" -- over 4x the baseline, not a marginal bump.
       expect(currentYearWeight).toBeGreaterThan(baseline * 4);
@@ -112,7 +112,7 @@ describe("calculateRecencyWeight", () => {
       // impossible real-world combination -- a reading can't be 400 days
       // old AND from the current year -- but useful to isolate exactly how
       // much the gate alone changes the result): the current-year component
-      // would still contribute 2^(-400/100) = 0.0625 if it applied, which
+      // would still contribute 2^(-400/120) = 0.09921 if it applied, which
       // is NOT what a genuine prior-year reading at this age gets.
       const wouldBeIfGated = calculateRecencyWeight(400, CURRENT_YEAR, CURRENT_YEAR);
       expect(wouldBeIfGated).toBeGreaterThan(priorYearFarBack);
