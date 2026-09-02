@@ -40,6 +40,59 @@ const DAYS_PER_YEAR = 365;
 // revisiting.
 const CURRENT_YEAR_HALF_LIFE_DAYS = 120;
 
+// Peak (age-0) amplitude for the current-year component -- deliberately
+// greater than 1.0, unlike SEASONAL_PEAK's 0.75 cap. This is a real product
+// decision, not an arbitrary tuning choice: for this application, recency
+// within the current calendar year is considered MORE informative than a
+// prior-year seasonal echo, because Seattle's real-world parking conditions
+// (rapid new development, business openings/closings, road and construction
+// changes, shifting traffic patterns) move fast enough that a same-year
+// reading reflects the actual current state of a blockface in a way a
+// year-old reading from the same season fundamentally cannot, no matter how
+// well its season lines up.
+//
+// The concrete requirement this value was solved for: even the oldest
+// current-year reading expected in practice (~270 days -- the age Q1 2026
+// data reaches by the time roughly three-quarters of the year has passed)
+// must still combine to a HIGHER total weight than a prior-year reading
+// sitting exactly on its seasonal peak (age 365, combined weight 0.75005 --
+// see CURRENT_YEAR_PEAK_WEIGHT's own verification below). Solving
+// combine(x, y) = x + y(1-x) > 0.75005 for y at age=270 (where x, the
+// recency+seasonal contribution alone, is 0.011236) requires the raw
+// current-year component to exceed roughly 0.7472 at that age, which in
+// turn requires PEAK * 2^(-270/120) > 0.7472, i.e. PEAK > 3.5544. 4.0 is
+// used here: a clean number with real, comfortable margin at every age
+// checked, not a knife's-edge value -- see the age-by-age table below.
+//
+//   age (days)  raw = 4.0 * 2^(-age/120)   combined (3-component)   margin over 0.75005 baseline
+//    30         3.3636                      1.96021                  +1.21015
+//    90         2.3784                      2.19198                  +1.44192
+//   150         1.6818                      1.66000                  +0.90995
+//   240         1.0000                      1.00000                  +0.24995
+//   270         0.8409                      0.84268                  +0.09263
+//
+// (At exactly age=240, PEAK*2^(-240/120) = 4.0*0.25 = 1.0 precisely, and
+// combine(x, 1) = x + 1 - x = 1 for any x -- mathematically exact, a
+// hand-verifiable checkpoint, though not floating-point bit-exact:
+// live-checked at 0.9999999999999999, 1 ULP off from 1, due to ordinary
+// floating-point rounding in the intermediate x+1-x subtraction.) The
+// guarantee erodes
+// gradually past 270 (crossing back below baseline around day 290-291),
+// which is expected and fine: 270 is the real worst case this was solved
+// for, not an arbitrary cutoff, and Q1 2026 data doesn't reach that age
+// until the very end of the year regardless.
+//
+// A necessary consequence: unlike the original two-component design,
+// calculateRecencyWeight's output is no longer bounded to [0, 1] once a
+// current-year reading is young enough (raw current-year component > 1
+// combined with any recency/seasonal contribution pushes the total above
+// 1 -- see combineWeights' own comment). This is fine for this function's
+// actual use (a per-reading weight feeding a weighted mean/variance, see
+// calculateWeightedStats.ts and incrementalWeightedStats.ts), which only
+// needs weights to be non-negative and to reflect each reading's RELATIVE
+// importance -- it never assumes or requires weights to be capped at 1.
+const CURRENT_YEAR_PEAK_WEIGHT = 4.0;
+
 // ageInDays is continuous/estimated (an age, not a fixed category), so an
 // invalid value is clamped and logged rather than rejected outright.
 function clampAgeInDays(ageInDays: number): number {
@@ -70,14 +123,17 @@ function calculateSeasonalComponent(ageInDays: number): number {
 
 // Rewards a reading recorded in the SAME calendar year as "now", decaying
 // smoothly with age -- same exponential shape as calculateRecencyComponent,
-// just with a far longer half-life (100 days vs. 30), so genuinely-current-
-// year data stays meaningfully weighted well past where the base recency
-// component has already decayed close to zero (e.g. a 90-150 day old
-// reading). The reasoning: a reading from the year we're actually
-// predicting for is real, current evidence in its own right -- current
-// construction, current business openings/closings, current traffic
-// patterns -- not merely a proxy for "recent", which is what the existing
-// recency component already covers on its own, much shorter timescale.
+// just with a far longer half-life (120 days vs. 30) and a peak above 1.0
+// (see CURRENT_YEAR_PEAK_WEIGHT), so genuinely-current-year data stays
+// weighted ABOVE even a prior-year reading at its seasonal peak, all the
+// way out past 270 days -- not just "meaningfully weighted" the way the
+// base recency component alone would decay to near zero by then. The
+// reasoning: a reading from the year we're actually predicting for is
+// real, current evidence in its own right -- current construction, current
+// business openings/closings, current traffic patterns -- which this
+// application deliberately treats as more informative than a prior-year
+// seasonal echo (see CURRENT_YEAR_PEAK_WEIGHT's comment for the full
+// product reasoning and the exact numbers this was solved against).
 //
 // Gated on readingYear === currentYear EXACTLY, not on ageInDays crossing
 // some threshold -- age alone can't distinguish "62 days into this year"
@@ -93,13 +149,18 @@ function calculateCurrentYearComponent(ageInDays: number, readingYear: number, c
   if (readingYear !== currentYear) {
     return 0;
   }
-  return Math.pow(2, -ageInDays / CURRENT_YEAR_HALF_LIFE_DAYS);
+  return CURRENT_YEAR_PEAK_WEIGHT * Math.pow(2, -ageInDays / CURRENT_YEAR_HALF_LIFE_DAYS);
 }
 
 // Probabilistic-OR combination (1 - (1-a)(1-b), rearranged to a+b-ab) instead
 // of max(a, b), so this reading's own recency and seasonal signals reinforce
-// each other rather than one simply overriding the other. Always stays
-// within [0, 1] when a and b do.
+// each other rather than one simply overriding the other. Stays within
+// [0, 1] when BOTH a and b do -- true for every combination in this module
+// except when the current-year component is involved, since
+// CURRENT_YEAR_PEAK_WEIGHT is deliberately > 1 (see its own comment for
+// why); combining a value above 1 with anything pushes the result above 1
+// too. That's an intentional, accepted consequence for this specific
+// component, not a bug -- see calculateRecencyWeight's own comment.
 //
 // This only combines the two signals for a single reading. The broader
 // reinforcement this function is meant to enable -- a ~7-day-old reading and
@@ -117,6 +178,11 @@ function combineWeights(a: number, b: number): number {
 // blockfaceLookup.ts's readingYear field and getPacificCalendarYear) rather
 // than direct external input, so -- unlike ageInDays -- they're compared
 // with a plain === and given no separate clamp/validation layer here.
+//
+// Return value is NOT guaranteed to be within [0, 1] -- a young enough
+// current-year reading can push it above 1 (see CURRENT_YEAR_PEAK_WEIGHT's
+// comment for why that's deliberate and safe for how this weight is
+// actually used downstream).
 export function calculateRecencyWeight(ageInDays: number, readingYear: number, currentYear: number): number {
   const safeAgeInDays = clampAgeInDays(ageInDays);
   const recency = calculateRecencyComponent(safeAgeInDays);
