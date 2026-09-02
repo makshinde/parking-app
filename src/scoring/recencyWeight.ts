@@ -7,6 +7,39 @@ const SEASONAL_HALF_LIFE_DAYS = 15;
 const SEASONAL_PEAK = 0.75;
 const DAYS_PER_YEAR = 365;
 
+// Half-life for the current-calendar-year component (see
+// calculateCurrentYearComponent below). Chosen from real computed values
+// across the requested 90-120 day candidate range, checked at four
+// distances, not just the headline age-90 case -- the four candidates
+// track closely at small ages but diverge sharply as age grows:
+//
+// Raw current-year component value, 2^(-age/HL):
+//   age    HL=90   HL=100  HL=110  HL=120
+//    30    0.7937  0.8123  0.8278  0.8409
+//    90    0.5000  0.5359  0.5672  0.5946
+//   150    0.3150  0.3536  0.3886  0.4204
+//   250    0.1458  0.1768  0.2069  0.2360
+//
+// Full 3-component combined weight for a current-year reading (old
+// 2-component, prior-year baseline shown for reference -- unaffected by
+// this choice):
+//   age    HL=90    HL=100   HL=110   HL=120   baseline
+//    30    0.91619  0.92373  0.93002  0.93536  0.59375
+//    90    0.56763  0.59866  0.62570  0.64944  0.13525
+//   150    0.33687  0.37421  0.40814  0.43897  0.03196
+//   250    0.15161  0.18236  0.21232  0.24115  0.00678
+//
+// At 250 days the ratio-vs-baseline spans 22x (HL=90) to 36x (HL=120) --
+// a real, meaningful difference, not noise -- so this was picked
+// deliberately for the shape at the far end, not just as the range's
+// midpoint: 120 keeps a 250-day-old current-year reading meaningfully
+// weighted (0.236 raw, 0.241 combined) rather than letting it decay away
+// too quickly, on the reasoning that genuinely-current-year data stays
+// valuable evidence for longer than a 90-100 day half-life would allow.
+// The values above are what to recompute against if this ever needs
+// revisiting.
+const CURRENT_YEAR_HALF_LIFE_DAYS = 120;
+
 // ageInDays is continuous/estimated (an age, not a fixed category), so an
 // invalid value is clamped and logged rather than rejected outright.
 function clampAgeInDays(ageInDays: number): number {
@@ -35,6 +68,34 @@ function calculateSeasonalComponent(ageInDays: number): number {
   return SEASONAL_PEAK * Math.pow(2, -distanceToNearestYear / SEASONAL_HALF_LIFE_DAYS);
 }
 
+// Rewards a reading recorded in the SAME calendar year as "now", decaying
+// smoothly with age -- same exponential shape as calculateRecencyComponent,
+// just with a far longer half-life (100 days vs. 30), so genuinely-current-
+// year data stays meaningfully weighted well past where the base recency
+// component has already decayed close to zero (e.g. a 90-150 day old
+// reading). The reasoning: a reading from the year we're actually
+// predicting for is real, current evidence in its own right -- current
+// construction, current business openings/closings, current traffic
+// patterns -- not merely a proxy for "recent", which is what the existing
+// recency component already covers on its own, much shorter timescale.
+//
+// Gated on readingYear === currentYear EXACTLY, not on ageInDays crossing
+// some threshold -- age alone can't distinguish "62 days into this year"
+// from "62 days old but spanning a Dec 31/Jan 1 boundary into last year",
+// and only the former should ever get this component. Because readingYear
+// is fixed at the moment a reading was recorded and currentYear only ever
+// moves forward, this can never retroactively switch back on for
+// prior-year data: once the calendar rolls over, a reading permanently and
+// irreversibly stops qualifying, no matter how the raw age-in-days math
+// might otherwise happen to align with a fresh calendar year for some
+// OTHER reading.
+function calculateCurrentYearComponent(ageInDays: number, readingYear: number, currentYear: number): number {
+  if (readingYear !== currentYear) {
+    return 0;
+  }
+  return Math.pow(2, -ageInDays / CURRENT_YEAR_HALF_LIFE_DAYS);
+}
+
 // Probabilistic-OR combination (1 - (1-a)(1-b), rearranged to a+b-ab) instead
 // of max(a, b), so this reading's own recency and seasonal signals reinforce
 // each other rather than one simply overriding the other. Always stays
@@ -50,9 +111,19 @@ function combineWeights(a: number, b: number): number {
   return a + b - a * b;
 }
 
-export function calculateRecencyWeight(ageInDays: number): number {
+// readingYear/currentYear are both discrete, exact calendar years computed
+// upstream from trusted sources (a reading's own parsed date components, and
+// Date.getFullYear()-equivalent Pacific resolution of "now" -- see
+// blockfaceLookup.ts's readingYear field and getPacificCalendarYear) rather
+// than direct external input, so -- unlike ageInDays -- they're compared
+// with a plain === and given no separate clamp/validation layer here.
+export function calculateRecencyWeight(ageInDays: number, readingYear: number, currentYear: number): number {
   const safeAgeInDays = clampAgeInDays(ageInDays);
   const recency = calculateRecencyComponent(safeAgeInDays);
   const seasonal = calculateSeasonalComponent(safeAgeInDays);
-  return combineWeights(recency, seasonal);
+  const currentYearComponent = calculateCurrentYearComponent(safeAgeInDays, readingYear, currentYear);
+  // Probabilistic-OR is associative (chaining combineWeights twice is
+  // exactly 1 - (1-a)(1-b)(1-c)), so this is the same "same approach" used
+  // to combine the original two components, just extended to three.
+  return combineWeights(combineWeights(recency, seasonal), currentYearComponent);
 }
