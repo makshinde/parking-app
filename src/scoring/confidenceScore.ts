@@ -7,8 +7,12 @@ const MAX_RECENCY_POINTS = 2;
 // Beyond this, more data doesn't meaningfully improve confidence.
 const SAMPLE_SIZE_SATURATION_COUNT = 200;
 
-// Furthest we forecast; recency score decays linearly to its floor by this point.
-const MAX_DAYS_IN_FUTURE = 7;
+// Furthest we forecast; recency score decays linearly to its floor by this
+// point. Exported so resolveRequestTime.ts can reject a request beyond this
+// same horizon at the request-validation layer, rather than maintaining a
+// second, separately-tracked "7" that could silently drift out of sync
+// with this one.
+export const MAX_DAYS_IN_FUTURE = 7;
 
 // Recency score never drops below this fraction of its max, since even a
 // week-out forecast is still informed by the same underlying historical pattern.
