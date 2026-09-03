@@ -626,7 +626,21 @@ function getRecordId(record: SocrataRecord): string {
 // --- Streaming orchestration ---------------------------------------------
 
 export interface StreamArchiveOptions {
+  // Real Socrata dataset id to fetch archive pages from -- used ONLY for
+  // building Socrata request URLs (fetchArchivePage/buildArchivePageUrl,
+  // including inside replayAccumulatorGap). Never used as a table identity
+  // -- see storageIdentity below.
   archiveDatasetId: string;
+  // Which archive_dataset_id identity to read/write against in
+  // archive_stream_checkpoint and archive_stream_accumulator_buckets.
+  // Defaults to archiveDatasetId when omitted -- every caller before this
+  // field existed had its storage identity match its Socrata source 1:1,
+  // so omitting this preserves that behavior exactly. Set it explicitly
+  // when the two need to diverge -- e.g. streaming a real dataset (say,
+  // "q2e4-e7e5") into an accumulator identity that isn't itself a real
+  // Socrata dataset id at all (e.g. "combined-history-staging", a manually
+  // seeded merge of multiple archives' totals).
+  storageIdentity?: string;
   // Defaults to DEFAULT_STREAM_CHUNK_SIZE (Socrata's own per-request cap).
   chunkSize?: number;
   // Defaults to DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS.
@@ -723,8 +737,14 @@ export async function streamArchiveWithResume(clients: ArchiveStreamClients, opt
   const { checkpointClient, bucketsClient } = clients;
   const chunkSize = options.chunkSize ?? DEFAULT_STREAM_CHUNK_SIZE;
   const snapshotIntervalChunks = options.snapshotIntervalChunks ?? DEFAULT_ACCUMULATOR_SNAPSHOT_INTERVAL_CHUNKS;
+  // Resolved once, used for every checkpoint/accumulator-table call below --
+  // options.archiveDatasetId (the real Socrata source) is used only where a
+  // Socrata request is actually made (fetchArchivePage, including inside
+  // replayAccumulatorGap). See StreamArchiveOptions.storageIdentity's own
+  // comment for why these two can differ.
+  const storageIdentity = options.storageIdentity ?? options.archiveDatasetId;
 
-  const existingCheckpoint = await fetchArchiveStreamCheckpoint(checkpointClient, options.archiveDatasetId);
+  const existingCheckpoint = await fetchArchiveStreamCheckpoint(checkpointClient, storageIdentity);
   let cursorId: string | null = existingCheckpoint?.lastProcessedId ?? null;
   let readingsProcessedCount = existingCheckpoint?.readingsProcessedCount ?? 0;
   let accumulatorState: AccumulatorSnapshot = {};
@@ -734,7 +754,7 @@ export async function streamArchiveWithResume(clients: ArchiveStreamClients, opt
     // far for this archive (empty if no snapshot has ever landed yet -- see
     // fetchAccumulatorBuckets, which simply returns {} for zero matching
     // rows, same as a fresh run).
-    accumulatorState = await fetchAccumulatorBuckets(bucketsClient, options.archiveDatasetId);
+    accumulatorState = await fetchAccumulatorBuckets(bucketsClient, storageIdentity);
 
     // Fires FIRST, before any onChunk call (including gap-replay's below)
     // -- this is what seeds the caller's own local accumulator (e.g. a
@@ -752,7 +772,8 @@ export async function streamArchiveWithResume(clients: ArchiveStreamClients, opt
       // The accumulator snapshot lags behind the stream's real position --
       // expected and normal under this design, not a sign of corruption.
       // Catch it up now, folding the gap into the (already-seeded) caller
-      // state via the normal onChunk path.
+      // state via the normal onChunk path. Fetches from the real Socrata
+      // source (archiveDatasetId), same as the main loop below.
       const replayResult = await replayAccumulatorGap(
         options.archiveDatasetId,
         chunkSize,
@@ -767,7 +788,7 @@ export async function streamArchiveWithResume(clients: ArchiveStreamClients, opt
       // recompute has already been paid for, so a future crash shouldn't
       // have to redo this same replay.
       await saveArchiveStreamAccumulatorSnapshot(clients, {
-        archiveDatasetId: options.archiveDatasetId,
+        archiveDatasetId: storageIdentity,
         accumulatorSnapshotLastProcessedId: existingCheckpoint.lastProcessedId,
         accumulatorState,
       });
@@ -794,7 +815,7 @@ export async function streamArchiveWithResume(clients: ArchiveStreamClients, opt
     // why this stays cheap even once a large accumulator snapshot already
     // exists on the row.
     await saveArchiveStreamPosition(checkpointClient, {
-      archiveDatasetId: options.archiveDatasetId,
+      archiveDatasetId: storageIdentity,
       lastProcessedId: cursorId,
       readingsProcessedCount,
     });
@@ -812,7 +833,7 @@ export async function streamArchiveWithResume(clients: ArchiveStreamClients, opt
       // silently skip readings the snapshot already counted, rather than
       // the safe, bounded-replay gap this design is built to handle.
       await saveArchiveStreamAccumulatorSnapshot(clients, {
-        archiveDatasetId: options.archiveDatasetId,
+        archiveDatasetId: storageIdentity,
         accumulatorSnapshotLastProcessedId: cursorId,
         accumulatorState,
       });
@@ -830,5 +851,5 @@ export async function streamArchiveWithResume(clients: ArchiveStreamClients, opt
     }
   }
 
-  await clearArchiveStreamCheckpoint(checkpointClient, options.archiveDatasetId);
+  await clearArchiveStreamCheckpoint(checkpointClient, storageIdentity);
 }
