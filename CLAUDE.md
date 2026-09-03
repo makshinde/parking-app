@@ -463,10 +463,20 @@ function can have multiple kinds of input.
   already.
 - resolveYearlyArchiveDatasetId (src/aggregation/resolveYearlyArchive.ts)
   only has live-verified Socrata dataset IDs for 2020 ("wtpb-jp8d") and
-  2025 ("7c2e-uany"). The live on-demand prediction flow's "5-day window
-  centered on the same date one year prior" (see Architecture section)
-  only works today for requests where that prior year is 2020 or 2025 --
-  any other year throws rather than guessing. Real time will require
+  2025 ("7c2e-uany"). An earlier design considered answering each
+  prediction request with a live Socrata query (a "5-day window centered
+  on the same date one year prior"), gated by this same per-year dataset
+  ID map -- that per-request live-query approach was never built and was
+  superseded by the current design (see Architecture section):
+  predictions are precomputed by the offline batch/streaming pipeline
+  into occupancy_stats, which the Edge Function reads directly at
+  request time, never querying Socrata live. Confirmed directly against
+  the code: resolveYearlyArchiveDatasetId's only real callers today are
+  that offline pipeline's own scripts (backfill-occupancy-stats.ts and
+  reconcile-occupancy-stats.ts), which need it to resolve which yearly
+  archive to pull or reconcile against -- nothing request-time calls it,
+  and no supabase/functions Edge Function code exists yet at all. The
+  still-relevant constraint this leaves behind: real time will require
   adding more years going forward (2026 becomes "last year" starting in
   2027, and so on); each new year's dataset ID MUST be live-verified
   directly against the real Socrata catalog before being added to the
