@@ -9,6 +9,7 @@ import {
   MaxChunksReachedError,
 } from "./backfill-occupancy-stats.ts";
 import {
+  fetchAccumulatorBuckets,
   streamArchiveWithResume,
   type ArchiveStreamAccumulatorBucketsSupabaseClient,
   type ArchiveStreamCheckpointSupabaseClient,
@@ -111,6 +112,34 @@ export async function streamArchiveIntoStaging(
   let totalUnmatched = 0;
   let totalParseFailures = 0;
   let stoppedEarly = false;
+
+  // Seed from whatever accumulator state already exists under this storage
+  // identity, unconditionally, BEFORE streaming starts -- deliberately not
+  // relying on streamArchiveWithResume's own onResume hook for this, since
+  // that hook only fires when a CHECKPOINT already exists for this identity
+  // (see streamArchiveWithResume.ts's own resume logic). A storage identity
+  // used by this script can legitimately have pre-populated accumulator
+  // rows with NO checkpoint at all -- e.g. a manually duplicated/seeded
+  // merge like "combined-history-staging" -- and those must not be
+  // silently ignored just because nothing has streamed into this identity
+  // yet. Live-confirmed as a real bug, not a hypothetical: a first run
+  // against a freshly-duplicated 105,931-row staging identity (no
+  // checkpoint yet) folded only its own newly-fetched chunks into a Map
+  // that started completely empty, because the (correct, for
+  // streamArchiveWithResume's normal caller) checkpoint-gated onResume
+  // never fired.
+  //
+  // On a genuine resume of THIS script (a checkpoint now exists),
+  // streamArchiveWithResume's own onResume below reads this exact same
+  // table again and re-merges -- redundant with this upfront seed, but
+  // harmless (mergeAccumulatorSnapshot just overwrites matching keys with
+  // the same or more current values) and not worth special-casing away for
+  // a script expected to run only a handful of times.
+  const preExistingSnapshot = await fetchAccumulatorBuckets(clients.bucketsClient, options.storageIdentity);
+  const preExistingCount = mergeAccumulatorSnapshot(accumulators, preExistingSnapshot);
+  if (preExistingCount > 0) {
+    console.log(`Seeded ${preExistingCount} pre-existing buckets from "${options.storageIdentity}" before streaming.`);
+  }
 
   const { onChunk } = createMaxChunksOnChunk(options.maxChunks, (records) => {
     const result = foldReadingsIntoAccumulators(records, accumulators, lookup, now);
