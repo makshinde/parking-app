@@ -261,6 +261,64 @@ it.
   hypothesis above, not a new or separate investigation -- root cause still
   unconfirmed.
 
+## Rebuild policy — reading weights are fixed at fold time
+
+Both aggregation paths (the per-bucket batch job and the streaming
+accumulator path) compute each reading's recency/seasonal/current-year
+weight via calculateRecencyWeight once, at the moment that reading is
+folded into calculateWeightedStats or an accumulator's addReading. The
+incremental accumulator design (incrementalWeightedStats.ts) deliberately
+never retains individual reading dates after folding -- only the small,
+fixed running totals (count, totalWeight, mean, sumSquaredDiff), which is
+exactly what keeps it usable for streaming a multi-hundred-million-row
+archive without holding raw readings in memory (see Architecture above).
+
+The direct consequence: a reading's weight is permanently fixed as of the
+age it had *at fold time*, and never decays further afterward. A reading
+folded when it was 60 days old keeps the weight calculateRecencyWeight
+assigned to a 60-day-old reading forever -- even a year later, once that
+same reading is (in reality) 425 days old, nothing in the accumulator
+re-evaluates or decays its contribution. There is no per-reading date left
+to recompute from; only re-folding the raw reading again, from scratch,
+recomputes its weight at its current age.
+
+This means the whole dataset's weighting gradually goes stale relative to
+"now" as time passes since the last full rebuild, even though no single
+reading or bucket is ever wrong at the moment it's folded. To keep the
+dataset's weighting honestly current, the full backfill pipeline (stream
+the relevant archive(s) from scratch, fold into a fresh accumulator,
+promote, reconcile occupancy_stats) should be re-run periodically -- roughly
+monthly is a reasonable cadence, trading off staleness against the real
+cost of a full re-run (see the multi-hour full-archive time estimates in
+Architecture above).
+
+This is currently a manual process -- no automated scheduler exists yet to
+trigger it on a recurring basis. Building real automation for this (e.g. a
+scheduled job that runs the pipeline and pages someone on failure) is a
+legitimate future improvement, not something needed right now.
+
+Whenever a rebuild is done -- monthly or otherwise -- follow the same
+approach just proven live with the Q1 2026 ingestion, rather than
+re-deriving a safe process from scratch each time:
+1. Duplicate the real, existing accumulator data into a new, clearly-labeled
+   staging identity first (byte-for-byte verified against the source before
+   proceeding), never fold new data directly into the real identity.
+2. Verify small before trusting full scale -- run the streaming job with a
+   small `--max-chunks` bound first, confirm the storage identity is
+   correctly isolated (the real identity untouched, the staging identity
+   seeded and updated as expected) before committing to the full,
+   unbounded run.
+3. Promote deliberately, not silently: once the full run and its
+   correctness checks (internal-consistency sanity checks on every bucket,
+   not just a row-count match) are complete, rename the real identity's
+   current rows to a clearly-labeled, permanent backup identity, then
+   rename the staging identity's rows to become the new real identity. Keep
+   the backup until explicitly told it's no longer needed.
+4. Only after promotion, run reconcile-occupancy-stats.ts against the
+   now-promoted real identity to update occupancy_stats, then run the same
+   systematic occupancy_stats-vs-accumulator comparison used before to
+   confirm zero stale rows.
+
 ## Handling invalid input
 
 Two categories, handled differently:
