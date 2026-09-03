@@ -243,6 +243,65 @@ describe("streamArchiveIntoStaging", () => {
     expect(new URL(fetchUrl).searchParams.get("$where")).toContain("row-old");
   });
 
+  // The exact bug this fix closes, live-confirmed against the real
+  // database before this test was written: a first run against a storage
+  // identity that already has real accumulator rows (e.g. a manually
+  // duplicated/seeded merge) but NO checkpoint row yet used to fold only
+  // its own newly-fetched chunks into a Map that started completely
+  // empty -- streamArchiveWithResume's onResume hook only fires when a
+  // checkpoint already exists, so the pre-existing accumulator rows were
+  // silently ignored. This is the critical test proving the fix: no
+  // checkpoint, but real pre-existing accumulator rows, must seed from
+  // them rather than starting from zero.
+  it("seeds from pre-existing accumulator rows even when NO checkpoint exists yet, rather than starting empty", async () => {
+    const { clients, checkpointRows } = makeMockClients({
+      existingCheckpointRow: null, // the exact condition that triggered the bug: no checkpoint at all
+      existingBucketRows: [
+        {
+          archive_dataset_id: "combined-history-staging",
+          blockface_id: "blockface-preexisting-1",
+          iso_day: 1,
+          hour: 8,
+          count: 2100,
+          total_weight: 1040.5,
+          mean: 0.5,
+          sum_squared_diff: 12.3,
+        },
+        {
+          archive_dataset_id: "combined-history-staging",
+          blockface_id: "blockface-preexisting-2",
+          iso_day: 5,
+          hour: 17,
+          count: 1980,
+          total_weight: 990.1,
+          mean: 0.5,
+          sum_squared_diff: 11.1,
+        },
+      ],
+    });
+    expect(checkpointRows.has("combined-history-staging")).toBe(false); // confirms the precondition
+    fetchMock.mockResolvedValueOnce(jsonResponse([makeRawRecord("new")])); // one new, distinct-bucket record; short page -> stop
+
+    const result = await streamArchiveIntoStaging(
+      clients,
+      LOOKUP,
+      { sourceDataset: "q2e4-e7e5", storageIdentity: "combined-history-staging", maxChunks: null },
+      NOW,
+    );
+
+    // Both pre-existing buckets PLUS the one newly-folded bucket -- not
+    // just the 1 bucket this run's own fetch would produce on its own,
+    // which is what the bug looked like (bucketsInMemory === 1).
+    expect(result.bucketsInMemory).toBe(3);
+
+    // And the fetch still started from the beginning of the source dataset
+    // (no checkpoint existed to resume a position from) -- confirms the
+    // seed is purely about the ACCUMULATOR state, not a fabricated stream
+    // position.
+    const fetchUrl = fetchMock.mock.calls[0]?.[0] as string;
+    expect(new URL(fetchUrl).searchParams.has("$where")).toBe(false);
+  });
+
   it("never reads or writes a checkpoint/bucket row under a DIFFERENT storage identity (e.g. the real production one)", async () => {
     const { clients, checkpointRows } = makeMockClients({
       existingCheckpointRow: {
