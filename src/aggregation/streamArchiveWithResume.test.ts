@@ -1617,4 +1617,83 @@ describe("streamArchiveWithResume", () => {
       expect(fetchMock).toHaveBeenCalledTimes(MAX_ARCHIVE_FETCH_ATTEMPTS);
     });
   });
+
+  // storageIdentity decouples "which real Socrata dataset to fetch from"
+  // (archiveDatasetId) from "which archive_dataset_id identity to read/write
+  // in archive_stream_checkpoint and archive_stream_accumulator_buckets"
+  // (storageIdentity) -- built for streaming a real archive (e.g.
+  // "q2e4-e7e5") into an accumulator identity that isn't itself a real
+  // Socrata dataset id (e.g. a manually-seeded merge like
+  // "combined-history-staging").
+  describe("storageIdentity: decoupling the Socrata source from the table identity", () => {
+    it("fetches from archiveDatasetId's real Socrata URL but reads/writes checkpoint+bucket rows under storageIdentity when the two differ", async () => {
+      const { clients, positionUpsertCalls, bucketUpsertCalls, deleteCalls } = makeMockClients({ existingCheckpointRow: null });
+      fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(2, "a"))); // short page (< chunkSize) -> stop after 1 chunk
+
+      await streamArchiveWithResume(clients, {
+        archiveDatasetId: "q2e4-e7e5",
+        storageIdentity: "combined-history-staging",
+        chunkSize: 50,
+        snapshotIntervalChunks: 1,
+        onChunk: () => ({ "bf-1:1:9": { count: 1, totalWeight: 1, mean: 0.5, sumSquaredDiff: 0 } }),
+      });
+
+      // The Socrata request itself used the real source dataset id.
+      const fetchUrl = fetchMock.mock.calls[0]?.[0] as string;
+      expect(fetchUrl).toContain("/resource/q2e4-e7e5.json");
+      expect(fetchUrl).not.toContain("combined-history-staging");
+
+      // But every table write used the storage identity, not the source.
+      expect(positionUpsertCalls[0]?.archive_dataset_id).toBe("combined-history-staging");
+      expect(bucketUpsertCalls[0]?.[0]?.archive_dataset_id).toBe("combined-history-staging");
+      expect(deleteCalls).toEqual(["combined-history-staging"]);
+    });
+
+    it("defaults storageIdentity to archiveDatasetId when omitted, matching every pre-existing caller's behavior", async () => {
+      const { clients, positionUpsertCalls, deleteCalls } = makeMockClients({ existingCheckpointRow: null });
+      fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(1, "a")));
+
+      await streamArchiveWithResume(clients, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        chunkSize: 50,
+        onChunk: () => ({}),
+      });
+
+      expect(positionUpsertCalls[0]?.archive_dataset_id).toBe(ARCHIVE_DATASET_ID);
+      expect(deleteCalls).toEqual([ARCHIVE_DATASET_ID]);
+    });
+
+    it("resumes from an existing checkpoint stored under storageIdentity, not archiveDatasetId, while still fetching new pages from the real Socrata source", async () => {
+      const { clients } = makeMockClients({
+        existingCheckpointRow: {
+          archive_dataset_id: "combined-history-staging",
+          last_processed_id: "row-existing",
+          readings_processed_count: 500,
+          accumulator_snapshot_last_processed_id: "row-existing",
+        },
+        existingBucketRows: accumulatorSnapshotToBucketRows("combined-history-staging", SAMPLE_ACCUMULATOR_SNAPSHOT),
+      });
+      fetchMock.mockResolvedValueOnce(jsonResponse(makeRecords(1, "b"))); // short -> stop after 1 chunk
+
+      const onResume = vi.fn();
+      await streamArchiveWithResume(clients, {
+        archiveDatasetId: "q2e4-e7e5",
+        storageIdentity: "combined-history-staging",
+        chunkSize: 50,
+        onResume,
+        onChunk: () => ({}),
+      });
+
+      // Resumed using the storage identity's own checkpoint and bucket rows.
+      expect(onResume).toHaveBeenCalledExactlyOnceWith(SAMPLE_ACCUMULATOR_SNAPSHOT);
+
+      // The new page fetch went to the real Socrata source, continuing from
+      // that checkpoint's own last_processed_id -- confirms the resume
+      // position (looked up under storageIdentity) correctly drives a fetch
+      // against archiveDatasetId's real dataset.
+      const fetchUrl = fetchMock.mock.calls[0]?.[0] as string;
+      expect(fetchUrl).toContain("/resource/q2e4-e7e5.json");
+      expect(new URL(fetchUrl).searchParams.get("$where")).toContain("row-existing");
+    });
+  });
 });
