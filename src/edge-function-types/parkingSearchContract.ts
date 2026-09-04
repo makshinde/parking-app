@@ -1,0 +1,187 @@
+// Canonical request/response contract for the parking-search Edge Function.
+// This is the single source of truth the frontend is built against --
+// consolidates what's already decided across resolveRequestTime.ts,
+// migrations/017's spatial-search RPCs, geocodeAddress.ts, and
+// assembleSearchResults.ts, plus a first proposal (flagged inline below,
+// see each block's own comment) for the error cases that weren't decided
+// by any of those pieces individually. DRAFT: the address_not_found /
+// invalid_request / geocoding_service_unavailable / internal_error
+// sections are a proposal pending confirmation, not yet treated as final.
+//
+// Type-only module -- no runtime logic, so it carries no portability
+// concerns of its own beyond the modules it re-exports types from (all of
+// which are already independently confirmed Deno-portable).
+
+import type { QuickTimeOption, ResolvedRequestTime } from "../scoring/resolveRequestTime.ts";
+import type { CandidateResult } from "../scoring/assembleSearchResults.ts";
+
+// --- Request -----------------------------------------------------------
+
+// The wire-level counterpart to resolveRequestTime.ts's PredictionTimeRequest.
+// That type's "specific" variant carries a real `Date`, which isn't
+// JSON-serializable -- over the wire it arrives as an ISO 8601 string
+// instead. The Edge Function is responsible for parsing `instant` into a
+// `Date` (via `new Date(instant)`) before calling resolveRequestTime, and
+// must treat a string that parses to an invalid Date as its own
+// malformed_body case (see InvalidRequestReason below) -- distinct from
+// resolveRequestTime's own NaN-Date guard, which exists for direct
+// in-memory/test callers, not as the request's first line of defense.
+export type PredictionTimeRequestWire = { type: "quick"; option: QuickTimeOption } | { type: "specific"; instant: string };
+
+export interface ParkingSearchRequestBody {
+  // Free-form address/query text, passed to geocodeAddress.ts as-is.
+  address: string;
+  time: PredictionTimeRequestWire;
+  // Meters, (0, 1000], matching nearby_blockfaces/nearby_off_street_facilities'
+  // own radius_meters bound exactly (migrations/017). Omit for the default (200).
+  radiusMeters?: number;
+  // Omit for the default cap (20, matching assembleSearchResults.ts's
+  // DEFAULT_RESULT_LIMIT); "all" for the full, uncapped list.
+  limit?: number | "all";
+}
+
+// --- Success response ----------------------------------------------------
+
+export interface GeocodedAddressSummary {
+  displayName: string;
+  lat: number;
+  lon: number;
+}
+
+export interface ParkingSearchSuccessResponse {
+  status: "ok";
+  resolvedTime: ResolvedRequestTime;
+  // Echoes back what the address actually resolved to -- not explicitly
+  // speced before now, but the frontend needs this to confirm "we found
+  // your address as X" and to know the real center point results were
+  // measured from. Proposed addition, flagged for confirmation.
+  geocodedAddress: GeocodedAddressSummary;
+  results: CandidateResult[];
+  // Count before capping -- lets the frontend show "20 of 47 nearby" and
+  // know whether requesting limit: "all" would actually return more.
+  // Proposed addition, flagged for confirmation.
+  totalCandidateCount: number;
+}
+
+// --- "Valid request, nothing to show" responses ---------------------------
+//
+// Two genuinely different scenarios that must not be conflated, both
+// legitimate (non-error) outcomes of a well-formed request:
+//
+// 1. AddressNotFoundResponse: geocodeAddress.ts returned matched: false --
+//    we don't know where the address even is. No search was performed.
+// 2. A normal ParkingSearchSuccessResponse with results: [] and
+//    totalCandidateCount: 0 -- we resolved the address fine, but nothing
+//    (no blockface, no facility) exists within the given radius. This is
+//    NOT a distinct response type -- it's the ordinary success shape,
+//    just empty. No special-casing needed; both nearby_* RPCs already
+//    return empty arrays cleanly for this case (nothing here to design).
+
+// PROPOSAL (see this file's own header): address_not_found is modeled as
+// its own top-level status, not folded into the generic error envelope,
+// and NOT mapped to a 4xx/5xx status. Recommended HTTP status: 200.
+// Reasoning: the request itself was well-formed and fully processed --
+// "this address doesn't geocode" is domain information the frontend
+// renders (e.g. "we couldn't find that address, try being more specific"),
+// the same way a search returning zero matches is conventionally 200 with
+// an empty/flagged body, not a transport-level failure. A real, live
+// example already seen in this project's own LocationIQ investigation:
+// querying "zzzznonexistentaddressxyzabc123, Nowhereville" against the
+// real API is an entirely ordinary, expected occurrence (a typo, an
+// address outside LocationIQ's coverage), not a bug or an abuse case --
+// treating it as a 4xx would incorrectly imply the CLIENT violated the
+// API contract, when it didn't. The realistic alternative is 422
+// Unprocessable Entity ("syntactically valid, semantically unactionable")
+// -- open to that instead if you'd rather the frontend branch on status
+// code alone rather than inspecting the body's `status` field.
+export interface AddressNotFoundResponse {
+  status: "address_not_found";
+  // The exact, normalized query that failed to resolve -- useful for the
+  // frontend to echo back ("we couldn't find '123 fake st'") and for
+  // debugging/logs.
+  query: string;
+  message: string;
+}
+
+// --- Error responses -----------------------------------------------------
+//
+// PROPOSAL (see this file's own header): a client-contract violation
+// (malformed body, out-of-range radius, an invalid/too-far-future time
+// request, an invalid limit) is validated and rejected by the Edge
+// Function's OWN request-parsing layer, BEFORE calling either spatial-
+// search RPC or resolveRequestTime in a way that could throw a raw,
+// internal error message. This is a deliberate design decision, not
+// incidental: nearby_blockfaces/nearby_off_street_facilities already
+// enforce the same (0, 1000] radius bound themselves (a defense-in-depth
+// backstop, per migrations/017's own reasoning -- these RPCs are directly
+// callable by the anon key), but a raw Postgres RAISE EXCEPTION surfaced
+// through PostgREST is not a clean, stable, frontend-facing error contract
+// (its exact shape/status code was never verified against a real call in
+// this project, and shouldn't be relied on for user-facing behavior).
+// Likewise, resolveRequestTime.ts's thrown RangeErrors carry internal,
+// implementation-oriented message text not meant for direct display.
+// The Edge Function validates the SAME bounds itself first and returns a
+// clean InvalidRequestResponse; the RPC/resolveRequestTime's own
+// validation should in practice never be reached by a well-behaved Edge
+// Function, but remains as the last line of defense either way.
+export type InvalidRequestReason =
+  | "malformed_body" // missing/wrong-typed address, time, radiusMeters, or limit field; a `time.instant` string that fails to parse to a valid Date
+  | "invalid_radius" // radiusMeters <= 0 or > 1000 -- mirrors nearby_blockfaces/nearby_off_street_facilities' own bound exactly
+  | "time_too_far_in_future" // daysInFuture would exceed MAX_DAYS_IN_FUTURE (7 -- see confidenceScore.ts), called out as its own reason (not folded into invalid_time_request) so the frontend can show a specific "pick a time within the next 7 days" message
+  | "invalid_time_request" // a specific instant that resolves to the past, or an unrecognized quick option/type -- resolveRequestTime.ts's other real rejection cases
+  | "invalid_limit"; // limit present, not "all", and not a positive integer -- mirrors assembleSearchResults.ts's own validation exactly
+
+// All InvalidRequestReason cases map to HTTP 400 -- a genuine client-
+// contract violation in every case, distinct from the geocoding/upstream/
+// internal failure modes below.
+export interface InvalidRequestResponse {
+  status: "invalid_request";
+  reason: InvalidRequestReason;
+  message: string;
+}
+
+// PROPOSAL: geocodeAddress.ts throwing (LocationIQ's retries exhausted on
+// a sustained 429/5xx, a non-retryable failure like a bad API key, or an
+// unexpected/non-numeric coordinate in an otherwise-successful response --
+// see geocodeAddress.ts's own error classification) is a genuine upstream-
+// dependency failure, not the caller's fault and not our own
+// infrastructure's fault. Recommended HTTP status: 502 Bad Gateway (the
+// conventional status for "a service we depend on failed"). The message
+// shown to the frontend must be generic and safe -- never the raw thrown
+// error text, which could include internal detail (e.g. LocationIQ's own
+// response body) not meant for an end user.
+export interface GeocodingServiceUnavailableResponse {
+  status: "geocoding_service_unavailable";
+  message: string;
+}
+
+// PROPOSAL: every other failure -- occupancy_stats query errors
+// (assembleSearchResults.ts), a genuine (non-validation) failure from
+// either spatial-search RPC, a geocode_cache read/write failure
+// (geocodeAddress.ts), or anything else unanticipated -- is our own
+// infrastructure failing, not a third party and not the client. Recommended
+// HTTP status: 500 Internal Server Error. Same "never leak the raw
+// internal error text" rule as GeocodingServiceUnavailableResponse.
+export interface InternalErrorResponse {
+  status: "internal_error";
+  message: string;
+}
+
+// --- Top-level response union -----------------------------------------
+
+export type ParkingSearchResponse =
+  | ParkingSearchSuccessResponse
+  | AddressNotFoundResponse
+  | InvalidRequestResponse
+  | GeocodingServiceUnavailableResponse
+  | InternalErrorResponse;
+
+// Recommended HTTP status per response `status` value -- proposal, see
+// each response type's own comment above for the reasoning behind each.
+export const PARKING_SEARCH_HTTP_STATUS: Record<ParkingSearchResponse["status"], number> = {
+  ok: 200,
+  address_not_found: 200,
+  invalid_request: 400,
+  geocoding_service_unavailable: 502,
+  internal_error: 500,
+};
