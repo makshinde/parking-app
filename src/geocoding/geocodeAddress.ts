@@ -109,7 +109,13 @@ interface LocationIQSearchResult {
   [key: string]: unknown;
 }
 
-class LocationIQRequestError extends Error {
+// Exported so callers (e.g. the Edge Function orchestration layer) can
+// classify a caught error via `instanceof` -- "LocationIQ's HTTP call
+// itself failed" is a distinct, identifiable failure mode from a cache
+// read/write failure or any other unanticipated error this module might
+// throw, and that distinction matters for mapping to the right HTTP
+// status upstream.
+export class LocationIQRequestError extends Error {
   readonly retryable: boolean;
 
   constructor(message: string, retryable: boolean) {
