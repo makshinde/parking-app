@@ -58,8 +58,14 @@ it.
 - Frontend: built separately in Lovable
 - Backend: Supabase Edge Functions (TypeScript)
 - Database: Supabase Postgres with PostGIS
-- Data sources: Seattle SDOT open data (historical), OpenStreetMap
-  Nominatim (geocoding) and Overpass API (off-street lots)
+- Mapping: Leaflet with OpenStreetMap tiles
+- Geocoding: LocationIQ, not Nominatim -- a deliberate choice built for
+  from the start rather than a later migration. Nominatim's usage policy
+  caps requests at 1/second, which doesn't realistically scale to this
+  app's intended usage; LocationIQ is backed by the same OSM data but
+  offers a much higher free tier with no credit card required.
+- Data sources: Seattle SDOT open data (historical) and OpenStreetMap's
+  Overpass API (off-street lots)
 - LLM: used only for final synthesis of structured results into
   plain language, not for any core calculation
 - Predictions are precomputed by a periodic batch aggregation job that
