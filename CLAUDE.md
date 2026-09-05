@@ -538,6 +538,29 @@ function can have multiple kinds of input.
   scale (1 row) -- worth revisiting only if this exact pattern (a live
   accumulator count decreasing between two reads with no run actively
   writing) ever recurs at meaningful scale.
+- destination-autocomplete's LocationIQ Autocomplete results can differ,
+  sometimes significantly, between identical requests depending on which
+  HTTP client sends them. Live-confirmed with a byte-identical (once
+  decoded) request to the exact same URL: curl consistently returns the
+  correct result, Deno's fetch (this project's actual runtime) consistently
+  returns a different one, reproducibly across repeated attempts. Directly
+  ruled out, one at a time: query encoding (the built URL decodes
+  identically either way, confirmed via an httpbin echo test), header
+  differences (forcing User-Agent/Accept/Accept-Encoding to match curl
+  exactly made no difference), HTTP protocol version (curl forced to both
+  HTTP/1.1 and HTTP/2 was still correct), and CDN routing (both clients hit
+  the same Cloudflare edge PoP, confirmed via a matching cf-ray region
+  suffix). The effect isn't limited to the two queries that first surfaced
+  it ("Pigott Building", "Larry's Tavern") -- a known-working query ("pike
+  pl") also showed diverging results past the top 2 positions when compared
+  the same way; those two queries just happened to have their correct match
+  ranked fragile enough to get bumped off entirely. Most likely cause:
+  client-level fingerprinting (e.g. TLS/HTTP stack fingerprinting) on
+  LocationIQ's or an intermediary's side, not something fixable from our
+  own request parameters, encoding, or headers -- all three were tried
+  directly. Reported to LocationIQ support. No code changes made:
+  autocompleteDestination.ts's request-building was directly verified
+  correct, so none of our own code was found to be at fault.
 
 ## Out of scope (v1)
 
