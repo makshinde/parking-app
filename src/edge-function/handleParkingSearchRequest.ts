@@ -6,22 +6,38 @@ import {
   type NearbyOffStreetFacilityRow,
   type OccupancyStatsSupabaseClient,
 } from "../scoring/assembleSearchResults.ts";
+import { validateCoordinates } from "./validateCoordinates.ts";
 import {
   PARKING_SEARCH_HTTP_STATUS,
   type InvalidRequestReason,
+  type LocalAddressSuggestion,
   type ParkingSearchResponse,
+  type SearchCenterWire,
 } from "../edge-function-types/parkingSearchContract.ts";
 
 // --- RPC client shape -----------------------------------------------------
 //
-// Neither nearby_blockfaces nor nearby_off_street_facilities has a DI
-// interface of its own yet (they're called directly here, the one place
-// that needs to) -- narrow, table-name-generic pattern, same as every
-// other client interface in this project.
+// Neither nearby_blockfaces, nearby_off_street_facilities, nor
+// search_local_addresses has a DI interface of its own yet (they're
+// called directly here, the one place that needs to) -- narrow,
+// table-name-generic pattern, same as every other client interface in
+// this project.
 
 export interface RpcQueryResult<T> {
   data: T[] | null;
   error: { message: string } | null;
+}
+
+// Raw row shape returned by search_local_addresses (migrations/019/020) --
+// snake_case, matching the RPC's own column names, distinct from the
+// camelCase LocalAddressSuggestion wire type it gets mapped to below.
+export interface SearchLocalAddressesRow {
+  kind: "blockface" | "off_street_facility";
+  id: string;
+  display_text: string;
+  lat: number;
+  lon: number;
+  similarity: number;
 }
 
 export interface ParkingSearchRpcClient {
@@ -33,6 +49,10 @@ export interface ParkingSearchRpcClient {
     fn: "nearby_off_street_facilities",
     args: { center_lon: number; center_lat: number; radius_meters: number },
   ): PromiseLike<RpcQueryResult<NearbyOffStreetFacilityRow>>;
+  rpc(
+    fn: "search_local_addresses",
+    args: { query_text: string; match_limit: number },
+  ): PromiseLike<RpcQueryResult<SearchLocalAddressesRow>>;
 }
 
 // Three independently-typed fields rather than one combined client
@@ -108,7 +128,7 @@ function parseTimeWire(rawTime: unknown): PredictionTimeRequest | null {
 }
 
 interface ValidatedRequest {
-  address: string;
+  searchCenter: SearchCenterWire;
   time: PredictionTimeRequest;
   radiusMeters: number;
   limit: number | "all" | undefined;
@@ -116,6 +136,44 @@ interface ValidatedRequest {
 
 function invalidRequest(reason: InvalidRequestReason, message: string): HandleParkingSearchResult {
   return { response: { status: "invalid_request", reason, message }, status: PARKING_SEARCH_HTTP_STATUS.invalid_request };
+}
+
+// Validates the searchCenter discriminated union. An unrecognized/missing
+// `type`, or a malformed `address`-variant `query`, is malformed_body; a
+// coordinates-variant lat/lon outside real-world range or non-finite is
+// its own, more specific invalid_coordinates reason (see
+// validateCoordinates.ts) -- mirrors the same distinction
+// resolveRequestTime's day-bound errors already get (time_too_far_in_future
+// vs invalid_time_request) rather than folding everything into one
+// generic reason.
+function parseSearchCenter(rawSearchCenter: unknown): SearchCenterWire | HandleParkingSearchResult {
+  if (typeof rawSearchCenter !== "object" || rawSearchCenter === null) {
+    return invalidRequest("malformed_body", '"searchCenter" must be an object.');
+  }
+  const center = rawSearchCenter as Record<string, unknown>;
+
+  if (center.type === "address") {
+    if (typeof center.query !== "string" || center.query.trim() === "") {
+      return invalidRequest("malformed_body", '"searchCenter.query" must be a non-empty string.');
+    }
+    return { type: "address", query: center.query };
+  }
+
+  if (center.type === "coordinates") {
+    const validationError = validateCoordinates(center.lat, center.lon);
+    if (validationError !== null) {
+      return invalidRequest("invalid_coordinates", validationError);
+    }
+    if (center.label !== undefined && typeof center.label !== "string") {
+      return invalidRequest("malformed_body", '"searchCenter.label" must be a string, if provided.');
+    }
+    return { type: "coordinates", lat: center.lat as number, lon: center.lon as number, label: center.label as string | undefined };
+  }
+
+  return invalidRequest(
+    "malformed_body",
+    '"searchCenter" must be { type: "address", query: <non-empty string> } or { type: "coordinates", lat: <number>, lon: <number>, label?: <string> }.',
+  );
 }
 
 function parseAndValidateRequest(rawBody: string): ValidatedRequest | HandleParkingSearchResult {
@@ -131,8 +189,9 @@ function parseAndValidateRequest(rawBody: string): ValidatedRequest | HandlePark
   }
   const body = parsed as Record<string, unknown>;
 
-  if (typeof body.address !== "string" || body.address.trim() === "") {
-    return invalidRequest("malformed_body", '"address" must be a non-empty string.');
+  const searchCenter = parseSearchCenter(body.searchCenter);
+  if ("response" in searchCenter) {
+    return searchCenter;
   }
 
   const time = parseTimeWire(body.time);
@@ -162,7 +221,7 @@ function parseAndValidateRequest(rawBody: string): ValidatedRequest | HandlePark
     }
   }
 
-  return { address: body.address, time, radiusMeters, limit };
+  return { searchCenter, time, radiusMeters, limit };
 }
 
 // --- Error classification --------------------------------------------------
@@ -219,6 +278,50 @@ function classifyGeocodeError(err: unknown): HandleParkingSearchResult {
   return internalError();
 }
 
+// --- "Did you mean" fallback (Piece 4) --------------------------------
+
+// Only ever the top few -- this is a "did you mean X, Y, Z" fallback, not
+// a second search results list. Independent of assembleSearchResults.ts's
+// own DEFAULT_RESULT_LIMIT (20), which caps genuine search results, not
+// suggestions for a failed one.
+const SUGGESTION_MATCH_LIMIT = 5;
+
+function toLocalAddressSuggestion(row: SearchLocalAddressesRow): LocalAddressSuggestion {
+  return { kind: row.kind, id: row.id, displayText: row.display_text, lat: row.lat, lon: row.lon };
+}
+
+// Reuses search_local_addresses -- the same fuzzy-match function backing
+// live-typing autocomplete -- rather than a second, separate suggestion
+// mechanism. Called only here, sequentially AFTER geocoding has already
+// failed, not concurrently with geocodeAddress: running both in parallel
+// would add a database query to every SUCCESSFUL address search (the
+// common case) just to cover this uncommon failure case, in exchange for
+// latency savings that only matter on the already-uncommon failure path.
+async function buildAddressNotFoundResponse(rpcClient: ParkingSearchRpcClient, query: string): Promise<HandleParkingSearchResult> {
+  const normalizedQuery = query.trim().replace(/\s+/g, " ").toLowerCase();
+
+  const suggestionsResult = await rpcClient.rpc("search_local_addresses", { query_text: query, match_limit: SUGGESTION_MATCH_LIMIT });
+  // A suggestions-lookup failure degrades to an empty list, not
+  // internal_error -- the address genuinely wasn't found either way;
+  // suggestions are an enrichment on top of that outcome, not the primary
+  // one, so a secondary lookup failing shouldn't turn an honest
+  // "not found" into a 500.
+  if (suggestionsResult.error !== null) {
+    console.error("handleParkingSearchRequest: search_local_addresses (did-you-mean) failed:", suggestionsResult.error.message);
+  }
+  const suggestions = suggestionsResult.error !== null ? [] : (suggestionsResult.data ?? []).map(toLocalAddressSuggestion);
+
+  return {
+    response: {
+      status: "address_not_found",
+      query: normalizedQuery,
+      message: `We couldn't find a location matching "${query}". Try a more specific address.`,
+      suggestions,
+    },
+    status: PARKING_SEARCH_HTTP_STATUS.address_not_found,
+  };
+}
+
 // --- Main entry point --------------------------------------------------
 
 // Pure(ish) orchestration: no direct Request/Response/Deno.serve coupling,
@@ -236,7 +339,7 @@ export async function handleParkingSearchRequest(
   if ("response" in validated) {
     return validated;
   }
-  const { address, time, radiusMeters, limit } = validated;
+  const { searchCenter, time, radiusMeters, limit } = validated;
 
   let resolvedTime;
   try {
@@ -245,32 +348,51 @@ export async function handleParkingSearchRequest(
     return classifyResolveRequestTimeError(err);
   }
 
-  let geocodeResult;
-  try {
-    geocodeResult = await geocodeAddress(deps.geocodeCacheClient, deps.locationIqApiKey, address, now);
-  } catch (err) {
-    console.error("handleParkingSearchRequest: geocodeAddress failed:", err);
-    return classifyGeocodeError(err);
-  }
+  // Resolves searchCenter into a real center point + a ResolvedSearchCenter
+  // to echo back, via one of two entirely separate paths: "coordinates"
+  // skips geocodeAddress (and therefore LocationIQ and geocode_cache)
+  // entirely, while "address" behaves exactly as before Piece 2.
+  let centerLat: number;
+  let centerLon: number;
+  let resolvedCenter: { displayName: string; lat: number; lon: number; source: "geocoded" | "coordinates" };
 
-  if (!geocodeResult.matched) {
-    const normalizedQuery = address.trim().replace(/\s+/g, " ").toLowerCase();
-    return {
-      response: {
-        status: "address_not_found",
-        query: normalizedQuery,
-        message: `We couldn't find a location matching "${address}". Try a more specific address.`,
-      },
-      status: PARKING_SEARCH_HTTP_STATUS.address_not_found,
+  if (searchCenter.type === "coordinates") {
+    centerLat = searchCenter.lat;
+    centerLon = searchCenter.lon;
+    resolvedCenter = {
+      // Never guesses an address for a bare coordinate pair -- if the
+      // frontend didn't supply a label (e.g. from a clicked local
+      // suggestion, or an earlier reverse-geocode call), this falls back
+      // to an honest, plain description of the point itself.
+      displayName: searchCenter.label ?? `Custom location (${searchCenter.lat.toFixed(5)}, ${searchCenter.lon.toFixed(5)})`,
+      lat: searchCenter.lat,
+      lon: searchCenter.lon,
+      source: "coordinates",
     };
+  } else {
+    let geocodeResult;
+    try {
+      geocodeResult = await geocodeAddress(deps.geocodeCacheClient, deps.locationIqApiKey, searchCenter.query, now);
+    } catch (err) {
+      console.error("handleParkingSearchRequest: geocodeAddress failed:", err);
+      return classifyGeocodeError(err);
+    }
+
+    if (!geocodeResult.matched) {
+      return buildAddressNotFoundResponse(deps.rpcClient, searchCenter.query);
+    }
+
+    centerLat = geocodeResult.lat;
+    centerLon = geocodeResult.lon;
+    resolvedCenter = { displayName: geocodeResult.displayName, lat: geocodeResult.lat, lon: geocodeResult.lon, source: "geocoded" };
   }
 
   try {
     const [blockfacesResult, facilitiesResult] = await Promise.all([
-      deps.rpcClient.rpc("nearby_blockfaces", { center_lon: geocodeResult.lon, center_lat: geocodeResult.lat, radius_meters: radiusMeters }),
+      deps.rpcClient.rpc("nearby_blockfaces", { center_lon: centerLon, center_lat: centerLat, radius_meters: radiusMeters }),
       deps.rpcClient.rpc("nearby_off_street_facilities", {
-        center_lon: geocodeResult.lon,
-        center_lat: geocodeResult.lat,
+        center_lon: centerLon,
+        center_lat: centerLat,
         radius_meters: radiusMeters,
       }),
     ]);
@@ -303,7 +425,7 @@ export async function handleParkingSearchRequest(
       response: {
         status: "ok",
         resolvedTime,
-        geocodedAddress: { displayName: geocodeResult.displayName, lat: geocodeResult.lat, lon: geocodeResult.lon },
+        resolvedCenter,
         results,
         totalCandidateCount: blockfaceCandidates.length + facilityCandidates.length,
       },

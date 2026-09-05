@@ -1,5 +1,6 @@
 import { reverseGeocodeCoordinates, type ReverseGeocodeCacheSupabaseClient } from "../geocoding/reverseGeocodeCoordinates.ts";
 import { LocationIQRequestError } from "../geocoding/geocodeAddress.ts";
+import { validateCoordinates } from "./validateCoordinates.ts";
 import {
   REVERSE_GEOCODE_HTTP_STATUS,
   type ReverseGeocodeInvalidRequestReason,
@@ -20,29 +21,6 @@ export interface HandleReverseGeocodeResult {
 
 function invalidRequest(reason: ReverseGeocodeInvalidRequestReason, message: string): HandleReverseGeocodeResult {
   return { response: { status: "invalid_request", reason, message }, status: REVERSE_GEOCODE_HTTP_STATUS.invalid_request };
-}
-
-// Reject (don't clamp) both non-finite and merely out-of-real-world-range
-// values -- same reasoning as parkingSearchContract.ts's coordinates
-// variant (see that file's own comment): a map widget cannot structurally
-// produce an out-of-range value from a real drag, so one signals a bug,
-// not imprecise intent, and there's no meaningful "nearest valid"
-// coordinate to clamp toward.
-//
-// This check is inline here for now, not yet a shared helper -- Piece 2
-// (the parking-search searchCenter contract change) will need the
-// identical check in handleParkingSearchRequest.ts too, at which point
-// it's worth extracting into its own validateCoordinates.ts module rather
-// than duplicating it a second time. One caller doesn't yet justify that
-// abstraction.
-function validateCoordinates(lat: unknown, lon: unknown): string | null {
-  if (typeof lat !== "number" || !Number.isFinite(lat) || lat < -90 || lat > 90) {
-    return '"lat" must be a finite number between -90 and 90.';
-  }
-  if (typeof lon !== "number" || !Number.isFinite(lon) || lon < -180 || lon > 180) {
-    return '"lon" must be a finite number between -180 and 180.';
-  }
-  return null;
 }
 
 interface ValidatedRequest {
