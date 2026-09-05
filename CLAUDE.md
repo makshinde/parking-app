@@ -605,3 +605,36 @@ This repo is public, so anything committed is visible immediately, not just for 
 
 If a change leaves the app in a broken or non-functional state, do 
 not commit it yet. Wait until it's working again.
+
+### Applying database changes
+
+The Supabase CLI (installed at `~/bin/supabase`) is authenticated and
+linked to the live project, so direct database access (e.g. `supabase db
+query --linked`, applying a migration file directly against the live
+project) is technically possible now, not just the more limited
+PostgREST-based access the anon/service-role keys already provided.
+
+That capability does not by itself change the bar for what may be applied
+without the user's manual review first. The real rule is about the
+change itself, not about which tool applies it:
+
+- **Safe, cleanly reversible changes** -- creating a new function,
+  replacing an existing function's definition (`CREATE OR REPLACE
+  FUNCTION`), adding a new index -- may be applied directly against the
+  live project without requiring manual application first. These are
+  reversible by definition: a function can be replaced or dropped again,
+  an index can be dropped, with no data loss and no effect on any
+  existing row.
+- **Anything structurally significant or not cleanly reversible** --
+  dropping or altering a column, deleting rows, dropping a table,
+  changing a column's type -- still requires the user's explicit review
+  and manual application, exactly as this project's established practice
+  throughout (e.g. every `migrations/*.sql` file to date).
+- **When genuinely uncertain which category a change falls into, default
+  to asking first.** Never assume permission for something ambiguous just
+  because direct access happens to be technically available.
+
+This distinction applies regardless of whether the change is wrapped in a
+numbered migration file or run as a one-off query -- the numbered-migration
+convention governs how a change is tracked in source control, not whether
+it's safe to apply directly.
