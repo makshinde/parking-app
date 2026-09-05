@@ -842,19 +842,58 @@ CREATE INDEX idx_off_street_facilities_search_text_trgm ON off_street_facilities
 -- nearby_blockfaces/nearby_off_street_facilities' own radius_meters bound.
 --
 -- Ranking: each table's own nearest-by-trigram-distance top-(match_limit*4)
--- rows are pulled via the GiST-indexed `<->` KNN ordering (cheap, index-
--- assisted), combined, then filtered down with an explicit
--- similarity(...) > 0.25 floor -- applied only to that small combined set,
--- not the whole table -- and only then sorted/capped to match_limit. This
--- keeps a real similarity floor (so a genuinely unrelated query can
--- legitimately return zero suggestions) without ever touching the
--- session-level GUC/set_limit() footgun described above. 0.25 and the x4
--- overfetch factor are starting points, confirmed against real
--- misspelled/partial input in this migration's own live verification, not
--- values with any deeper theoretical justification.
+-- rows are pulled via a GiST-indexed KNN ordering (cheap, index-assisted),
+-- combined, then filtered/ranked using the gate_score/rank_score split
+-- described below -- applied only to that small combined set, not the
+-- whole table -- and only then sorted/capped to match_limit. This keeps a
+-- real similarity floor (so a genuinely unrelated query can legitimately
+-- return zero suggestions) without ever touching pg_trgm's session-level
+-- GUC/set_limit()/word_similarity_threshold footgun (unsafe under
+-- PostgREST's pooled connections, since a session-level mutation could
+-- leak onto a later, unrelated query sharing the same pooled connection).
+--
+-- blockfaces uses plain similarity() for both gating and ranking, and the
+-- `<->` KNN operator -- its search_text is short (a street name plus two
+-- cross streets and a side), live-verified to score comfortably above
+-- 0.25 for real partial/misspelled queries ("pike st", "pike",
+-- "3rd avenu").
+--
+-- off_street_facilities deliberately DECOUPLES inclusion from ranking
+-- (migrations/020, a fix to this function's original migrations/019
+-- version). Its search_text concatenates name with the FULL street
+-- address including city/state/zip, and that long, low-signal tail
+-- dilutes whole-string similarity() far more than blockfaces' much
+-- shorter search_text: a real, live-verified case ("westlke garag"
+-- against the real "2200 WESTLAKE GARAGE 81236") scored only 0.2075
+-- under similarity() -- below the floor, despite genuinely ranking #1 in
+-- raw KNN order. word_similarity() (best-matching CONTINUOUS SUBSTRING,
+-- not diluted across the whole string) scores that same real case at
+-- 0.647059 -- but switching off_street_facilities to word_similarity()
+-- for BOTH gating and ranking (an initial fix attempt, also live-tested)
+-- introduced a new regression: word_similarity() saturates at 1.0 for
+-- ANY exact contiguous-substring match, live-confirmed to affect
+-- blockfaces too, not just facilities -- once rows from both kinds tie
+-- at the ceiling, ranking by that same column becomes an arbitrary
+-- tiebreak, and a live "pike st" test showed genuinely-strong blockface
+-- matches getting silently pushed out of the combined top results by
+-- tied facility rows. The actual fix: word_similarity() decides
+-- `gate_score` (eligibility only, lenient enough to admit the
+-- westlke-garag case), but `rank_score` -- the value actually used for
+-- cross-kind ORDER BY and returned as `similarity` -- is always plain
+-- similarity(), the same non-saturating metric blockfaces use, so a
+-- facility that only barely clears the lenient gate is honestly ranked
+-- low (e.g. westlke-garag's real similarity() of 0.208), never
+-- artificially tied with or ahead of a genuinely strong blockface match.
+--
+-- KNN ordering is unaffected by the gate/rank split: off_street_
+-- facilities still use `<->>` (word-similarity-based distance, so enough
+-- real candidates survive the overfetch*4 cut before gate/rank logic
+-- runs), blockfaces still use `<->`. Both live-confirmed (EXPLAIN
+-- ANALYZE) to use the same GiST index (idx_off_street_facilities_search_
+-- text_trgm / idx_blockfaces_search_text_trgm, gist_trgm_ops) as before.
 --
 -- Results are ranked as one single combined list across both kinds
--- (ORDER BY similarity DESC LIMIT match_limit over the union), not
+-- (ORDER BY rank_score DESC LIMIT match_limit over the union), not
 -- top-N-per-kind -- "a small number of top matches" means one ranked list.
 CREATE OR REPLACE FUNCTION search_local_addresses(
   query_text text,
@@ -889,7 +928,8 @@ BEGIN
             || ' (' || b.side_of_street || ' side)' AS display_text,
           ST_Y(ST_LineInterpolatePoint(b.location::geometry, 0.5)) AS lat,
           ST_X(ST_LineInterpolatePoint(b.location::geometry, 0.5)) AS lon,
-          b.search_text
+          similarity(b.search_text, normalized_query) AS gate_score,
+          similarity(b.search_text, normalized_query) AS rank_score
         FROM blockfaces b
         ORDER BY b.search_text <-> normalized_query
         LIMIT overfetch_limit
@@ -902,9 +942,10 @@ BEGIN
           CASE WHEN f.address IS NOT NULL THEN f.name || ', ' || f.address ELSE f.name END AS display_text,
           ST_Y(f.location::geometry) AS lat,
           ST_X(f.location::geometry) AS lon,
-          f.search_text
+          word_similarity(normalized_query, f.search_text) AS gate_score,
+          similarity(f.search_text, normalized_query) AS rank_score
         FROM off_street_facilities f
-        ORDER BY f.search_text <-> normalized_query
+        ORDER BY f.search_text <->> normalized_query
         LIMIT overfetch_limit
       )
     )
@@ -914,16 +955,16 @@ BEGIN
       n.display_text,
       n.lat,
       n.lon,
-      similarity(n.search_text, normalized_query) AS similarity
+      n.rank_score AS similarity
     FROM nearest n
-    WHERE similarity(n.search_text, normalized_query) > 0.25
-    ORDER BY similarity DESC
+    WHERE n.gate_score > 0.25
+    ORDER BY n.rank_score DESC
     LIMIT match_limit;
 END;
 $$;
 
 COMMENT ON FUNCTION search_local_addresses(text, integer) IS
-  'Trigram-fuzzy-matches query_text against blockfaces and off_street_facilities, returning up to match_limit (default 5, capped at 10 -- out-of-range rejects rather than clamps) top matches ranked by similarity across both kinds combined. Each table''s own GiST-indexed top-(match_limit*4) nearest-by-trigram-distance rows are combined, then filtered by an explicit similarity > 0.25 floor and re-ranked -- deliberately not pg_trgm''s `%` operator/set_limit(), which rely on a session-level GUC unsafe under PostgREST''s pooled connections. Used both directly by the frontend for live-typing autocomplete and by handleParkingSearchRequest.ts for the "did you mean" fallback on a failed geocode. SECURITY INVOKER (the default): runs under the calling role''s own RLS context.';
+  'Trigram-fuzzy-matches query_text against blockfaces and off_street_facilities, returning up to match_limit (default 5, capped at 10 -- out-of-range rejects rather than clamps) top matches ranked by similarity across both kinds combined. Inclusion and ranking are deliberately decoupled for off_street_facilities (migrations/020): word_similarity() decides eligibility (lenient enough to admit a real match otherwise diluted by its long address/city/state/zip tail), but plain similarity() -- the same metric blockfaces use throughout -- decides ranking and the returned similarity value, since word_similarity() saturates at 1.0 for any exact contiguous-substring match (live-confirmed to affect both kinds, not just facilities) and would otherwise let substring ties arbitrarily crowd out genuinely-strong blockface matches from the combined ranking. Each table''s own GiST-indexed top-(match_limit*4) nearest rows (via `<->` for blockfaces, `<->>` for off_street_facilities -- both live-confirmed to use the same GiST gist_trgm_ops index) are combined before this gate/rank logic runs. Deliberately not pg_trgm''s `%`/`<%` operators or set_limit()/word_similarity_threshold, which rely on session-level GUCs unsafe under PostgREST''s pooled connections. Used both directly by the frontend for live-typing autocomplete and by handleParkingSearchRequest.ts for the "did you mean" fallback on a failed geocode. SECURITY INVOKER (the default): runs under the calling role''s own RLS context.';
 
 REVOKE ALL ON FUNCTION search_local_addresses(text, integer) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION search_local_addresses(text, integer) TO anon, authenticated, service_role;
