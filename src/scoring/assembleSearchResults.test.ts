@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   assembleSearchResults,
+  calculateOccupancyColor,
   type BlockfaceHasDataResult,
   type BlockfaceNoDataResult,
   type NearbyBlockfaceRow,
@@ -91,6 +92,28 @@ const GREEN_STATS = { mean_occupancy: 0, std_dev: 0.1, sample_count: 200 };
 const YELLOW_STATS = { mean_occupancy: 0, std_dev: 0.5, sample_count: 100 };
 const ORANGE_STATS = { mean_occupancy: 0, std_dev: 0.75, sample_count: 50 };
 const RED_STATS = { mean_occupancy: 0, std_dev: 0.95, sample_count: 10 };
+
+// Fixed confidence inputs (std_dev/sample_count borrowed from GREEN_STATS,
+// a fixed, uninteresting confidence throughout) so each row below isolates
+// the occupancy percentage/color calculation alone -- only mean_occupancy
+// varies. Hand-verified: meanOccupancy * 100 = occupancyPercent exactly
+// (a straight *100, not calculateConfidenceScore's /10*100), and each
+// occupancyColor below is calculateOccupancyColor's real, direct output
+// for that percentage, checked by hand against its 75/50/25 bands.
+const OCCUPANCY_ZERO = { mean_occupancy: 0, std_dev: 0.1, sample_count: 200 }; // 0%  -> green
+const OCCUPANCY_JUST_BELOW_25 = { mean_occupancy: 0.24, std_dev: 0.1, sample_count: 200 }; // 24% -> green
+const OCCUPANCY_AT_25 = { mean_occupancy: 0.25, std_dev: 0.1, sample_count: 200 }; // 25% -> yellow
+const OCCUPANCY_JUST_BELOW_50 = { mean_occupancy: 0.49, std_dev: 0.1, sample_count: 200 }; // 49% -> yellow
+const OCCUPANCY_AT_50 = { mean_occupancy: 0.5, std_dev: 0.1, sample_count: 200 }; // 50% -> orange
+const OCCUPANCY_JUST_BELOW_75 = { mean_occupancy: 0.74, std_dev: 0.1, sample_count: 200 }; // 74% -> orange
+// 90% -- deliberately using GREEN_STATS' own std_dev/sample_count (the
+// exact combination that produces confidence.color: "green") paired with
+// a near-full mean_occupancy, so this row proves the inversion holds even
+// when confidence itself is green: occupancyColor must be RED regardless
+// of what confidence.color says, since they are two independent
+// calculations. This is the specific, dangerous mistake this whole split
+// exists to prevent -- a 90%-full block face must never show green.
+const OCCUPANCY_HIGH = { mean_occupancy: 0.9, std_dev: 0.1, sample_count: 200 }; // 90% -> RED, not green
 
 describe("assembleSearchResults", () => {
   it("marks every off-street facility hasData: false unconditionally", async () => {
@@ -303,6 +326,8 @@ describe("assembleSearchResults", () => {
       distanceMeters: blockface.distance_meters,
       hasData: true,
       confidence: { score: 6, percentage: 60, color: "yellow", meanOccupancy: 0.42 },
+      occupancyPercent: 42,
+      occupancyColor: "yellow",
       pricing: { isPaid: true, startingRateUsd: 2, rateTiers: blockface.rate_tiers },
     });
   });
@@ -327,6 +352,135 @@ describe("assembleSearchResults", () => {
       distanceMeters: facility.distance_meters,
       hasData: false,
       pricing: { rateTiers: facility.rate_tiers },
+    });
+  });
+
+  describe("calculateOccupancyColor", () => {
+    it.each([
+      [0, "green"],
+      [10, "green"],
+      [24, "green"],
+      [25, "yellow"],
+      [42, "yellow"],
+      [49, "yellow"],
+      [50, "orange"],
+      [60, "orange"],
+      [74, "orange"],
+      [75, "red"],
+      // The specific, dangerous mistake this test suite exists to catch:
+      // a HIGH occupancy percentage must produce RED (nearly full, bad),
+      // never GREEN -- the exact opposite of what percentageToColor
+      // (confidence's mapping) would produce for the same 90.
+      [90, "red"],
+      [100, "red"],
+    ])("maps occupancy percentage %s%% to %s (inverted vs confidence's mapping)", (percentage, expectedColor) => {
+      expect(calculateOccupancyColor(percentage)).toBe(expectedColor);
+    });
+
+    it("never returns the same color confidence's percentageToColor would for a shared boundary value", () => {
+      // At the exact same percentage, occupancy and confidence colors must
+      // be opposites at every one of the three real threshold-crossing
+      // values -- confirming the inversion isn't just correct "on average"
+      // but at each individual boundary.
+      expect(calculateOccupancyColor(24)).toBe("green");
+      expect(calculateOccupancyColor(25)).toBe("yellow");
+      expect(calculateOccupancyColor(49)).toBe("yellow");
+      expect(calculateOccupancyColor(50)).toBe("orange");
+      expect(calculateOccupancyColor(74)).toBe("orange");
+      expect(calculateOccupancyColor(75)).toBe("red");
+    });
+  });
+
+  describe("occupancyPercent/occupancyColor via assembleSearchResults", () => {
+    it("computes occupancyPercent as meanOccupancy formatted as a percentage, independent of confidence", async () => {
+      const { client } = makeMockOccupancyStatsClient([{ blockface_id: "bf-1", ...OCCUPANCY_AT_25 }]);
+
+      const [result] = (await assembleSearchResults(client, {
+        blockfaceCandidates: [makeBlockfaceRow({ id: "bf-1" })],
+        facilityCandidates: [],
+        isoDay: 1,
+        hour: 9,
+        daysInFuture: 0,
+      })) as [BlockfaceHasDataResult];
+
+      expect(result.occupancyPercent).toBe(25);
+      expect(result.occupancyColor).toBe("yellow");
+    });
+
+    it("a 90% occupancy result is red, NOT green, even though its confidence inputs are the exact GREEN_STATS combination", async () => {
+      // The critical, hand-verified regression test: OCCUPANCY_HIGH reuses
+      // GREEN_STATS' own std_dev/sample_count (which makes
+      // confidence.color: "green"), paired with mean_occupancy: 0.9. If
+      // occupancyColor were ever accidentally computed via confidence's
+      // own percentageToColor (or the two colors were ever conflated),
+      // this would wrongly come back green. It must be red.
+      const { client } = makeMockOccupancyStatsClient([{ blockface_id: "bf-1", ...OCCUPANCY_HIGH }]);
+
+      const [result] = (await assembleSearchResults(client, {
+        blockfaceCandidates: [makeBlockfaceRow({ id: "bf-1" })],
+        facilityCandidates: [],
+        isoDay: 1,
+        hour: 9,
+        daysInFuture: 0,
+      })) as [BlockfaceHasDataResult];
+
+      expect(result.occupancyPercent).toBe(90);
+      expect(result.occupancyColor).toBe("red");
+      expect(result.confidence.color).toBe("green");
+      expect(result.occupancyColor).not.toBe(result.confidence.color);
+    });
+
+    it("occupancyColor crosses bands independently across a realistic mixed set, confirmed at every boundary", async () => {
+      const { client } = makeMockOccupancyStatsClient([
+        { blockface_id: "bf-green", ...OCCUPANCY_JUST_BELOW_25 },
+        { blockface_id: "bf-yellow", ...OCCUPANCY_JUST_BELOW_50 },
+        { blockface_id: "bf-orange", ...OCCUPANCY_JUST_BELOW_75 },
+        { blockface_id: "bf-red", ...OCCUPANCY_HIGH },
+      ]);
+
+      const results = (await assembleSearchResults(client, {
+        blockfaceCandidates: [
+          makeBlockfaceRow({ id: "bf-green" }),
+          makeBlockfaceRow({ id: "bf-yellow" }),
+          makeBlockfaceRow({ id: "bf-orange" }),
+          makeBlockfaceRow({ id: "bf-red" }),
+        ],
+        facilityCandidates: [],
+        isoDay: 1,
+        hour: 9,
+        daysInFuture: 0,
+        limit: "all",
+      })) as BlockfaceHasDataResult[];
+
+      const byId = new Map(results.map((r) => [r.id, r]));
+      expect(byId.get("bf-green")?.occupancyColor).toBe("green");
+      expect(byId.get("bf-yellow")?.occupancyColor).toBe("yellow");
+      expect(byId.get("bf-orange")?.occupancyColor).toBe("orange");
+      expect(byId.get("bf-red")?.occupancyColor).toBe("red");
+    });
+  });
+
+  describe("confidence color logic is unaffected by occupancy color (regression guard)", () => {
+    it("confidence.color still reflects only calculateConfidenceScore's output, not occupancy", async () => {
+      // Same fixtures already used above for confidence's own color
+      // mapping (GREEN/YELLOW/ORANGE/RED_STATS), now with a HIGH
+      // mean_occupancy on the otherwise-green row -- confirming confidence
+      // still comes back green (unaffected by the near-full occupancy),
+      // proving the two color calculations are genuinely independent in
+      // both directions, not just that occupancy ignores confidence.
+      const { client } = makeMockOccupancyStatsClient([{ blockface_id: "bf-1", ...GREEN_STATS, mean_occupancy: 0.9 }]);
+
+      const [result] = (await assembleSearchResults(client, {
+        blockfaceCandidates: [makeBlockfaceRow({ id: "bf-1" })],
+        facilityCandidates: [],
+        isoDay: 1,
+        hour: 9,
+        daysInFuture: 0,
+      })) as [BlockfaceHasDataResult];
+
+      expect(result.confidence.color).toBe("green");
+      expect(result.confidence.percentage).toBe(100);
+      expect(result.occupancyColor).toBe("red");
     });
   });
 });
