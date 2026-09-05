@@ -2,11 +2,18 @@
 // This is the single source of truth the frontend is built against --
 // consolidates what's already decided across resolveRequestTime.ts,
 // migrations/017's spatial-search RPCs, geocodeAddress.ts, and
-// assembleSearchResults.ts, plus a first proposal (flagged inline below,
-// see each block's own comment) for the error cases that weren't decided
-// by any of those pieces individually. DRAFT: the address_not_found /
-// invalid_request / geocoding_service_unavailable / internal_error
-// sections are a proposal pending confirmation, not yet treated as final.
+// assembleSearchResults.ts.
+//
+// Updated for the approved address-selection-flow design (Pieces 2 and 4):
+// the request now accepts EITHER a free-form address string (forward-
+// geocoded, the original path) OR direct coordinates as an alternative way
+// to specify the search center, skipping geocoding entirely -- covering
+// both a clicked local-suggestion result (search_local_addresses,
+// migrations/019/020) and a manually-dragged map pin, which isn't tied to
+// any known ID at all. This is a deliberate breaking change from the
+// original flat `address: string` field: nothing outside this repo
+// consumes this contract yet (no frontend built), so there is no
+// compatibility obligation to preserve.
 //
 // Type-only module -- no runtime logic, so it carries no portability
 // concerns of its own beyond the modules it re-exports types from (all of
@@ -28,9 +35,21 @@ import type { CandidateResult } from "../scoring/assembleSearchResults.ts";
 // in-memory/test callers, not as the request's first line of defense.
 export type PredictionTimeRequestWire = { type: "quick"; option: QuickTimeOption } | { type: "specific"; instant: string };
 
+// Either a free-form address (forward-geocoded via geocodeAddress.ts, the
+// original path) or direct coordinates, which skip geocoding entirely.
+// `label`, on the coordinates variant, is how reverse-geocoding and
+// parking-search stay decoupled: the frontend already knows a human-
+// readable label for the point before ever calling this endpoint -- either
+// from a clicked search_local_addresses suggestion's own display_text, or
+// from an earlier, separate call to the reverse-geocode Edge Function when
+// a pin was dragged (see reverseGeocodeContract.ts) -- so this endpoint
+// never needs to reverse-geocode on its own. Omitting `label` (e.g. a raw
+// API caller) falls back to a plain, honest coordinate description, never
+// a guessed address.
+export type SearchCenterWire = { type: "address"; query: string } | { type: "coordinates"; lat: number; lon: number; label?: string };
+
 export interface ParkingSearchRequestBody {
-  // Free-form address/query text, passed to geocodeAddress.ts as-is.
-  address: string;
+  searchCenter: SearchCenterWire;
   time: PredictionTimeRequestWire;
   // Meters, (0, 1000], matching nearby_blockfaces/nearby_off_street_facilities'
   // own radius_meters bound exactly (migrations/017). Omit for the default (200).
@@ -42,24 +61,27 @@ export interface ParkingSearchRequestBody {
 
 // --- Success response ----------------------------------------------------
 
-export interface GeocodedAddressSummary {
+export interface ResolvedSearchCenter {
   displayName: string;
   lat: number;
   lon: number;
+  // Lets the frontend distinguish "we geocoded your text" from "you gave
+  // us a point directly" without needing to remember which searchCenter
+  // variant it originally sent.
+  source: "geocoded" | "coordinates";
 }
 
 export interface ParkingSearchSuccessResponse {
   status: "ok";
   resolvedTime: ResolvedRequestTime;
-  // Echoes back what the address actually resolved to -- not explicitly
-  // speced before now, but the frontend needs this to confirm "we found
-  // your address as X" and to know the real center point results were
-  // measured from. Proposed addition, flagged for confirmation.
-  geocodedAddress: GeocodedAddressSummary;
+  // Echoes back what the search center actually resolved to -- the
+  // frontend needs this to confirm "we found your address as X" (or "you
+  // picked this point") and to know the real center point results were
+  // measured from.
+  resolvedCenter: ResolvedSearchCenter;
   results: CandidateResult[];
   // Count before capping -- lets the frontend show "20 of 47 nearby" and
   // know whether requesting limit: "all" would actually return more.
-  // Proposed addition, flagged for confirmation.
   totalCandidateCount: number;
 }
 
@@ -77,7 +99,7 @@ export interface ParkingSearchSuccessResponse {
 //    just empty. No special-casing needed; both nearby_* RPCs already
 //    return empty arrays cleanly for this case (nothing here to design).
 
-// PROPOSAL (see this file's own header): address_not_found is modeled as
+// address_not_found is modeled as
 // its own top-level status, not folded into the generic error envelope,
 // and NOT mapped to a 4xx/5xx status. Recommended HTTP status: 200.
 // Reasoning: the request itself was well-formed and fully processed --
@@ -101,11 +123,32 @@ export interface AddressNotFoundResponse {
   // debugging/logs.
   query: string;
   message: string;
+  // Reuses search_local_addresses -- the same fuzzy-match function used
+  // for live-typing autocomplete -- triggered specifically because the
+  // typed address both matched no local suggestion (or the frontend's own
+  // autocomplete wasn't used/ignored) and failed real LocationIQ
+  // geocoding. Always present, possibly [] -- never omitted, so the
+  // frontend never needs an existence check, the same convention
+  // ParkingSearchSuccessResponse.results already uses for a genuinely
+  // empty result set.
+  suggestions: LocalAddressSuggestion[];
+}
+
+// One row from search_local_addresses (migrations/019/020), reused
+// verbatim as the "did you mean" fallback above -- deliberately not a
+// separate suggestion mechanism. Field names match this project's usual
+// camelCase wire convention, not the RPC's raw snake_case columns.
+export interface LocalAddressSuggestion {
+  kind: "blockface" | "off_street_facility";
+  id: string;
+  displayText: string;
+  lat: number;
+  lon: number;
 }
 
 // --- Error responses -----------------------------------------------------
 //
-// PROPOSAL (see this file's own header): a client-contract violation
+// A client-contract violation
 // (malformed body, out-of-range radius, an invalid/too-far-future time
 // request, an invalid limit) is validated and rejected by the Edge
 // Function's OWN request-parsing layer, BEFORE calling either spatial-
@@ -125,8 +168,9 @@ export interface AddressNotFoundResponse {
 // validation should in practice never be reached by a well-behaved Edge
 // Function, but remains as the last line of defense either way.
 export type InvalidRequestReason =
-  | "malformed_body" // missing/wrong-typed address, time, radiusMeters, or limit field; a `time.instant` string that fails to parse to a valid Date
+  | "malformed_body" // missing/wrong-typed searchCenter, time, radiusMeters, or limit field; an unrecognized searchCenter.type; a `time.instant` string that fails to parse to a valid Date
   | "invalid_radius" // radiusMeters <= 0 or > 1000 -- mirrors nearby_blockfaces/nearby_off_street_facilities' own bound exactly
+  | "invalid_coordinates" // searchCenter.type === "coordinates" with a non-finite lat/lon or one outside real-world range ([-90,90]/[-180,180]) -- reject, don't clamp; see validateCoordinates.ts's own comment for the full reasoning
   | "time_too_far_in_future" // daysInFuture would exceed MAX_DAYS_IN_FUTURE (7 -- see confidenceScore.ts), called out as its own reason (not folded into invalid_time_request) so the frontend can show a specific "pick a time within the next 7 days" message
   | "invalid_time_request" // a specific instant that resolves to the past, or an unrecognized quick option/type -- resolveRequestTime.ts's other real rejection cases
   | "invalid_limit"; // limit present, not "all", and not a positive integer -- mirrors assembleSearchResults.ts's own validation exactly
@@ -140,7 +184,7 @@ export interface InvalidRequestResponse {
   message: string;
 }
 
-// PROPOSAL: geocodeAddress.ts throwing (LocationIQ's retries exhausted on
+// geocodeAddress.ts throwing (LocationIQ's retries exhausted on
 // a sustained 429/5xx, a non-retryable failure like a bad API key, or an
 // unexpected/non-numeric coordinate in an otherwise-successful response --
 // see geocodeAddress.ts's own error classification) is a genuine upstream-
@@ -155,7 +199,7 @@ export interface GeocodingServiceUnavailableResponse {
   message: string;
 }
 
-// PROPOSAL: every other failure -- occupancy_stats query errors
+// Every other failure -- occupancy_stats query errors
 // (assembleSearchResults.ts), a genuine (non-validation) failure from
 // either spatial-search RPC, a geocode_cache read/write failure
 // (geocodeAddress.ts), or anything else unanticipated -- is our own
@@ -176,8 +220,8 @@ export type ParkingSearchResponse =
   | GeocodingServiceUnavailableResponse
   | InternalErrorResponse;
 
-// Recommended HTTP status per response `status` value -- proposal, see
-// each response type's own comment above for the reasoning behind each.
+// HTTP status per response `status` value -- see each response type's own
+// comment above for the reasoning behind each.
 export const PARKING_SEARCH_HTTP_STATUS: Record<ParkingSearchResponse["status"], number> = {
   ok: 200,
   address_not_found: 200,

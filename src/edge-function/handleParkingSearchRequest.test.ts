@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { handleParkingSearchRequest, type HandleParkingSearchRequestDeps } from "./handleParkingSearchRequest";
+import { handleParkingSearchRequest, type HandleParkingSearchRequestDeps, type SearchLocalAddressesRow } from "./handleParkingSearchRequest";
 import type { GeocodeCacheSupabaseClient } from "../geocoding/geocodeAddress";
 import type { NearbyBlockfaceRow, NearbyOffStreetFacilityRow, OccupancyStatsSupabaseClient } from "../scoring/assembleSearchResults";
 import type { ParkingSearchRpcClient, RpcQueryResult } from "./handleParkingSearchRequest";
@@ -46,6 +46,8 @@ function makeMockDeps(
     blockfaceRpcError?: { message: string } | null;
     facilityRpcError?: { message: string } | null;
     occupancyStatsError?: { message: string } | null;
+    suggestionRows?: SearchLocalAddressesRow[];
+    suggestionRpcError?: { message: string } | null;
   } = {},
 ) {
   let cacheRow: Record<string, unknown> | null = null;
@@ -89,9 +91,17 @@ function makeMockDeps(
         };
         return Promise.resolve(result as unknown as RpcQueryResult<T>);
       }
-      const result: RpcQueryResult<NearbyOffStreetFacilityRow> = {
-        data: options.facilityRpcError ? null : (options.facilityRows ?? []),
-        error: options.facilityRpcError ?? null,
+      if (fn === "nearby_off_street_facilities") {
+        const result: RpcQueryResult<NearbyOffStreetFacilityRow> = {
+          data: options.facilityRpcError ? null : (options.facilityRows ?? []),
+          error: options.facilityRpcError ?? null,
+        };
+        return Promise.resolve(result as unknown as RpcQueryResult<T>);
+      }
+      // search_local_addresses
+      const result: RpcQueryResult<SearchLocalAddressesRow> = {
+        data: options.suggestionRpcError ? null : (options.suggestionRows ?? []),
+        error: options.suggestionRpcError ?? null,
       };
       return Promise.resolve(result as unknown as RpcQueryResult<T>);
     }) as ParkingSearchRpcClient["rpc"],
@@ -133,7 +143,7 @@ describe("handleParkingSearchRequest", () => {
 
   function validBody(overrides: Record<string, unknown> = {}): string {
     return JSON.stringify({
-      address: "4315 15th Ave NE, Seattle, WA",
+      searchCenter: { type: "address", query: "4315 15th Ave NE, Seattle, WA" },
       time: { type: "quick", option: "right_now" },
       ...overrides,
     });
@@ -148,15 +158,31 @@ describe("handleParkingSearchRequest", () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it("rejects a missing address", async () => {
+    it("rejects a missing searchCenter", async () => {
       const { deps } = makeMockDeps();
       const result = await handleParkingSearchRequest(deps, JSON.stringify({ time: { type: "quick", option: "right_now" } }), NOW);
       expect(result.response).toMatchObject({ status: "invalid_request", reason: "malformed_body" });
     });
 
-    it("rejects an empty address", async () => {
+    it("rejects an unrecognized searchCenter.type", async () => {
       const { deps } = makeMockDeps();
-      const result = await handleParkingSearchRequest(deps, validBody({ address: "   " }), NOW);
+      const result = await handleParkingSearchRequest(deps, validBody({ searchCenter: { type: "landmark", query: "the space needle" } }), NOW);
+      expect(result.response).toMatchObject({ status: "invalid_request", reason: "malformed_body" });
+    });
+
+    it("rejects an empty address query", async () => {
+      const { deps } = makeMockDeps();
+      const result = await handleParkingSearchRequest(deps, validBody({ searchCenter: { type: "address", query: "   " } }), NOW);
+      expect(result.response).toMatchObject({ status: "invalid_request", reason: "malformed_body" });
+    });
+
+    it("rejects a coordinates searchCenter with a non-string label", async () => {
+      const { deps } = makeMockDeps();
+      const result = await handleParkingSearchRequest(
+        deps,
+        validBody({ searchCenter: { type: "coordinates", lat: 47.6, lon: -122.3, label: 12345 } }),
+        NOW,
+      );
       expect(result.response).toMatchObject({ status: "invalid_request", reason: "malformed_body" });
     });
 
@@ -170,6 +196,24 @@ describe("handleParkingSearchRequest", () => {
       const { deps } = makeMockDeps();
       const result = await handleParkingSearchRequest(deps, validBody({ time: { type: "specific", instant: "not-a-date" } }), NOW);
       expect(result.response).toMatchObject({ status: "invalid_request", reason: "malformed_body" });
+    });
+  });
+
+  describe("request validation (invalid_coordinates)", () => {
+    it.each([
+      ["lat too high (91)", { lat: 91, lon: -122.3 }],
+      ["lat too low (-91)", { lat: -91, lon: -122.3 }],
+      ["lon too high (181)", { lat: 47.6, lon: 181 }],
+      ["lon too low (-181)", { lat: 47.6, lon: -181 }],
+      ["lat is NaN", { lat: Number.NaN, lon: -122.3 }],
+      ["lon is Infinity", { lat: 47.6, lon: Number.POSITIVE_INFINITY }],
+      ["lat is a string", { lat: "47.6", lon: -122.3 }],
+    ])("rejects %s", async (_label, coords) => {
+      const { deps } = makeMockDeps();
+      const result = await handleParkingSearchRequest(deps, validBody({ searchCenter: { type: "coordinates", ...coords } }), NOW);
+      expect(result.status).toBe(400);
+      expect(result.response).toMatchObject({ status: "invalid_request", reason: "invalid_coordinates" });
+      expect(fetchMock).not.toHaveBeenCalled();
     });
   });
 
@@ -212,16 +256,45 @@ describe("handleParkingSearchRequest", () => {
     });
   });
 
-  describe("geocoding outcomes", () => {
-    it("returns address_not_found (HTTP 200) when LocationIQ finds no match, without calling either RPC", async () => {
-      const { deps, rpcCalls } = makeMockDeps();
+  describe("geocoding outcomes (searchCenter.type === 'address')", () => {
+    it("returns address_not_found (HTTP 200) when LocationIQ finds no match, with real suggestions from search_local_addresses", async () => {
+      const suggestionRows: SearchLocalAddressesRow[] = [
+        { kind: "blockface", id: "bf-1", display_text: "PIKE ST between 1ST AVE and 2ND AVE (N side)", lat: 47.61, lon: -122.34, similarity: 0.4 },
+      ];
+      const { deps, rpcCalls } = makeMockDeps({ suggestionRows });
       fetchMock.mockResolvedValueOnce(NO_MATCH_RESPONSE);
 
-      const result = await handleParkingSearchRequest(deps, validBody({ address: "zzzznonexistentaddressxyz" }), NOW);
+      const result = await handleParkingSearchRequest(deps, validBody({ searchCenter: { type: "address", query: "zzzznonexistentaddressxyz" } }), NOW);
 
       expect(result.status).toBe(200);
-      expect(result.response).toMatchObject({ status: "address_not_found", query: "zzzznonexistentaddressxyz" });
-      expect(rpcCalls).toHaveLength(0);
+      expect(result.response).toMatchObject({
+        status: "address_not_found",
+        query: "zzzznonexistentaddressxyz",
+        suggestions: [{ kind: "blockface", id: "bf-1", displayText: "PIKE ST between 1ST AVE and 2ND AVE (N side)", lat: 47.61, lon: -122.34 }],
+      });
+      // Only the suggestions RPC is called -- not either spatial-search RPC.
+      expect(rpcCalls).toHaveLength(1);
+      expect(rpcCalls[0]).toMatchObject({ fn: "search_local_addresses", args: { query_text: "zzzznonexistentaddressxyz", match_limit: 5 } });
+    });
+
+    it("returns address_not_found with an empty suggestions list when nothing local matches either", async () => {
+      const { deps } = makeMockDeps({ suggestionRows: [] });
+      fetchMock.mockResolvedValueOnce(NO_MATCH_RESPONSE);
+
+      const result = await handleParkingSearchRequest(deps, validBody({ searchCenter: { type: "address", query: "zzzznonexistentaddressxyz" } }), NOW);
+
+      expect(result.response).toMatchObject({ status: "address_not_found", suggestions: [] });
+    });
+
+    it("degrades to an empty suggestions list (not internal_error) when search_local_addresses itself fails", async () => {
+      const { deps } = makeMockDeps({ suggestionRpcError: { message: "connection reset" } });
+      fetchMock.mockResolvedValueOnce(NO_MATCH_RESPONSE);
+
+      const result = await handleParkingSearchRequest(deps, validBody({ searchCenter: { type: "address", query: "zzzznonexistentaddressxyz" } }), NOW);
+
+      expect(result.status).toBe(200);
+      expect(result.response).toMatchObject({ status: "address_not_found", suggestions: [] });
+      expect(JSON.stringify(result.response)).not.toMatch(/connection reset/);
     });
 
     it("returns geocoding_service_unavailable (502) when LocationIQ's retries are exhausted", async () => {
@@ -248,6 +321,47 @@ describe("handleParkingSearchRequest", () => {
 
       expect(result.status).toBe(502);
       expect(result.response).toMatchObject({ status: "geocoding_service_unavailable" });
+    });
+  });
+
+  describe("coordinates path (searchCenter.type === 'coordinates')", () => {
+    it("skips geocodeAddress entirely and never calls LocationIQ", async () => {
+      const { deps, rpcCalls } = makeMockDeps();
+
+      const result = await handleParkingSearchRequest(deps, validBody({ searchCenter: { type: "coordinates", lat: 47.61, lon: -122.34 } }), NOW);
+
+      expect(result.status).toBe(200);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(rpcCalls).toContainEqual({
+        fn: "nearby_blockfaces",
+        args: { center_lon: -122.34, center_lat: 47.61, radius_meters: 200 },
+      });
+    });
+
+    it("echoes the caller-supplied label as resolvedCenter.displayName, with source: coordinates", async () => {
+      const { deps } = makeMockDeps();
+
+      const result = await handleParkingSearchRequest(
+        deps,
+        validBody({ searchCenter: { type: "coordinates", lat: 47.61, lon: -122.34, label: "3rd Ave & Pike St" } }),
+        NOW,
+      );
+
+      expect(result.response).toMatchObject({
+        status: "ok",
+        resolvedCenter: { displayName: "3rd Ave & Pike St", lat: 47.61, lon: -122.34, source: "coordinates" },
+      });
+    });
+
+    it("falls back to an honest coordinate description when no label is supplied", async () => {
+      const { deps } = makeMockDeps();
+
+      const result = await handleParkingSearchRequest(deps, validBody({ searchCenter: { type: "coordinates", lat: 47.61, lon: -122.34 } }), NOW);
+
+      expect(result.response).toMatchObject({
+        status: "ok",
+        resolvedCenter: { displayName: "Custom location (47.61000, -122.34000)", source: "coordinates" },
+      });
     });
   });
 
@@ -314,7 +428,7 @@ describe("handleParkingSearchRequest", () => {
       expect(result.response).toMatchObject({
         status: "ok",
         resolvedTime: { isoDay: 1, hour: 14 },
-        geocodedAddress: { lat: 47.6592579, lon: -122.3124109 },
+        resolvedCenter: { lat: 47.6592579, lon: -122.3124109, source: "geocoded" },
         totalCandidateCount: 2,
       });
       if (result.response.status === "ok") {
