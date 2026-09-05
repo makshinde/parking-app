@@ -135,6 +135,30 @@ function percentageToColor(percentage: number): ConfidenceColor {
   return "red";
 }
 
+// --- Occupancy percentage/color -------------------------------------------
+
+// meanOccupancy is already a 0-1 ratio (unlike calculateConfidenceScore's
+// 0-10 integer score), so this is a straight *100, not a /10*100 like
+// scoreToPercentage above.
+function occupancyToPercentage(meanOccupancy: number): number {
+  return meanOccupancy * 100;
+}
+
+// Same 75/50/25 percentage bands as confidence's percentageToColor, but
+// DELIBERATELY INVERTED: for confidence, high is good (green); for
+// occupancy, high is bad (nearly full, red) and low is good (available,
+// green) -- the exact opposite direction. This is its own function, not a
+// reuse of percentageToColor, specifically so the two can never be
+// accidentally swapped or share a bug -- confirmed by this file's own
+// tests that a 90% occupancy reading produces red, never green, the
+// dangerous mistake this split guards against.
+export function calculateOccupancyColor(percentage: number): ConfidenceColor {
+  if (percentage >= 75) return "red";
+  if (percentage >= 50) return "orange";
+  if (percentage >= 25) return "yellow";
+  return "green";
+}
+
 // --- Result shape ----------------------------------------------------------
 
 export interface BlockfacePricing {
@@ -165,6 +189,13 @@ export interface BlockfaceHasDataResult extends BaseCandidateResult {
   type: "blockface";
   hasData: true;
   confidence: BlockfaceConfidence;
+  // Predicted occupancy, as its own primary, color-coded field -- distinct
+  // from confidence.percentage/confidence.color, and NOT the same
+  // percentage-to-color mapping: occupancyColor is inverted relative to
+  // confidence.color (low occupancy is good/green, high is bad/red -- see
+  // calculateOccupancyColor's own comment).
+  occupancyPercent: number; // 0-100, confidence.meanOccupancy formatted as a percentage
+  occupancyColor: ConfidenceColor;
   pricing: BlockfacePricing;
 }
 
@@ -218,17 +249,20 @@ function buildBlockfaceResult(
   }
 
   const score = calculateConfidenceScore(statsRow.sample_count, statsRow.std_dev, daysInFuture);
-  const percentage = scoreToPercentage(score);
+  const confidencePercentage = scoreToPercentage(score);
+  const occupancyPercentage = occupancyToPercentage(statsRow.mean_occupancy);
 
   return {
     ...base,
     hasData: true,
     confidence: {
       score,
-      percentage,
-      color: percentageToColor(percentage),
+      percentage: confidencePercentage,
+      color: percentageToColor(confidencePercentage),
       meanOccupancy: statsRow.mean_occupancy,
     },
+    occupancyPercent: occupancyPercentage,
+    occupancyColor: calculateOccupancyColor(occupancyPercentage),
   };
 }
 
