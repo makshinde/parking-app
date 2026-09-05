@@ -562,6 +562,33 @@ function can have multiple kinds of input.
   autocompleteDestination.ts's request-building was directly verified
   correct, so none of our own code was found to be at fault.
 
+  Two follow-up questions were directly tested, not left as speculation.
+  First: does a different HTTP client within Deno avoid this? No --
+  npm:undici's own fetch (a genuinely independent client implementation,
+  not just a wrapper around Deno's native one) still returned the same
+  wrong result. Only shelling out to the real curl BINARY as a subprocess
+  (Deno.Command) got the correct result, which pins the root cause
+  definitively to Deno's own TLS/socket layer itself, underneath any
+  JS-level HTTP library -- but this isn't a usable fix: Supabase's Edge
+  Function sandbox doesn't support subprocess execution at all, and
+  granting that in a production serverless function wouldn't be
+  advisable even if it did. There is no free, code-only fix available
+  from within what's actually deployable here.
+
+  Second: does this same discrepancy affect forward or reverse geocoding
+  too (geocodeAddress.ts / reverseGeocodeCoordinates.ts, both already
+  live in production), not just autocomplete? Directly tested, not
+  assumed: the same byte-identical-URL curl-vs-Deno comparison against
+  three real forward-geocoding queries (including the exact "Pigott
+  Building" and "Larry's Tavern" queries that fail for autocomplete,
+  plus a fuzzier, unqualified version of one to stress its ranking the
+  same way) and two real reverse-geocoding points -- all five matched
+  exactly between curl and Deno, no divergence found. This issue appears
+  specific to the /v1/autocomplete endpoint alone, not a blanket
+  LocationIQ/Cloudflare policy across their whole API -- the
+  already-shipped parking-search and reverse-geocode paths show no
+  evidence of being silently degraded by it.
+
 ## Out of scope (v1)
 
 - Individually owned/rented parking spaces (driveway rentals, etc., the
