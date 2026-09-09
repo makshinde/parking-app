@@ -588,6 +588,33 @@ function can have multiple kinds of input.
   LocationIQ/Cloudflare policy across their whole API -- the
   already-shipped parking-search and reverse-geocode paths show no
   evidence of being silently degraded by it.
+- **PostGIS (and pg_trgm) live in the `extensions` schema on this project,
+  not `public`.** Live-verified via pg_extension. Any function that uses
+  spatial types/casts (`geography`, `geometry`) or trigram operators/
+  functions (`similarity`, `word_similarity`, `<->`, `<%`, etc.) and
+  pins its own `search_path` (via `SET search_path = ...` in its
+  definition, e.g. for the real, legitimate "Function Search Path
+  Mutable" security advisory) MUST explicitly include `extensions` in
+  that search_path, or those types/operators silently fail to resolve --
+  even though an ordinary ad hoc session resolves them fine, since a
+  plain session's own default search_path
+  (`"$user", public, extensions`) already includes it. A function's
+  pinned search_path is independent of the calling session's, so it
+  doesn't inherit that default.
+
+  This is not hypothetical: exactly this happened live on 2026-09-09.
+  An automated security remediation (Lovable's "Try to fix all" tool)
+  pinned `search_path=public, pg_catalog` -- a reasonable-looking fix in
+  general, but missing `extensions` -- on nearby_blockfaces, nearby_off_
+  street_facilities, and search_local_addresses, breaking every one of
+  them (`ERROR: 42704: type "geography"/"geometry" does not exist`) and
+  taking down parking-search and destination search entirely, with no
+  code or deployment change involved at all. Fixed live and captured as
+  tracked history in migrations/022_fix_function_search_path_missing_
+  extensions.sql. Any future automated tool, manual security pass, or a
+  fresh database rebuild touching function search_path settings must
+  account for this project's non-default extensions schema, or this
+  exact regression will silently reoccur.
 
 ## Out of scope (v1)
 
