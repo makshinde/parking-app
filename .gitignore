@@ -5,3 +5,4 @@ node_modules
 .DS_Store
 Supabase Table Exports/
 supabase/.temp/
+backtest-output/
