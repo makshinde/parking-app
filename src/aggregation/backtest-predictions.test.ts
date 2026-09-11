@@ -472,16 +472,19 @@ describe("computeSummary", () => {
     expect(summary.confidenceErrorCorrelation).toBeLessThan(0);
   });
 
-  it("separates the named capitol_hill_saturday and general slices", () => {
+  it("separates the named capitol_hill_saturday, general, and confidence_spread slices", () => {
     const results = [
       makeResult({ slice: "capitol_hill_saturday", absErrorSingleNearest: 0.4, errorSingleNearest: 0.4 }),
       makeResult({ slice: "general", absErrorSingleNearest: 0.1, errorSingleNearest: 0.1 }),
+      makeResult({ slice: "confidence_spread", absErrorSingleNearest: 0.2, errorSingleNearest: 0.2 }),
     ];
     const summary = computeSummary(results);
     const capitolHill = summary.slices.find((s) => s.name === "capitol_hill_saturday");
     const general = summary.slices.find((s) => s.name === "general");
+    const confidenceSpread = summary.slices.find((s) => s.name === "confidence_spread");
     expect(capitolHill?.maeSingleNearest).toBeCloseTo(0.4, 10);
     expect(general?.maeSingleNearest).toBeCloseTo(0.1, 10);
+    expect(confidenceSpread?.maeSingleNearest).toBeCloseTo(0.2, 10);
   });
 
   it("attaches a bootstrap result to every non-empty slice", () => {
@@ -613,4 +616,18 @@ describe("TEST_CASES", () => {
     expect(multiOccCases.every((tc) => tc.slice === "capitol_hill_saturday")).toBe(true);
   });
 
+  it("includes the confidence_spread slice, with varying-length training windows for the same blockface/day/hour", () => {
+    const confidenceSpreadCases = TEST_CASES.filter((tc) => tc.slice === "confidence_spread");
+    // 4 blockfaces x 2 day/hour combos x 4 cutoffs (see buildConfidenceSpreadTestCases).
+    expect(confidenceSpreadCases.length).toBe(32);
+    // Every one of these cutoffs is deliberately early in the 2025 archive
+    // (a short training window, see that function's own comment) --
+    // distinct from every capitol_hill_saturday/general cutoff, which are
+    // all several months to a year in.
+    const cutoffs = new Set(confidenceSpreadCases.map((tc) => tc.cutoffDateOnly));
+    expect(cutoffs.size).toBe(4);
+    for (const cutoff of cutoffs) {
+      expect(cutoff.startsWith("2025-0")).toBe(true); // January-April 2025
+    }
+  });
 });

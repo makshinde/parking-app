@@ -182,7 +182,7 @@ export interface TestCase {
   // "YYYY-MM-DD", Pacific-local, always midnight -- see pacificMidnightInstant.
   cutoffDateOnly: string;
   horizonDays: number;
-  slice: "capitol_hill_saturday" | "general";
+  slice: "capitol_hill_saturday" | "general" | "confidence_spread";
 }
 
 interface BlockfaceIdentity {
@@ -308,6 +308,75 @@ function buildGeneralTestCases(): TestCase[] {
   return cases;
 }
 
+// --- Confidence-spread slice -------------------------------------------
+//
+// The two slices above all use training windows of several months to a
+// full year -- live-verified (this harness's own design investigation) to
+// produce sample_count in the hundreds to low thousands for every real
+// bucket checked, which saturates calculateConfidenceScore's sample-size
+// term (maxes out at sample_count=200) and, combined with these blocks'
+// own real, consistently low stdDev (~0.05-0.22 in every bucket checked),
+// means every case in those two slices lands at confidence score 8 or 9.
+// That's real behavior, not a bug -- but it leaves no genuine LOW- or
+// MID-confidence case anywhere in the list, which is exactly what a real
+// calibration curve needs to be worth anything.
+//
+// The lever that actually moves the score for these specific real blocks
+// is training-window LENGTH: a genuinely short window has fewer real
+// occurrences to draw from, before sample_count ever gets near saturation.
+// Four early-2025 cutoffs below were live-verified directly against
+// Socrata (this harness's own design investigation, not guessed) to
+// produce real, substantially different sample counts for the same
+// blockface/day/hour bucket:
+//   cutoff        training window     real sample_count (broadway_e_side, Sat 19:00)
+//   2025-01-08    ~1 week (1 occurrence)   60
+//   2025-01-22    ~3 weeks                 180
+//   2025-02-19    ~7 weeks                 420
+//   2025-04-16    ~15 weeks                900
+// 60 readings is close to the real floor for a weekly bucket in this
+// dataset (matching CLAUDE.md's own bimodal 0-or-60+ finding -- a bucket
+// with at least one real occurrence never lands much below 60), so this
+// range doesn't reach confidenceScore's true 0-3 floor for these specific
+// blocks (their real stdDev just isn't high enough to get there on its
+// own) -- an honest, live-verified limit of this technique against these
+// real blocks, not something worth faking by inventing unrealistic data.
+// It DOES produce a genuine, real spread across multiple distinct
+// confidence-score buckets instead of just two, which is what actually
+// makes a calibration curve buildable.
+const CONFIDENCE_SPREAD_BLOCKFACES: readonly BlockfaceIdentity[] = [
+  CAPITOL_HILL_BLOCKFACES[0] as BlockfaceIdentity, // broadway_e_side
+  CAPITOL_HILL_BLOCKFACES[1] as BlockfaceIdentity, // broadway_w_side (low-capacity)
+  CAPITOL_HILL_BLOCKFACES[3] as BlockfaceIdentity, // pike_s_side
+  GENERAL_BLOCKFACES[5] as BlockfaceIdentity, // ballard_ave_nw_ballard
+];
+const CONFIDENCE_SPREAD_CUTOFFS: readonly string[] = ["2025-01-08", "2025-01-22", "2025-02-19", "2025-04-16"];
+const CONFIDENCE_SPREAD_DAY_HOUR_COMBOS: readonly { isoDay: number; hour: number }[] = [
+  { isoDay: 6, hour: 19 }, // Saturday evening
+  { isoDay: 3, hour: 12 }, // Wednesday midday
+];
+
+function buildConfidenceSpreadTestCases(): TestCase[] {
+  const cases: TestCase[] = [];
+  for (const blockface of CONFIDENCE_SPREAD_BLOCKFACES) {
+    for (const { isoDay, hour } of CONFIDENCE_SPREAD_DAY_HOUR_COMBOS) {
+      for (const cutoffDateOnly of CONFIDENCE_SPREAD_CUTOFFS) {
+        cases.push({
+          label: `confspread_${blockface.name}_iso${isoDay}_h${hour}_${cutoffDateOnly}`,
+          blockfaceId: blockface.blockfaceId,
+          sourceElementKey: blockface.sourceElementKey,
+          sideOfStreet: blockface.sideOfStreet,
+          isoDay,
+          hour,
+          cutoffDateOnly,
+          horizonDays: STANDARD_HORIZON_DAYS,
+          slice: "confidence_spread",
+        });
+      }
+    }
+  }
+  return cases;
+}
+
 // The full, fixed test-case list -- decided and committed before this
 // script is ever run against real results, per this harness's own design
 // requirement (see the PR/commit this file was introduced in): nothing
@@ -316,6 +385,7 @@ export const TEST_CASES: readonly TestCase[] = [
   ...buildCapitolHillSaturdayEveningTestCases(),
   ...buildCapitolHillMultiOccurrenceTestCases(),
   ...buildGeneralTestCases(),
+  ...buildConfidenceSpreadTestCases(),
 ];
 
 // --- Socrata query building -------------------------------------------------
@@ -872,6 +942,7 @@ export function computeSummary(results: readonly TestCaseResult[]): SummaryRepor
   const slices: SliceSummary[] = [
     summarizeSlice("capitol_hill_saturday", results.filter((r) => r.slice === "capitol_hill_saturday")),
     summarizeSlice("general", results.filter((r) => r.slice === "general")),
+    summarizeSlice("confidence_spread", results.filter((r) => r.slice === "confidence_spread")),
     summarizeSlice(`low_capacity (<${LOW_CAPACITY_THRESHOLD} spaces)`, results.filter((r) => r.lowCapacity)),
     summarizeSlice(
       `standard_capacity (>=${LOW_CAPACITY_THRESHOLD} spaces)`,
