@@ -588,6 +588,38 @@ function can have multiple kinds of input.
   LocationIQ/Cloudflare policy across their whole API -- the
   already-shipped parking-search and reverse-geocode paths show no
   evidence of being silently degraded by it.
+
+  Real fix status, as of 2026-09-11: Google Places Autocomplete (New)
+  (`POST places.googleapis.com/v1/places:autocomplete`) has been chosen as
+  the actual fix -- live-verified via Google's real Maps Demo Key (no
+  credit card, confirmed to genuinely cover "Autocomplete (...API)", not
+  just basic map display): the real Autocomplete endpoint correctly
+  resolved both "Pigott Building" and "Larry's Tavern" -- the exact two
+  queries that fail against LocationIQ -- with no sign of the same
+  curl-vs-Deno fingerprinting discrepancy. Mapbox and HERE were
+  considered as alternatives too, but NOT actually tested -- both would
+  have needed a real account signed up first (something Claude cannot do
+  even when asked), and the investigation moved directly to Google's
+  no-signup-required Demo Key instead of ever completing that signup, so
+  there is no real comparative data for Mapbox/HERE, only LocationIQ and
+  Google. (Separately, Places' `parkingOptions` field -- real, but
+  Place-Details-only, gated behind the expensive Enterprise + Atmosphere
+  SKU, and carrying no actual availability data -- was investigated and
+  ruled out on its own; it is not part of this Autocomplete decision.)
+
+  The actual code swap (destination-autocomplete's internal
+  implementation, from LocationIQ to Google Places Autocomplete) has
+  **deliberately not been started yet**. It's blocked on the user
+  completing real Google Cloud billing setup: the Demo Key just verified
+  above is explicitly test-only per Google's own docs, and a real
+  production `GOOGLE_PLACES_API_KEY` requires a real GCP project with
+  billing enabled first. This is a deliberate, informed decision to wait
+  for that prerequisite, not an overlooked or abandoned bug -- once
+  billing is set up, the swap itself (keeping destinationAutocompleteContract.ts's
+  external contract unchanged, implementing Google's session-token
+  billing model correctly so Autocomplete stays free at real scale, and
+  live-verifying Google's real error shapes rather than assuming they
+  mirror LocationIQ's) is scoped and ready to build.
 - **PostGIS (and pg_trgm) live in the `extensions` schema on this project,
   not `public`.** Live-verified via pg_extension. Any function that uses
   spatial types/casts (`geography`, `geometry`) or trigram operators/
