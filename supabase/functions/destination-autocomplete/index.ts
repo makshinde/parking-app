@@ -24,15 +24,15 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-const locationIqApiKey = Deno.env.get("LOCATIONIQ_API_KEY");
+const googlePlacesApiKey = Deno.env.get("GOOGLE_PLACES_API_KEY");
 
-if (locationIqApiKey === undefined) {
+if (googlePlacesApiKey === undefined) {
   throw new Error(
-    "destination-autocomplete: missing required environment variable LOCATIONIQ_API_KEY -- must be set via `supabase secrets set` (already done for parking-search/reverse-geocode -- this function reuses the same project secret).",
+    "destination-autocomplete: missing required environment variable GOOGLE_PLACES_API_KEY -- must be set via `supabase secrets set` (the real, billing-enabled key, never the test-only GOOGLE_MAPS_DEMO_KEY -- see CLAUDE.md's Known open questions).",
   );
 }
 
-const deps: HandleDestinationAutocompleteRequestDeps = { locationIqApiKey };
+const deps: HandleDestinationAutocompleteRequestDeps = { googlePlacesApiKey };
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { handleDestinationAutocompleteRequest, type HandleDestinationAutocompleteRequestDeps } from "./handleDestinationAutocompleteRequest";
+import { handleDestinationAutocompleteRequest, type HandleDestinationAutocompleteRequestDeps } from "./handleDestinationAutocompleteRequest.ts";
 
-const API_KEY = "test-locationiq-key";
+const API_KEY = "test-google-places-key";
 
 function jsonResponse(body: unknown, init?: { ok?: boolean; status?: number; statusText?: string }) {
   return {
@@ -12,22 +12,26 @@ function jsonResponse(body: unknown, init?: { ok?: boolean; status?: number; sta
   } as Response;
 }
 
-function makeAutocompleteResult(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+function makePlacePrediction(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    place_id: "323319931923",
-    lat: "47.60939675",
-    lon: "-122.34141018",
-    display_name: "Pike Place Market, 2nd Avenue Cycletrack, Central Business District, Belltown, Seattle, King County, Washington, 98101, USA",
-    display_place: "Pike Place Market",
-    display_address: "2nd Avenue Cycletrack, Central Business District, Belltown, Seattle, King County, Washington, 98101, USA",
-    ...overrides,
+    placePrediction: {
+      placeId: "ChIJy9ZRwbJqkFQRHJ8-Y18dRGA",
+      text: { text: "Pike Place Market, Seattle, WA, USA" },
+      structuredFormat: {
+        mainText: { text: "Pike Place Market" },
+        secondaryText: { text: "Seattle, WA, USA" },
+      },
+      ...overrides,
+    },
   };
 }
 
-const NO_MATCH_RESPONSE = jsonResponse({ error: "Unable to geocode" }, { ok: false, status: 404, statusText: "Not Found" });
+// Live-verified real shape: Google returns HTTP 200 with body `{}` for a
+// genuine no-match.
+const NO_MATCH_RESPONSE = jsonResponse({});
 
 function makeDeps(): HandleDestinationAutocompleteRequestDeps {
-  return { locationIqApiKey: API_KEY };
+  return { googlePlacesApiKey: API_KEY };
 }
 
 describe("handleDestinationAutocompleteRequest", () => {
@@ -75,16 +79,17 @@ describe("handleDestinationAutocompleteRequest", () => {
     });
 
     it("accepts a 2-character query (the real minimum)", async () => {
-      fetchMock.mockResolvedValueOnce(jsonResponse([makeAutocompleteResult()]));
+      fetchMock.mockResolvedValueOnce(jsonResponse({ suggestions: [makePlacePrediction()] }));
       const result = await handleDestinationAutocompleteRequest(makeDeps(), JSON.stringify({ query: "pi" }));
       expect(result.response.status).toBe("ok");
     });
 
-    it("trims the query before both validating length and calling LocationIQ", async () => {
-      fetchMock.mockResolvedValueOnce(jsonResponse([makeAutocompleteResult()]));
+    it("trims the query before both validating length and calling Google", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse({ suggestions: [makePlacePrediction()] }));
       await handleDestinationAutocompleteRequest(makeDeps(), JSON.stringify({ query: "  pike pl  " }));
-      const requestedUrl = new URL(fetchMock.mock.calls[0]?.[0] as string);
-      expect(requestedUrl.searchParams.get("q")).toBe("pike pl");
+      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const body = JSON.parse(init.body as string);
+      expect(body.input).toBe("pike pl");
     });
   });
 
@@ -94,23 +99,36 @@ describe("handleDestinationAutocompleteRequest", () => {
       expect(result.response).toMatchObject({ status: "invalid_request", reason: "invalid_limit" });
     });
 
-    it("defaults limit to 5 when omitted", async () => {
-      fetchMock.mockResolvedValueOnce(jsonResponse([makeAutocompleteResult()]));
-      await handleDestinationAutocompleteRequest(makeDeps(), JSON.stringify({ query: "pike pl" }));
-      const requestedUrl = new URL(fetchMock.mock.calls[0]?.[0] as string);
-      expect(requestedUrl.searchParams.get("limit")).toBe("5");
+    it("defaults limit to 5 when omitted, applied by slicing (Google has no server-side limit param)", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({
+          suggestions: [
+            makePlacePrediction({ placeId: "a" }),
+            makePlacePrediction({ placeId: "b" }),
+            makePlacePrediction({ placeId: "c" }),
+            makePlacePrediction({ placeId: "d" }),
+            makePlacePrediction({ placeId: "e" }),
+            makePlacePrediction({ placeId: "f" }),
+          ],
+        }),
+      );
+      const result = await handleDestinationAutocompleteRequest(makeDeps(), JSON.stringify({ query: "pike pl" }));
+      expect(result.response.status).toBe("ok");
+      if (result.response.status === "ok") {
+        expect(result.response.results).toHaveLength(5);
+      }
     });
 
     it("accepts limit: 10 (the real maximum)", async () => {
-      fetchMock.mockResolvedValueOnce(jsonResponse([makeAutocompleteResult()]));
+      fetchMock.mockResolvedValueOnce(jsonResponse({ suggestions: [makePlacePrediction()] }));
       const result = await handleDestinationAutocompleteRequest(makeDeps(), JSON.stringify({ query: "pike pl", limit: 10 }));
       expect(result.response.status).toBe("ok");
     });
   });
 
   describe("success path", () => {
-    it("returns ok with results reshaped to the wire format, kind: general_place", async () => {
-      fetchMock.mockResolvedValueOnce(jsonResponse([makeAutocompleteResult()]));
+    it("returns ok with results reshaped to the wire format, kind: general_place, no lat/lon", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse({ suggestions: [makePlacePrediction()] }));
 
       const result = await handleDestinationAutocompleteRequest(makeDeps(), JSON.stringify({ query: "pike pl" }));
 
@@ -120,11 +138,9 @@ describe("handleDestinationAutocompleteRequest", () => {
         results: [
           {
             kind: "general_place",
-            placeId: "323319931923",
+            placeId: "ChIJy9ZRwbJqkFQRHJ8-Y18dRGA",
             displayText: "Pike Place Market",
-            displayAddress: "2nd Avenue Cycletrack, Central Business District, Belltown, Seattle, King County, Washington, 98101, USA",
-            lat: 47.60939675,
-            lon: -122.34141018,
+            displayAddress: "Seattle, WA, USA",
           },
         ],
       });
@@ -141,9 +157,11 @@ describe("handleDestinationAutocompleteRequest", () => {
   });
 
   describe("upstream failures", () => {
-    it("returns geocoding_service_unavailable (502) when LocationIQ's retries are exhausted", async () => {
+    it("returns geocoding_service_unavailable (502) when Google's retries are exhausted", async () => {
       vi.useFakeTimers();
-      fetchMock.mockResolvedValue(jsonResponse({ error: "Rate Limited Second" }, { ok: false, status: 429, statusText: "Too Many Requests" }));
+      fetchMock.mockResolvedValue(
+        jsonResponse({ error: { code: 429, message: "rate limited", status: "RESOURCE_EXHAUSTED" } }, { ok: false, status: 429, statusText: "Too Many Requests" }),
+      );
 
       const resultPromise = handleDestinationAutocompleteRequest(makeDeps(), JSON.stringify({ query: "pike pl" }));
       await vi.runAllTimersAsync();
@@ -152,11 +170,11 @@ describe("handleDestinationAutocompleteRequest", () => {
 
       expect(result.status).toBe(502);
       expect(result.response).toMatchObject({ status: "geocoding_service_unavailable" });
-      expect(JSON.stringify(result.response)).not.toMatch(/429|Rate Limited/);
+      expect(JSON.stringify(result.response)).not.toMatch(/429|RESOURCE_EXHAUSTED/);
     });
 
-    it("returns geocoding_service_unavailable (502) on a non-retryable failure (bad API key)", async () => {
-      fetchMock.mockResolvedValueOnce(jsonResponse({ error: "Invalid key" }, { ok: false, status: 401, statusText: "Unauthorized" }));
+    it("returns geocoding_service_unavailable (502) on a non-retryable failure (5xx exhausted differently is retryable -- use a real 403 instead)", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse({}, { ok: false, status: 403, statusText: "Forbidden" }));
 
       const result = await handleDestinationAutocompleteRequest(makeDeps(), JSON.stringify({ query: "pike pl" }));
 
@@ -164,11 +182,17 @@ describe("handleDestinationAutocompleteRequest", () => {
       expect(result.response).toMatchObject({ status: "geocoding_service_unavailable" });
     });
 
-    it("returns internal_error (500), not geocoding_service_unavailable, if LocationIQ ever rejects a request that passed our own query_too_short validation", async () => {
+    it("returns internal_error (500), not geocoding_service_unavailable, if Google ever rejects a request that passed our own query_too_short validation (real 400 shape)", async () => {
       // Should be unreachable in practice (that's the whole point of this
       // handler's own 2-character minimum) -- but if it ever happens, it
-      // signals a gap in OUR validation, not LocationIQ's fault.
-      fetchMock.mockResolvedValueOnce(jsonResponse({ error: "Invalid Request" }, { ok: false, status: 400, statusText: "Bad Request" }));
+      // signals a gap in OUR validation (or a misconfigured API key), not
+      // Google's fault.
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse(
+          { error: { code: 400, message: "input must be non-empty.\n", status: "INVALID_ARGUMENT" } },
+          { ok: false, status: 400, statusText: "Bad Request" },
+        ),
+      );
 
       const result = await handleDestinationAutocompleteRequest(makeDeps(), JSON.stringify({ query: "pike pl" }));
 
@@ -176,10 +200,18 @@ describe("handleDestinationAutocompleteRequest", () => {
       expect(result.response).toMatchObject({ status: "internal_error" });
     });
 
-    it("returns geocoding_service_unavailable (502) on a structurally-invalid coordinate in LocationIQ's response", async () => {
-      fetchMock.mockResolvedValueOnce(jsonResponse([makeAutocompleteResult({ lat: "not-a-number" })]));
+    it("returns geocoding_service_unavailable (502) on an unexpected (non-object) response shape", async () => {
+      // A plain Error (not GoogleApiRequestError) defaults to retryable in
+      // autocompleteDestination.ts's own retry loop, so both attempts of
+      // its 2-attempt budget need a mocked response -- same reasoning as
+      // that module's own equivalent test.
+      vi.useFakeTimers();
+      fetchMock.mockResolvedValue(jsonResponse(["not", "an", "object"]));
 
-      const result = await handleDestinationAutocompleteRequest(makeDeps(), JSON.stringify({ query: "pike pl" }));
+      const resultPromise = handleDestinationAutocompleteRequest(makeDeps(), JSON.stringify({ query: "pike pl" }));
+      await vi.runAllTimersAsync();
+      const result = await resultPromise;
+      vi.useRealTimers();
 
       expect(result.status).toBe(502);
       expect(result.response).toMatchObject({ status: "geocoding_service_unavailable" });
