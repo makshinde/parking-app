@@ -40,20 +40,28 @@ interface GoogleGeocodingResult {
   };
 }
 
-// The classic Geocoding API funnels essentially every outcome -- success,
-// no-match, invalid key, rate limit, malformed request -- through HTTP 200
-// with a body-level `status` field, NOT real HTTP status codes. Live-
-// verified directly against this exact endpoint and key: an invalid API
-// key still returned HTTP 200 with `status: "REQUEST_DENIED"` in the body
-// (see below), not a 401/403 -- a genuinely different error-transport
-// convention than Places API (New)'s real HTTP status codes
-// (autocompleteDestination.ts). The other status values below
-// (ZERO_RESULTS, OVER_QUERY_LIMIT, OVER_DAILY_LIMIT, INVALID_REQUEST,
-// UNKNOWN_ERROR) are Google's own complete, official documented set
-// (developers.google.com/maps/documentation/geocoding/requests-geocoding)
-// -- not yet live-triggered as of this module's own initial build (the
-// Geocoding API wasn't enabled yet on this project's real key at build
-// time), pending a live re-verification pass once it is.
+// The classic Geocoding API's error-transport convention is NOT uniform --
+// live-verified directly, and confirmed to be genuinely inconsistent, not
+// just under-documented: an invalid API key returns HTTP 200 with
+// `status: "REQUEST_DENIED"` in the body, while a structurally malformed
+// place_id returns a real HTTP 400 with `status: "INVALID_REQUEST"` in
+// that SAME body shape. An earlier version of this module assumed every
+// outcome funneled through HTTP 200 (reasonable from Google's own prose
+// docs, which don't call out this inconsistency) and gated on
+// `response.ok` before ever parsing the body -- live-verified WRONG the
+// first time resolve-destination was exercised against a real invalid
+// place_id in production: the real 400 was caught by that gate and turned
+// into a generic transport-failure message, never reaching the status
+// switch below at all, so INVALID_REQUEST's own real handling (see below)
+// was silently unreachable. Fixed by always parsing the JSON body first,
+// regardless of HTTP status, and switching on its own `status` field --
+// the one genuinely reliable signal across every real outcome tested.
+// HTTP status is now only consulted as a last-resort fallback, for a
+// response whose body isn't parseable JSON at all (a real, if different,
+// kind of failure this endpoint's own documented status enum doesn't
+// cover). REQUEST_DENIED (200) and INVALID_REQUEST (400) are both now
+// real, live-confirmed; OVER_QUERY_LIMIT/OVER_DAILY_LIMIT/UNKNOWN_ERROR
+// remain Google's own documented set, not yet individually live-triggered.
 interface GoogleGeocodingResponse {
   status: "OK" | "ZERO_RESULTS" | "OVER_QUERY_LIMIT" | "OVER_DAILY_LIMIT" | "REQUEST_DENIED" | "INVALID_REQUEST" | "UNKNOWN_ERROR";
   results: GoogleGeocodingResult[];
@@ -69,9 +77,10 @@ function sleep(ms: number): Promise<void> {
 }
 
 // Google's own standard REST convention for a real transport-level
-// failure (not one of the documented body-level `status` outcomes above,
-// which this endpoint returns via HTTP 200 regardless of outcome) -- same
-// retryable convention as autocompleteDestination.ts.
+// failure -- used now only as the last-resort fallback for a response
+// whose body isn't parseable JSON at all (see fetchGeocodeOnce's own
+// comment for why HTTP status alone is no longer trusted as the primary
+// signal). Same retryable convention as autocompleteDestination.ts.
 function isRetryableStatus(status: number): boolean {
   return status === 429 || (status >= 500 && status < 600);
 }
@@ -90,18 +99,21 @@ export type ResolveDestinationResult =
 async function fetchGeocodeOnce(placeId: string, apiKey: string): Promise<ResolveDestinationResult> {
   const response = await fetch(buildGeocodeUrl(placeId, apiKey));
 
-  if (!response.ok) {
-    // A genuinely unexpected transport-level failure -- not one of the
-    // documented body-level status outcomes below, which this endpoint
-    // returns via HTTP 200 regardless of outcome (see this module's own
-    // header comment).
+  // Body parsed FIRST, regardless of HTTP status -- see this module's own
+  // header comment for why status alone is not a reliable signal on this
+  // endpoint. A response whose body isn't parseable JSON at all is a
+  // genuinely different, transport-level failure this endpoint's own
+  // documented status enum doesn't cover -- HTTP status is the only
+  // signal available for that real fallback case.
+  let body: GoogleGeocodingResponse;
+  try {
+    body = (await response.json()) as GoogleGeocodingResponse;
+  } catch {
     throw new GoogleApiRequestError(
-      `resolveDestinationCoordinates: Google Geocoding request failed with status ${response.status} ${response.statusText}`,
+      `resolveDestinationCoordinates: Google Geocoding request failed with status ${response.status} ${response.statusText} and an unparseable body`,
       isRetryableStatus(response.status),
     );
   }
-
-  const body = (await response.json()) as GoogleGeocodingResponse;
 
   switch (body.status) {
     case "OK": {
@@ -144,9 +156,11 @@ async function fetchGeocodeOnce(placeId: string, apiKey: string): Promise<Resolv
         false,
       );
     case "INVALID_REQUEST":
-      // Documented as generally meaning the query (here, `place_id`) is
-      // missing -- should be unreachable given this module's own caller
-      // always supplies a real placeId from a prior Autocomplete response.
+      // Live-verified real shape (a structurally malformed place_id, real
+      // HTTP 400): {"error_message":"Invalid request. Invalid 'place_id'
+      // parameter.","results":[],"status":"INVALID_REQUEST"} -- should be
+      // unreachable in practice given this module's own caller always
+      // supplies a real placeId from a prior Autocomplete response.
       throw new GoogleApiRequestError(
         "resolveDestinationCoordinates: Google Geocoding rejected the request as invalid -- should be unreachable given this module's own caller's validation",
         false,
