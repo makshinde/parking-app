@@ -1,5 +1,4 @@
-import { autocompleteDestination, type DestinationSuggestion } from "../geocoding/autocompleteDestination.ts";
-import { LocationIQRequestError } from "../geocoding/geocodeAddress.ts";
+import { autocompleteDestination, GoogleApiRequestError, type DestinationSuggestion } from "../geocoding/autocompleteDestination.ts";
 import {
   DESTINATION_AUTOCOMPLETE_HTTP_STATUS,
   type DestinationAutocompleteInvalidRequestReason,
@@ -12,7 +11,7 @@ import {
 // deliberately stateless proxy with no cache table (see that module's own
 // header comment for why).
 export interface HandleDestinationAutocompleteRequestDeps {
-  locationIqApiKey: string;
+  googlePlacesApiKey: string;
 }
 
 export interface HandleDestinationAutocompleteResult {
@@ -88,31 +87,26 @@ function geocodingServiceUnavailable(
 
 // autocompleteDestination's own throw surface (see that module) is narrow
 // enough to classify safely without needing message-matching against
-// anything not owned by this codebase, except two deliberately-scoped
-// cases (see below).
+// anything not owned by this codebase, except one deliberately-scoped
+// case (see below).
 function classifyAutocompleteError(err: unknown): HandleDestinationAutocompleteResult {
-  if (err instanceof LocationIQRequestError) {
+  if (err instanceof GoogleApiRequestError) {
     if (err.message.includes("rejected the request as invalid")) {
       // Should be unreachable given this handler's own query_too_short
-      // validation above -- if LocationIQ ever rejects a request we
-      // already validated as fine, that signals a gap in OUR validation
-      // logic, not a genuine upstream failure.
+      // validation above -- if Google ever rejects a request we already
+      // validated as fine, that signals a gap in OUR validation logic (or
+      // a misconfigured API key -- see autocompleteDestination.ts's own
+      // comment), not a genuine upstream failure.
       console.error(
-        "handleDestinationAutocompleteRequest: LocationIQ rejected a request that passed our own validation:",
+        "handleDestinationAutocompleteRequest: Google Places rejected a request that passed our own validation:",
         err.message,
       );
       return internalError();
     }
     return geocodingServiceUnavailable();
   }
-  if (err instanceof RangeError) {
-    // Within THIS call's scope, autocompleteDestination throws a
-    // RangeError only for a non-numeric coordinate in an otherwise-
-    // successful LocationIQ response -- their data, not our infrastructure.
-    return geocodingServiceUnavailable();
-  }
   const message = err instanceof Error ? err.message : String(err);
-  if (message.includes("unexpected LocationIQ response shape")) {
+  if (message.includes("unexpected Google Places response shape")) {
     return geocodingServiceUnavailable();
   }
   return internalError();
@@ -124,10 +118,8 @@ function toWireSuggestion(suggestion: DestinationSuggestion): DestinationSuggest
   return {
     kind: "general_place",
     placeId: suggestion.placeId,
-    displayText: suggestion.displayPlace,
+    displayText: suggestion.displayText,
     displayAddress: suggestion.displayAddress,
-    lat: suggestion.lat,
-    lon: suggestion.lon,
   };
 }
 
@@ -149,7 +141,7 @@ export async function handleDestinationAutocompleteRequest(
 
   let suggestions: DestinationSuggestion[];
   try {
-    suggestions = await autocompleteDestination(deps.locationIqApiKey, query, limit);
+    suggestions = await autocompleteDestination(deps.googlePlacesApiKey, query, limit);
   } catch (err) {
     console.error("handleDestinationAutocompleteRequest: autocompleteDestination failed:", err);
     return classifyAutocompleteError(err);
