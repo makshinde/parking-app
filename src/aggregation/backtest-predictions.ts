@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { writeFile, mkdir } from "node:fs/promises";
+import { writeFile, readFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { fetchSocrataRecords, type SocrataRecord } from "../utils/fetchSocrataRecords.ts";
@@ -711,6 +711,83 @@ export function pearsonCorrelation(xs: readonly number[], ys: readonly number[])
   return numerator / Math.sqrt(denomX * denomY);
 }
 
+// --- Bootstrap resampling ---------------------------------------------
+
+// Percentile-method bootstrap on the mean: resamples `values` WITH
+// replacement `resampleCount` times, recomputes the mean of each
+// resample, and reports the [alpha/2, 1-alpha/2] percentiles of that
+// distribution as a confidence interval -- the standard, model-free way
+// to ask "how much would this mean plausibly have moved if a few
+// different real cases had been drawn instead of the ones we actually
+// have," without assuming any particular distribution shape for the
+// underlying errors. fractionResamplesNegative is the practical
+// trustworthiness check this harness actually needs: if a slice's real
+// mean signed error is negative (a bias), the fraction of RESAMPLES that
+// are also negative answers "how often would we have seen the same sign
+// of bias, if we'd happened to draw a slightly different set of real
+// cases" -- close to 1 means the sign is stable/trustworthy, close to 0.5
+// means it's plausibly just noise around zero.
+export interface BootstrapResult {
+  observedMean: number;
+  meanOfResampleMeans: number;
+  lowerBound: number;
+  upperBound: number;
+  fractionResamplesNegative: number;
+  resampleCount: number;
+  sampleSize: number;
+}
+
+export function bootstrapMeanConfidenceInterval(
+  values: readonly number[],
+  resampleCount: number,
+  confidenceLevel: number,
+  // Injected rather than always Math.random -- the same testability-driven
+  // pattern this whole project uses for "now" (see this file's header
+  // comment): a deterministic randomFn lets this function's own tests
+  // hand-verify an exact result instead of only checking loose statistical
+  // properties.
+  randomFn: () => number = Math.random,
+): BootstrapResult {
+  if (values.length === 0) {
+    throw new Error("bootstrapMeanConfidenceInterval: values must not be empty -- there is no meaningful mean to bootstrap");
+  }
+  if (!Number.isInteger(resampleCount) || resampleCount <= 0) {
+    throw new Error(`bootstrapMeanConfidenceInterval: resampleCount must be a positive integer, got ${resampleCount}`);
+  }
+  if (!Number.isFinite(confidenceLevel) || confidenceLevel <= 0 || confidenceLevel >= 1) {
+    throw new Error(`bootstrapMeanConfidenceInterval: confidenceLevel must be a finite number strictly between 0 and 1, got ${confidenceLevel}`);
+  }
+
+  const observedMean = mean(values);
+  const resampleMeans: number[] = [];
+  for (let i = 0; i < resampleCount; i++) {
+    let sum = 0;
+    for (let j = 0; j < values.length; j++) {
+      const index = Math.floor(randomFn() * values.length);
+      sum += values[index] as number;
+    }
+    resampleMeans.push(sum / values.length);
+  }
+  resampleMeans.sort((a, b) => a - b);
+
+  const alpha = 1 - confidenceLevel;
+  const lowerIndex = Math.floor((alpha / 2) * resampleCount);
+  const upperIndex = Math.min(Math.ceil((1 - alpha / 2) * resampleCount) - 1, resampleCount - 1);
+
+  return {
+    observedMean,
+    meanOfResampleMeans: mean(resampleMeans),
+    lowerBound: resampleMeans[lowerIndex] as number,
+    upperBound: resampleMeans[upperIndex] as number,
+    fractionResamplesNegative: resampleMeans.filter((m) => m < 0).length / resampleCount,
+    resampleCount,
+    sampleSize: values.length,
+  };
+}
+
+const DEFAULT_BOOTSTRAP_RESAMPLES = 10_000;
+const DEFAULT_BOOTSTRAP_CONFIDENCE_LEVEL = 0.95;
+
 export interface ConfidenceBucketSummary {
   confidenceScore: number;
   count: number;
@@ -724,6 +801,12 @@ export interface SliceSummary {
   maeSingleNearest: number;
   maeMultiOccurrence: number;
   meanSignedErrorSingleNearest: number;
+  // Bootstrap validation of meanSignedErrorSingleNearest -- null only when
+  // there's nothing scored to bootstrap (see summarizeSlice). Answers "is
+  // this slice's average bias a real, stable pattern, or could it plausibly
+  // just be noise from which particular real cases happened to be in the
+  // fixed test list" -- see bootstrapMeanConfidenceInterval's own comment.
+  bootstrap: BootstrapResult | null;
 }
 
 export interface SummaryReport {
@@ -747,8 +830,9 @@ export interface SummaryReport {
 function summarizeSlice(name: string, results: readonly TestCaseResult[]): SliceSummary {
   const scored = results.filter((r) => r.skippedReason === null);
   if (scored.length === 0) {
-    return { name, count: results.length, maeSingleNearest: NaN, maeMultiOccurrence: NaN, meanSignedErrorSingleNearest: NaN };
+    return { name, count: results.length, maeSingleNearest: NaN, maeMultiOccurrence: NaN, meanSignedErrorSingleNearest: NaN, bootstrap: null };
   }
+  const signedErrors = scored.map((r) => r.errorSingleNearest as number);
   return {
     name,
     count: results.length,
@@ -756,7 +840,8 @@ function summarizeSlice(name: string, results: readonly TestCaseResult[]): Slice
     maeMultiOccurrence: mean(
       scored.filter((r) => r.absErrorMultiOccurrence !== null).map((r) => r.absErrorMultiOccurrence as number),
     ),
-    meanSignedErrorSingleNearest: mean(scored.map((r) => r.errorSingleNearest as number)),
+    meanSignedErrorSingleNearest: mean(signedErrors),
+    bootstrap: bootstrapMeanConfidenceInterval(signedErrors, DEFAULT_BOOTSTRAP_RESAMPLES, DEFAULT_BOOTSTRAP_CONFIDENCE_LEVEL),
   };
 }
 
@@ -859,8 +944,150 @@ export function formatCsv(results: readonly TestCaseResult[]): string {
   return [header, ...rows].join("\n") + "\n";
 }
 
+// --- CSV parsing (the inverse of formatCsv) ---------------------------
+//
+// Lets --from-csv (see main()) recompute a summary/bootstrap analysis
+// against an ALREADY-COLLECTED real run's per-case CSV, without re-running
+// the live Socrata queries that produced it -- e.g. to validate a slice's
+// bias with bootstrapMeanConfidenceInterval, or to try a different
+// resample count, against the exact same real results already on disk.
+
+// Full-text state machine, not a per-line split -- a quoted field can
+// legitimately contain a literal newline (see csvCell's own quoting rule),
+// so splitting on "\n" first would corrupt exactly the kind of value (a
+// multi-line error message in skippedDetail) most likely to need it.
+function parseCsvRecords(csvText: string): string[][] {
+  const records: string[][] = [];
+  let currentField = "";
+  let currentRecord: string[] = [];
+  let inQuotes = false;
+  let i = 0;
+
+  while (i < csvText.length) {
+    const char = csvText[i] as string;
+    if (inQuotes) {
+      if (char === '"') {
+        if (csvText[i + 1] === '"') {
+          currentField += '"';
+          i += 2;
+          continue;
+        }
+        inQuotes = false;
+        i += 1;
+        continue;
+      }
+      currentField += char;
+      i += 1;
+      continue;
+    }
+    if (char === '"') {
+      inQuotes = true;
+      i += 1;
+      continue;
+    }
+    if (char === ",") {
+      currentRecord.push(currentField);
+      currentField = "";
+      i += 1;
+      continue;
+    }
+    if (char === "\n" || char === "\r") {
+      currentRecord.push(currentField);
+      records.push(currentRecord);
+      currentField = "";
+      currentRecord = [];
+      i += char === "\r" && csvText[i + 1] === "\n" ? 2 : 1;
+      continue;
+    }
+    currentField += char;
+    i += 1;
+  }
+  if (currentField.length > 0 || currentRecord.length > 0) {
+    currentRecord.push(currentField);
+    records.push(currentRecord);
+  }
+  return records;
+}
+
+const NULLABLE_NUMBER_COLUMNS = new Set<keyof TestCaseResult>([
+  "predictedMean",
+  "confidenceScore",
+  "sampleCount",
+  "stdDev",
+  "observedParkingSpaceCount",
+  "singleNearestActualMean",
+  "multiOccurrenceActualMean",
+  "errorSingleNearest",
+  "absErrorSingleNearest",
+  "errorMultiOccurrence",
+  "absErrorMultiOccurrence",
+]);
+const REQUIRED_NUMBER_COLUMNS = new Set<keyof TestCaseResult>([
+  "isoDay",
+  "hour",
+  "horizonDays",
+  "groundTruthOccurrenceCount",
+  "groundTruthReadingCount",
+]);
+// The two nullable STRING columns -- skippedReason/skippedDetail are null
+// on every scored (non-skipped) result, distinct from NULLABLE_NUMBER_COLUMNS
+// above (which are null on every SKIPPED result instead).
+const NULLABLE_STRING_COLUMNS = new Set<keyof TestCaseResult>(["skippedReason", "skippedDetail"]);
+
+function parseCsvCell(column: keyof TestCaseResult, raw: string): unknown {
+  if (column === "lowCapacity") {
+    return raw === "true";
+  }
+  if (raw === "") {
+    // Only the nullable columns are ever legitimately empty (see csvCell's
+    // own null -> "" rule) -- an empty cell under any other column means
+    // this file wasn't really produced by formatCsv.
+    if (!NULLABLE_NUMBER_COLUMNS.has(column) && !NULLABLE_STRING_COLUMNS.has(column)) {
+      throw new Error(`parseResultsCsv: column "${column}" is never null, but got an empty cell`);
+    }
+    return null;
+  }
+  if (NULLABLE_NUMBER_COLUMNS.has(column) || REQUIRED_NUMBER_COLUMNS.has(column)) {
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) {
+      throw new Error(`parseResultsCsv: expected a number for column "${column}", got "${raw}"`);
+    }
+    return parsed;
+  }
+  return raw; // label, blockfaceId, cutoffDateOnly, slice, skippedReason, skippedDetail
+}
+
+export function parseResultsCsv(csvText: string): TestCaseResult[] {
+  const records = parseCsvRecords(csvText).filter((record) => !(record.length === 1 && record[0] === ""));
+  if (records.length === 0) {
+    return [];
+  }
+  const header = records[0] as string[];
+  const expectedHeader = CSV_COLUMNS as readonly string[];
+  if (header.length !== expectedHeader.length || header.some((col, i) => col !== expectedHeader[i])) {
+    throw new Error(
+      "parseResultsCsv: CSV header does not match the columns formatCsv writes -- was this file really produced by formatCsv?",
+    );
+  }
+
+  return records.slice(1).map((row, rowIndex) => {
+    if (row.length !== CSV_COLUMNS.length) {
+      throw new Error(`parseResultsCsv: row ${rowIndex + 1} has ${row.length} fields, expected ${CSV_COLUMNS.length}`);
+    }
+    const result = {} as Record<keyof TestCaseResult, unknown>;
+    CSV_COLUMNS.forEach((column, i) => {
+      result[column] = parseCsvCell(column, row[i] as string);
+    });
+    return result as unknown as TestCaseResult;
+  });
+}
+
 function pct(ratio: number): string {
   return `${(ratio * 100).toFixed(1)}%`;
+}
+
+function signedPct(ratio: number): string {
+  return `${ratio >= 0 ? "+" : ""}${pct(ratio)}`;
 }
 
 export function formatSummaryReport(summary: SummaryReport): string {
@@ -874,7 +1101,7 @@ export function formatSummaryReport(summary: SummaryReport): string {
   lines.push("");
   lines.push(`Overall MAE (single-nearest-occurrence):     ${pct(summary.overallMaeSingleNearest)}`);
   lines.push(`Overall MAE (multi-occurrence-averaged):     ${pct(summary.overallMaeMultiOccurrence)}`);
-  lines.push(`Mean signed error (single-nearest):          ${summary.meanSignedErrorSingleNearest >= 0 ? "+" : ""}${pct(summary.meanSignedErrorSingleNearest)} (positive = over-predicts occupancy)`);
+  lines.push(`Mean signed error (single-nearest):          ${signedPct(summary.meanSignedErrorSingleNearest)} (positive = over-predicts occupancy)`);
   lines.push(`Confidence-vs-error correlation (headline):  ${summary.confidenceErrorCorrelation.toFixed(3)} (negative = working calibration: higher confidence, lower error)`);
   lines.push("");
   lines.push("--- MAE by confidence-score bucket ---");
@@ -886,9 +1113,14 @@ export function formatSummaryReport(summary: SummaryReport): string {
   }
   lines.push("");
   lines.push("--- Slices ---");
+  lines.push("(bootstrap: 95% CI on the mean signed error, from 10,000 resamples -- see bootstrapMeanConfidenceInterval)");
   for (const slice of summary.slices) {
+    const bootstrapStr =
+      slice.bootstrap === null
+        ? "bootstrap=n/a"
+        : `bootstrap95%CI=[${signedPct(slice.bootstrap.lowerBound)}, ${signedPct(slice.bootstrap.upperBound)}] (${(slice.bootstrap.fractionResamplesNegative * 100).toFixed(0)}% of resamples negative)`;
     lines.push(
-      `${slice.name.padEnd(32)} n=${String(slice.count).padStart(4)}  MAE(single)=${pct(slice.maeSingleNearest)}  MAE(multi)=${pct(slice.maeMultiOccurrence)}  signed=${slice.meanSignedErrorSingleNearest >= 0 ? "+" : ""}${pct(slice.meanSignedErrorSingleNearest)}`,
+      `${slice.name.padEnd(32)} n=${String(slice.count).padStart(4)}  MAE(single)=${pct(slice.maeSingleNearest)}  MAE(multi)=${pct(slice.maeMultiOccurrence)}  signed=${signedPct(slice.meanSignedErrorSingleNearest)}  ${bootstrapStr}`,
     );
   }
   lines.push("=====================================");
@@ -900,6 +1132,11 @@ export function formatSummaryReport(summary: SummaryReport): string {
 export interface CliOptions {
   limit: number | null;
   outDir: string;
+  // Re-analyze an already-collected real run's CSV (see parseResultsCsv)
+  // instead of hitting Socrata again -- e.g. to bootstrap-validate a
+  // slice's bias, or try a different resample count, against exactly the
+  // same real results already on disk.
+  fromCsv: string | null;
 }
 
 // --limit is a testing convenience -- run only the first N test cases
@@ -909,6 +1146,7 @@ export interface CliOptions {
 export function parseCliOptions(argv: readonly string[]): CliOptions {
   let limit: number | null = null;
   let outDir = "backtest-output";
+  let fromCsv: string | null = null;
   for (const arg of argv) {
     const limitMatch = /^--limit=(.+)$/.exec(arg);
     if (limitMatch !== null) {
@@ -923,15 +1161,18 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
     const outDirMatch = /^--out-dir=(.+)$/.exec(arg);
     if (outDirMatch !== null) {
       outDir = outDirMatch[1] as string;
+      continue;
+    }
+    const fromCsvMatch = /^--from-csv=(.+)$/.exec(arg);
+    if (fromCsvMatch !== null) {
+      fromCsv = fromCsvMatch[1] as string;
     }
   }
-  return { limit, outDir };
+  return { limit, outDir, fromCsv };
 }
 
-export async function main(): Promise<void> {
-  const { limit, outDir } = parseCliOptions(process.argv.slice(2));
+async function runFullBacktest(limit: number | null): Promise<TestCaseResult[]> {
   const testCases = limit === null ? [...TEST_CASES] : TEST_CASES.slice(0, limit);
-
   console.log(
     `Running ${testCases.length} of ${TEST_CASES.length} fixed backtest cases${limit !== null ? ` (--limit=${limit})` : ""}...`,
   );
@@ -943,20 +1184,39 @@ export async function main(): Promise<void> {
     results.push(result);
     console.log(result.skippedReason === null ? `predicted=${pct(result.predictedMean as number)} actual=${pct(result.singleNearestActualMean as number)}` : `skipped (${result.skippedReason})`);
   }
+  return results;
+}
+
+export async function main(): Promise<void> {
+  const { limit, outDir, fromCsv } = parseCliOptions(process.argv.slice(2));
+
+  let results: TestCaseResult[];
+  if (fromCsv !== null) {
+    console.log(`Re-analyzing existing results from ${fromCsv} (no Socrata queries this run)...`);
+    results = parseResultsCsv(await readFile(fromCsv, "utf-8"));
+    console.log(`Loaded ${results.length} rows.`);
+  } else {
+    results = await runFullBacktest(limit);
+  }
 
   await mkdir(outDir, { recursive: true });
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const csvPath = path.join(outDir, `backtest-predictions-${timestamp}.csv`);
   const reportPath = path.join(outDir, `backtest-predictions-${timestamp}.txt`);
 
-  await writeFile(csvPath, formatCsv(results), "utf-8");
+  // Only write a fresh CSV when this run actually collected new results --
+  // re-analyzing an existing CSV (--from-csv) has nothing new to write back,
+  // the input file already IS that CSV.
+  if (fromCsv === null) {
+    const csvPath = path.join(outDir, `backtest-predictions-${timestamp}.csv`);
+    await writeFile(csvPath, formatCsv(results), "utf-8");
+    console.log(`\nPer-case CSV written to:  ${csvPath}`);
+  }
 
   const summary = computeSummary(results);
   const report = formatSummaryReport(summary);
   await writeFile(reportPath, report, "utf-8");
 
   console.log("\n" + report);
-  console.log(`\nPer-case CSV written to:  ${csvPath}`);
   console.log(`Summary report written to: ${reportPath}`);
 }
 
