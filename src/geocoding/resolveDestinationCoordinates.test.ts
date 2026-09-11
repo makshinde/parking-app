@@ -88,11 +88,38 @@ describe("resolveDestinationCoordinates", () => {
     expect((err as Error).message).toMatch(/misconfigured or unauthorized API key/);
   });
 
-  it("throws a non-retryable error on INVALID_REQUEST", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse({ status: "INVALID_REQUEST", results: [] }));
+  it("throws a non-retryable error on the real, live-verified INVALID_REQUEST shape (HTTP 400, not 200)", async () => {
+    // Live-verified directly: unlike REQUEST_DENIED (HTTP 200), a
+    // structurally malformed place_id returns a REAL HTTP 400 -- this
+    // endpoint's error-transport convention is genuinely inconsistent,
+    // not uniformly HTTP 200 (see this module's own header comment for
+    // the real bug this caught: an earlier version gated on
+    // `response.ok` and never reached this status at all for a real 400).
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        { error_message: "Invalid request. Invalid 'place_id' parameter.", results: [], status: "INVALID_REQUEST" },
+        { ok: false, status: 400, statusText: "Bad Request" },
+      ),
+    );
 
     await expect(resolveDestinationCoordinates(API_KEY, PLACE_ID)).rejects.toThrow(/rejected the request as invalid/);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws a non-retryable, transport-level error when the response body isn't parseable JSON at all", async () => {
+    const unparseableResponse = {
+      ok: false,
+      status: 500,
+      statusText: "Internal Server Error",
+      json: () => Promise.reject(new Error("Unexpected token < in JSON")),
+    } as unknown as Response;
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(unparseableResponse);
+
+    const assertion = expect(resolveDestinationCoordinates(API_KEY, PLACE_ID)).rejects.toThrow(/unparseable body/);
+    await vi.runAllTimersAsync();
+    await assertion;
+    vi.useRealTimers();
   });
 
   it("throws RangeError on a non-finite coordinate in an otherwise-OK response", async () => {
@@ -163,10 +190,14 @@ describe("resolveDestinationCoordinates", () => {
       expect(result).toMatchObject({ matched: true });
     });
 
-    it("retries a real transport-level 5xx", async () => {
-      fetchMock
-        .mockResolvedValueOnce(jsonResponse({}, { ok: false, status: 503, statusText: "Service Unavailable" }))
-        .mockResolvedValueOnce(makeOkResponse());
+    it("retries a real transport-level failure (unparseable body) and succeeds if a later attempt goes through", async () => {
+      const unparseableResponse = {
+        ok: false,
+        status: 503,
+        statusText: "Service Unavailable",
+        json: () => Promise.reject(new Error("Unexpected token < in JSON")),
+      } as unknown as Response;
+      fetchMock.mockResolvedValueOnce(unparseableResponse).mockResolvedValueOnce(makeOkResponse());
 
       const resultPromise = resolveDestinationCoordinates(API_KEY, PLACE_ID);
       await vi.runAllTimersAsync();
