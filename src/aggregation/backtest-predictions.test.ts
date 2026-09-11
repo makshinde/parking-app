@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   addCalendarDays,
+  bootstrapMeanConfidenceInterval,
   computeGroundTruth,
   computeSummary,
   formatCsv,
   formatSummaryReport,
   pacificMidnightInstant,
   parseCliOptions,
+  parseResultsCsv,
   pearsonCorrelation,
   resolveGroundTruthDataset,
   resolveTrainingDatasets,
@@ -172,15 +174,105 @@ describe("pearsonCorrelation", () => {
   });
 });
 
+// --- bootstrapMeanConfidenceInterval ---------------------------------------
+
+// Deterministic mulberry32 PRNG, seeded -- purely a test-only convenience so
+// these tests can hand-verify exact resample behavior instead of only
+// checking loose statistical properties against real Math.random(). Never
+// used in production code (bootstrapMeanConfidenceInterval defaults to the
+// real Math.random()).
+function makeSeededRandom(seed: number): () => number {
+  let state = seed;
+  return () => {
+    state = (state + 0x6d2b79f5) | 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// A random function that always returns the same fixed sequence of
+// fractions, cycling -- makes every resample select exactly the same
+// indices in the same order, so the resample mean is hand-computable
+// exactly rather than merely bounded.
+function makeCyclingRandom(fractions: readonly number[]): () => number {
+  let i = 0;
+  return () => {
+    const value = fractions[i % fractions.length] as number;
+    i += 1;
+    return value;
+  };
+}
+
+describe("bootstrapMeanConfidenceInterval", () => {
+  it("produces an exact, hand-computable result with a fixed cycling random sequence", () => {
+    // values[0]=1, values[1]=2, values[2]=3 -- fractions 0, 1/3, 2/3 select
+    // indices 0, 1, 2 in that order every time (floor(0*3)=0,
+    // floor(0.34*3)=1, floor(0.67*3)=2), so every single resample is
+    // exactly [1,2,3] and its mean is exactly 2.
+    const randomFn = makeCyclingRandom([0, 0.34, 0.67]);
+    const result = bootstrapMeanConfidenceInterval([1, 2, 3], 5, 0.95, randomFn);
+
+    expect(result.observedMean).toBeCloseTo(2, 10);
+    expect(result.meanOfResampleMeans).toBeCloseTo(2, 10);
+    expect(result.lowerBound).toBeCloseTo(2, 10);
+    expect(result.upperBound).toBeCloseTo(2, 10);
+    expect(result.fractionResamplesNegative).toBe(0);
+    expect(result.resampleCount).toBe(5);
+    expect(result.sampleSize).toBe(3);
+  });
+
+  it("brackets the observed mean and matches its sign for a real, consistently-negative sample", () => {
+    const values = [-0.6, -0.5, -0.55, -0.45, -0.5, -0.6, -0.4];
+    const result = bootstrapMeanConfidenceInterval(values, 2000, 0.95, makeSeededRandom(42));
+
+    expect(result.observedMean).toBeLessThan(0);
+    expect(result.lowerBound).toBeLessThanOrEqual(result.upperBound);
+    expect(result.meanOfResampleMeans).toBeCloseTo(result.observedMean, 1);
+    // Every real value is clearly negative with modest spread -- the bias's
+    // sign should be essentially always reproduced across resamples.
+    expect(result.fractionResamplesNegative).toBeGreaterThan(0.95);
+    expect(result.upperBound).toBeLessThan(0); // even the CI's high end stays negative
+  });
+
+  it("shows real instability (fractionResamplesNegative near 0.5) when the true mean is near zero with high variance", () => {
+    const values = [-1, 1, -1, 1, -1, 1, 0.1, -0.1];
+    const result = bootstrapMeanConfidenceInterval(values, 2000, 0.95, makeSeededRandom(7));
+    expect(result.fractionResamplesNegative).toBeGreaterThan(0.3);
+    expect(result.fractionResamplesNegative).toBeLessThan(0.7);
+  });
+
+  it("throws on an empty values array", () => {
+    expect(() => bootstrapMeanConfidenceInterval([], 100, 0.95)).toThrow(/values must not be empty/);
+  });
+
+  it("throws on a non-positive-integer resampleCount", () => {
+    expect(() => bootstrapMeanConfidenceInterval([1, 2], 0, 0.95)).toThrow(/resampleCount must be a positive integer/);
+    expect(() => bootstrapMeanConfidenceInterval([1, 2], -5, 0.95)).toThrow(/resampleCount must be a positive integer/);
+    expect(() => bootstrapMeanConfidenceInterval([1, 2], 2.5, 0.95)).toThrow(/resampleCount must be a positive integer/);
+  });
+
+  it("throws on a confidenceLevel outside (0, 1)", () => {
+    expect(() => bootstrapMeanConfidenceInterval([1, 2], 100, 0)).toThrow(/confidenceLevel must be a finite number strictly between 0 and 1/);
+    expect(() => bootstrapMeanConfidenceInterval([1, 2], 100, 1)).toThrow(/confidenceLevel must be a finite number strictly between 0 and 1/);
+    expect(() => bootstrapMeanConfidenceInterval([1, 2], 100, 1.5)).toThrow(/confidenceLevel must be a finite number strictly between 0 and 1/);
+    expect(() => bootstrapMeanConfidenceInterval([1, 2], 100, NaN)).toThrow(/confidenceLevel must be a finite number strictly between 0 and 1/);
+  });
+});
+
 // --- parseCliOptions ---------------------------------------------------
 
 describe("parseCliOptions", () => {
-  it("defaults to no limit and outDir 'backtest-output'", () => {
-    expect(parseCliOptions([])).toEqual({ limit: null, outDir: "backtest-output" });
+  it("defaults to no limit, outDir 'backtest-output', and no --from-csv", () => {
+    expect(parseCliOptions([])).toEqual({ limit: null, outDir: "backtest-output", fromCsv: null });
   });
 
   it("parses --limit and --out-dir", () => {
-    expect(parseCliOptions(["--limit=5", "--out-dir=/tmp/out"])).toEqual({ limit: 5, outDir: "/tmp/out" });
+    expect(parseCliOptions(["--limit=5", "--out-dir=/tmp/out"])).toEqual({ limit: 5, outDir: "/tmp/out", fromCsv: null });
+  });
+
+  it("parses --from-csv", () => {
+    expect(parseCliOptions(["--from-csv=/tmp/results.csv"])).toEqual({ limit: null, outDir: "backtest-output", fromCsv: "/tmp/results.csv" });
   });
 
   it("throws for a non-positive-integer --limit", () => {
@@ -392,6 +484,17 @@ describe("computeSummary", () => {
     expect(general?.maeSingleNearest).toBeCloseTo(0.1, 10);
   });
 
+  it("attaches a bootstrap result to every non-empty slice", () => {
+    const results = [
+      makeResult({ slice: "general", absErrorSingleNearest: 0.1, errorSingleNearest: 0.1 }),
+      makeResult({ slice: "general", absErrorSingleNearest: 0.2, errorSingleNearest: -0.2 }),
+    ];
+    const summary = computeSummary(results);
+    const general = summary.slices.find((s) => s.name === "general");
+    expect(general?.bootstrap).not.toBeNull();
+    expect(general?.bootstrap?.sampleSize).toBe(2);
+  });
+
   it("separates low-capacity from standard-capacity slices", () => {
     const results = [
       makeResult({ lowCapacity: true, observedParkingSpaceCount: 4, absErrorSingleNearest: 0.6, errorSingleNearest: 0.6 }),
@@ -424,6 +527,51 @@ describe("formatCsv", () => {
   it("quotes a field containing a comma", () => {
     const csv = formatCsv([makeResult({ skippedDetail: "failed, retrying" })]);
     expect(csv).toContain('"failed, retrying"');
+  });
+});
+
+describe("parseResultsCsv", () => {
+  it("round-trips a normal scored result exactly through formatCsv", () => {
+    const original = makeResult({ label: "roundtrip_case", predictedMean: 0.4123, confidenceScore: 7, lowCapacity: true });
+    const parsed = parseResultsCsv(formatCsv([original]));
+    expect(parsed).toEqual([original]);
+  });
+
+  it("round-trips a skipped result (with null numeric fields) exactly", () => {
+    const original = makeResult({
+      skippedReason: "no_ground_truth_data",
+      predictedMean: 0.5,
+      confidenceScore: 6,
+      singleNearestActualMean: null,
+      multiOccurrenceActualMean: null,
+      errorSingleNearest: null,
+      absErrorSingleNearest: null,
+      errorMultiOccurrence: null,
+      absErrorMultiOccurrence: null,
+      skippedDetail: null,
+    });
+    const parsed = parseResultsCsv(formatCsv([original]));
+    expect(parsed).toEqual([original]);
+  });
+
+  it("round-trips a field containing a comma and embedded quotes", () => {
+    const original = makeResult({ skippedReason: "fetch_error", skippedDetail: 'failed, retried "twice"' });
+    const parsed = parseResultsCsv(formatCsv([original]));
+    expect(parsed[0]?.skippedDetail).toBe('failed, retried "twice"');
+  });
+
+  it("returns an empty array for an empty/header-only CSV", () => {
+    expect(parseResultsCsv("")).toEqual([]);
+    expect(parseResultsCsv(formatCsv([]))).toEqual([]);
+  });
+
+  it("throws when the header doesn't match formatCsv's own columns", () => {
+    expect(() => parseResultsCsv("wrong,header\nvalue,value")).toThrow(/CSV header does not match/);
+  });
+
+  it("throws when a data row has the wrong number of fields", () => {
+    const header = formatCsv([]).trim();
+    expect(() => parseResultsCsv(`${header}\ntoo,few,fields`)).toThrow(/has 3 fields, expected/);
   });
 });
 
@@ -464,4 +612,5 @@ describe("TEST_CASES", () => {
     expect(multiOccCases.length).toBe(4); // one per Capitol Hill blockface
     expect(multiOccCases.every((tc) => tc.slice === "capitol_hill_saturday")).toBe(true);
   });
+
 });
