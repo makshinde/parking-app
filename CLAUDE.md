@@ -688,6 +688,86 @@ function can have multiple kinds of input.
   largest earliestCovered) as that run's whole coverage, deliberately
   biasing toward over-reporting a gap that might just be replica
   staleness rather than ever risking silently under-reporting a real one.
+- **The live `7c2e-uany` accumulator identity's reading count is higher
+  than it should be able to be -- confirmed, not yet fully explained.**
+  Live-verified 2026-09-12, while preparing to fold rke9-rsvs into
+  `occupancy_stats` for the first time: `7c2e-uany-pre-q1-2026-backup`
+  (the preserved snapshot of the pure 2025-only backfill, before Q1 2026
+  was ever folded in) has an accumulator `sum(count)` of 315,116,945 --
+  but the real, live raw row count of the 2025 archive dataset on
+  Socrata (also `7c2e-uany`) is only 300,055,806. That's an excess of
+  **+15,061,139** readings the accumulator claims to have folded, more
+  than physically exist in the source. This is structurally impossible
+  under a correct fold: `foldReadingsIntoAccumulators`
+  (backfill-occupancy-stats.ts) calls `addReading` at most once per raw
+  record (once for a parse failure, once for an unmatched blockface, once
+  for a real match), so `count` can only ever be less than or equal to
+  the raw row count, never more. Checking Q1 2026's own contribution in
+  isolation (`385,678,888 - 315,116,945 = 70,561,943` matched readings
+  out of 73,770,121 raw Q1 2026 rows, a plausible ~95.65% match rate)
+  shows no anomaly there -- the excess is entirely inside the original
+  2025 backfill, predating both Q1 2026 and the rke9-rsvs work entirely.
+
+  Two hypotheses were directly investigated, not just reasoned about
+  abstractly. First, the resume/gap-replay path in
+  `streamArchiveWithResume.ts` (the code that built this data) was traced
+  directly: it fetches `:id > snapshotCursor AND :id <= positionCursor`,
+  a strict-lower/inclusive-upper half-open interval that cannot overlap
+  either the already-durably-snapshotted range before it or the range the
+  main loop fetches next, and the cursor-ordering guarantee (position
+  saved before the snapshot cursor ever advances) prevents the snapshot
+  cursor from getting ahead of the stream position. No double-counting
+  mechanism was found in this specific path.
+
+  Second, and much better supported by real evidence: PR #71 ("Fix
+  rolling-window fetch to use :id-keyset pagination, not $offset",
+  merged 2026-08-27T04:49Z) documents an already-CONFIRMED, real bug in a
+  *different* function -- `fetchSocrataRecordsPaginated`, used once by
+  `initializeAccumulators` for the one-shot rolling-window (rke9-rsvs)
+  fold, not `streamArchiveWithResume`'s own keyset-paginated main loop.
+  That function paginated via `$offset`/`$limit` against rke9-rsvs (a
+  continuously-changing dataset); a retried request after a failed
+  mid-fetch could return an overlapping row set instead of the same one,
+  since an offset isn't anchored to anything. The PR's own body states
+  this was independently verified to have caused a real, confirmed 1-3%
+  sample-count overcount on a `--max-chunks=150` test run, correlating
+  exactly with that run's own two logged mid-fetch retries.
+
+  The timing lines up: that 150-chunk test run crossed the 120-chunk
+  snapshot interval, meaning it durably persisted its already-overcounted
+  rolling-window fold into `archive_stream_accumulator_buckets` under
+  `archive_dataset_id="7c2e-uany"` *before* the fix merged.
+  `initializeAccumulators` explicitly skips re-folding the rolling window
+  whenever a snapshot already exists for that dataset id (a deliberate
+  design choice, so a resumed run doesn't redo expensive work) --
+  it has no way to know that an existing snapshot was built by
+  since-fixed buggy code. The "final, complete backfill run" happened
+  between PR #74 (merged 2026-08-28T19:55Z) and PR #76 (created
+  2026-08-29T03:26Z, documenting that run's own reconcile results) --
+  roughly a day and a half *after* PR #71's fix landed. No PR, commit, or
+  log evidence was found of anyone explicitly clearing
+  `archive_stream_accumulator_buckets`' `7c2e-uany` rows in between, and
+  the system's whole resumability design exists specifically so that
+  clearing is never required -- so if the final run simply resumed rather
+  than starting from a wiped table, it would have silently inherited that
+  pre-fix, overcounted rolling-window baseline, with the correctly-folded
+  yearly archive then added on top of it.
+
+  **This is the strongest current lead, not a confirmed root cause.** No
+  direct log or record was found proving the final run definitely resumed
+  from that specific pre-fix state rather than a clean reset -- this
+  investigation was conducted via git/PR history and read-only Socrata
+  queries only, deliberately without touching the live database. Confirming
+  this definitively would require either finding further historical
+  evidence, or a real, live comparison against a fresh, correct re-fold of
+  the 2025 archive -- neither attempted yet. Worth resolving before
+  treating `7c2e-uany`'s current numbers as fully trustworthy for anything
+  precision-sensitive, though `occupancy_stats`' actual predictions may
+  still be largely fine in practice: a uniform overcounted rolling-window
+  baseline mostly inflates `count`/confidence rather than skewing the
+  weighted `mean` itself, provided the duplicated readings' own values
+  weren't systematically biased relative to the rest of that bucket's data
+  (not yet verified either way).
 
 ## Out of scope (v1)
 
