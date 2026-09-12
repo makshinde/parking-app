@@ -10,6 +10,14 @@ import type { SupabaseQueryResult } from "../importers/upsertBlockface.ts";
 // while its latest edge stayed frozen. See migrations/023's own header
 // comment for the full investigation.
 //
+// A second, separate real behavior was found immediately after, also
+// live-confirmed on 2026-09-12: successive coverage reads of rke9-rsvs
+// seconds apart can genuinely disagree with each other (most likely
+// multiple, mutually inconsistent backend replicas on Socrata's side --
+// see fetchCurrentCoverage's own comment and CLAUDE.md's Known open
+// questions for the full writeup). fetchCurrentCoverage compensates for
+// this directly, rather than trusting a single read.
+//
 // The core insight this module encodes: each refresh does a full,
 // unfiltered pull of the ENTIRE current window (never an incremental
 // delta -- see stream-into-staging.ts), so one run's own
@@ -69,7 +77,7 @@ interface RawCoverageRow {
 // and row count -- the same aggregate query used throughout this
 // project's own live investigations, promoted here to a real, reusable,
 // tested function rather than an ad hoc one-off.
-export async function fetchCurrentCoverage(datasetUrl: string): Promise<RollingWindowCoverage> {
+async function fetchCurrentCoverageOnce(datasetUrl: string): Promise<RollingWindowCoverage> {
   const url = new URL(datasetUrl);
   url.searchParams.set("$select", "min(occupancydatetime) as earliest, max(occupancydatetime) as latest, count(*) as row_count");
 
@@ -92,6 +100,48 @@ export async function fetchCurrentCoverage(datasetUrl: string): Promise<RollingW
   }
 
   return { earliestCovered: row.earliest, latestCovered: row.latest, rowCount };
+}
+
+// Live-discovered (2026-09-12), immediately before the first real
+// rke9-rsvs ingestion: this same aggregate query -- and even a plain
+// `$order=occupancydatetime ASC&$limit=1` query with no aggregation at
+// all, which rules out an aggregate-computation artifact -- returns
+// genuinely DIFFERENT answers between successive requests seconds apart.
+// Five requests taken over ~90 seconds flip-flopped between exactly two
+// distinct (earliest, row_count) pairs ("2026-07-31T11:05:00.000" /
+// 28,111,190 vs "2026-07-31T12:03:00.000" / 28,026,190), with no
+// request-rate pattern explaining it -- most likely Socrata serving
+// rke9-rsvs reads from multiple, mutually inconsistent backend
+// replicas/shards, not a single authoritative live value. See
+// CLAUDE.md's Known open questions for the full writeup -- this is a
+// real, external data-source behavior, not a bug in this code, if ever
+// seen again.
+//
+// Since silently losing data to an undetected gap is far worse than a
+// false-alarm gap someone has to glance at and dismiss, fetchCurrentCoverage
+// takes several rapid re-reads and keeps the single one showing the MOST
+// eviction (the largest earliestCovered -- i.e. the window's left edge
+// advanced the furthest) as this run's whole coverage, rather than
+// trusting whichever reply happens to arrive first. Kept whole (never
+// mixed with fields from a different read) so the returned coverage is
+// always an actually-observed, internally-consistent snapshot.
+const COVERAGE_READ_ATTEMPTS = 5;
+
+export async function fetchCurrentCoverage(datasetUrl: string): Promise<RollingWindowCoverage> {
+  let mostEvicted: RollingWindowCoverage | null = null;
+  for (let attempt = 0; attempt < COVERAGE_READ_ATTEMPTS; attempt++) {
+    const reading = await fetchCurrentCoverageOnce(datasetUrl);
+    if (mostEvicted === null || reading.earliestCovered > mostEvicted.earliestCovered) {
+      mostEvicted = reading;
+    }
+  }
+  // Unreachable in practice -- COVERAGE_READ_ATTEMPTS is a fixed positive
+  // constant, so the loop above always runs at least once and assigns
+  // mostEvicted. Satisfies the type checker without a non-null assertion.
+  if (mostEvicted === null) {
+    throw new Error("fetchCurrentCoverage: unreachable -- no coverage reading was taken");
+  }
+  return mostEvicted;
 }
 
 // --- rolling_window_refresh_log read/write ----------------------------

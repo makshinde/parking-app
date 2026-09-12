@@ -647,6 +647,47 @@ function can have multiple kinds of input.
   fresh database rebuild touching function search_path settings must
   account for this project's non-default extensions schema, or this
   exact regression will silently reoccur.
+- **rke9-rsvs (Seattle's current-year Paid Parking Occupancy dataset) is a
+  genuine EVICTING rolling window, not merely an append-only growing
+  one.** Live-verified directly on 2026-09-12: its own earliest available
+  row moved forward (2026-07-27 -> 2026-07-31 11:05 -> 2026-07-31 11:56)
+  across three checks spanning this project's own investigation, with
+  real row_count actually decreasing (28,111,190 -> 28,036,190) in a
+  ~62-minute gap between two of those checks even while its latest edge
+  stayed frozen (a separate, real, ~10-day+ upstream ingestion stall).
+  This had never been incorporated into occupancy_stats at all before
+  this investigation, and it means a reading can permanently roll out of
+  the window between refresh cycles and be lost -- caught by neither the
+  stable yearly archive nor a later refresh's pull of the (by-then
+  narrower) current window. rolling_window_refresh_log
+  (migrations/023_add_rolling_window_refresh_log.sql) and
+  detectCoverageGap (src/aggregation/rollingWindowRefreshLog.ts) exist
+  specifically to catch this: each refresh records its own real observed
+  `[earliest_covered, latest_covered]`, and a later refresh whose
+  earliest is strictly after an earlier refresh's latest fails loudly
+  (gap_detected=true) instead of silently losing data.
+
+  A second, separate real behavior was found immediately after, also
+  live-confirmed on 2026-09-12, while trying to get one single
+  trustworthy "current coverage" reading immediately before starting the
+  first real ingestion: **successive coverage reads of rke9-rsvs seconds
+  apart can genuinely disagree with each other.** Five requests taken
+  over ~90 seconds flip-flopped between exactly two distinct
+  (earliest, row_count) pairs ("2026-07-31T11:05:00.000" / 28,111,190 vs
+  "2026-07-31T12:03:00.000" / 28,026,190), with no request-rate pattern
+  explaining it. Confirmed this wasn't an artifact of the `min()`/
+  `count()` aggregate query specifically: a plain
+  `$order=occupancydatetime ASC&$limit=1` query with no aggregation at
+  all showed the exact same two-way flip-flop. Most likely cause:
+  Socrata serving rke9-rsvs reads from multiple, mutually inconsistent
+  backend replicas/shards, not a single authoritative live value -- an
+  external data-source behavior, not a bug in this project's code, if
+  ever seen again. fetchCurrentCoverage (src/aggregation/
+  rollingWindowRefreshLog.ts) compensates directly: it takes several
+  rapid re-reads and keeps the single one showing the MOST eviction (the
+  largest earliestCovered) as that run's whole coverage, deliberately
+  biasing toward over-reporting a gap that might just be replica
+  staleness rather than ever risking silently under-reporting a real one.
 
 ## Out of scope (v1)
 
