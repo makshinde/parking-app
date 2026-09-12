@@ -898,9 +898,14 @@ describe("streamArchiveWithResume", () => {
     expect(chunks).toHaveLength(1);
     expect(chunks[0]).toHaveLength(3);
 
-    // Position is saved for the one processed chunk; with the default
-    // snapshot interval (120) and only 1 chunk processed, no snapshot write
-    // happens at all before the short page ends the run and clears the row.
+    // Position is saved for the one processed chunk. With the default
+    // snapshot interval (120) and only 1 chunk processed, the periodic
+    // in-loop boundary never fires -- but natural completion (the short
+    // page ending the run) forces one final flush of whatever's unflushed
+    // before the checkpoint row is cleared, so the one bucket this run
+    // folded still lands in the database rather than being silently
+    // dropped (see streamArchiveWithResume's own comment on this final
+    // flush for the real bug this fixes).
     expect(positionUpsertCalls).toEqual([
       {
         archive_dataset_id: ARCHIVE_DATASET_ID,
@@ -908,8 +913,26 @@ describe("streamArchiveWithResume", () => {
         readings_processed_count: 3,
       },
     ]);
-    expect(bucketUpsertCalls).toEqual([]);
-    expect(cursorUpdateCalls).toEqual([]);
+    expect(bucketUpsertCalls).toEqual([
+      [
+        {
+          archive_dataset_id: ARCHIVE_DATASET_ID,
+          blockface_id: "bf-1",
+          iso_day: 1,
+          hour: 9,
+          count: 3,
+          total_weight: 3,
+          mean: 0.5,
+          sum_squared_diff: 0.1,
+        },
+      ],
+    ]);
+    expect(cursorUpdateCalls).toEqual([
+      {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        values: { accumulator_snapshot_last_processed_id: "row-a-2" },
+      },
+    ]);
     expect(deleteCalls).toEqual([ARCHIVE_DATASET_ID]);
   });
 
@@ -936,33 +959,44 @@ describe("streamArchiveWithResume", () => {
       }),
     });
 
-    // 4 chunks processed -> 4 position writes, but only 1 snapshot event
-    // (after the 3rd chunk, at snapshotIntervalChunks=3) before the run
-    // ends -- one bucket batch-upsert plus one cursor update.
+    // 4 chunks processed -> 4 position writes and 2 snapshot events: the
+    // periodic one after the 3rd chunk (at snapshotIntervalChunks=3), plus
+    // a final one forced by natural completion (the short 4th page ending
+    // the run) to flush the 1 chunk folded since that periodic boundary --
+    // otherwise that chunk's data would never reach the database at all
+    // before the checkpoint row is cleared (see streamArchiveWithResume's
+    // own comment on this final flush for the real bug this fixes). Both
+    // snapshots see the exact same fixed accumulator state here since
+    // onChunk always returns the same constant regardless of chunk.
+    const expectedBucketRow = {
+      archive_dataset_id: ARCHIVE_DATASET_ID,
+      blockface_id: "bf-1",
+      iso_day: 1,
+      hour: 9,
+      count: 1,
+      total_weight: 1,
+      mean: 1,
+      sum_squared_diff: 0,
+    };
     expect(positionUpsertCalls).toHaveLength(4);
-    expect(bucketUpsertCalls).toHaveLength(1);
-    expect(bucketUpsertCalls[0]).toEqual([
-      {
-        archive_dataset_id: ARCHIVE_DATASET_ID,
-        blockface_id: "bf-1",
-        iso_day: 1,
-        hour: 9,
-        count: 1,
-        total_weight: 1,
-        mean: 1,
-        sum_squared_diff: 0,
-      },
-    ]);
-    expect(cursorUpdateCalls).toHaveLength(1);
+    expect(bucketUpsertCalls).toHaveLength(2);
+    expect(bucketUpsertCalls[0]).toEqual([expectedBucketRow]);
+    expect(bucketUpsertCalls[1]).toEqual([expectedBucketRow]);
+    expect(cursorUpdateCalls).toHaveLength(2);
     expect(cursorUpdateCalls[0]?.values).toEqual({
       accumulator_snapshot_last_processed_id: "row-c3-1",
+    });
+    expect(cursorUpdateCalls[1]?.values).toEqual({
+      accumulator_snapshot_last_processed_id: "row-c4-0",
     });
 
     // On the snapshotting chunk (the 3rd), position is saved BEFORE the
     // snapshot's bucket upsert and cursor update -- this ordering is what
     // guarantees the snapshot cursor can never get ahead of the stream
     // position, and the bucket upsert lands before the cursor advances
-    // (the atomicity guarantee this design depends on).
+    // (the atomicity guarantee this design depends on). The 4th chunk's
+    // position save is likewise followed by its own (final-flush) bucket
+    // upsert and cursor update, before the checkpoint is finally deleted.
     expect(callOrder).toEqual([
       "position-upsert", // chunk 1
       "position-upsert", // chunk 2
@@ -970,6 +1004,8 @@ describe("streamArchiveWithResume", () => {
       "bucket-upsert", // chunk 3's snapshot: bucket rows land first
       "cursor-update", // ...then the cursor advances
       "position-upsert", // chunk 4
+      "bucket-upsert", // final flush: chunk 4's data lands too
+      "cursor-update",
       "delete",
     ]);
   });
@@ -998,7 +1034,13 @@ describe("streamArchiveWithResume", () => {
     });
 
     // Only the main loop's one fetch -- no gap-replay fetch, and no
-    // redundant re-snapshot write, since there was nothing to catch up.
+    // redundant re-snapshot write on RESUME, since there was nothing to
+    // catch up. The one chunk the main loop itself then processes (a short
+    // page, ending the run via natural completion) still forces its own
+    // final flush before the checkpoint is cleared: bucketUpsertCalls stays
+    // empty since this chunk's onChunk returns an empty accumulator state
+    // (nothing to upsert), but the cursor still advances to record that
+    // this chunk's (empty) state was genuinely flushed.
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(
       new URL(fetchMock.mock.calls[0]?.[0] as string).searchParams.get(
@@ -1006,7 +1048,12 @@ describe("streamArchiveWithResume", () => {
       ),
     ).toBe(":id > 'row-old-1'");
     expect(bucketUpsertCalls).toEqual([]);
-    expect(cursorUpdateCalls).toEqual([]);
+    expect(cursorUpdateCalls).toEqual([
+      {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        values: { accumulator_snapshot_last_processed_id: "row-b-1" },
+      },
+    ]);
     expect(onResume).toHaveBeenCalledExactlyOnceWith(
       SAMPLE_ACCUMULATOR_SNAPSHOT,
     );
@@ -1694,6 +1741,99 @@ describe("streamArchiveWithResume", () => {
       const fetchUrl = fetchMock.mock.calls[0]?.[0] as string;
       expect(fetchUrl).toContain("/resource/q2e4-e7e5.json");
       expect(new URL(fetchUrl).searchParams.get("$where")).toContain("row-existing");
+    });
+  });
+
+  describe("final flush on natural completion (real, live-confirmed bug fix)", () => {
+    // Live-confirmed 2026-09-12: a completed rke9-rsvs fold reported 105,936
+    // buckets in its own final in-memory accumulator state, but only
+    // 105,935 ever reached archive_stream_accumulator_buckets, because the
+    // run's last few chunks fell short of a full snapshotIntervalChunks
+    // boundary when the stream reached the real end of the dataset. These
+    // tests pin down that a natural (non-interrupted, non--max-chunks)
+    // completion always flushes whatever's unflushed before the checkpoint
+    // is cleared, regardless of where that leaves it relative to the
+    // periodic snapshot interval.
+
+    it("flushes a partial interval's worth of chunks on natural completion, even when zero periodic snapshots ever fired", async () => {
+      const { clients, bucketUpsertCalls, cursorUpdateCalls, deleteCalls } = makeMockClients({ existingCheckpointRow: null });
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse(makeRecords(2, "x1")))
+        .mockResolvedValueOnce(jsonResponse(makeRecords(1, "x2"))); // short -> stop, only 2 chunks total, well under the default 120-chunk interval
+
+      await streamArchiveWithResume(clients, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        chunkSize: 2,
+        onChunk: () => ({
+          "bf-final:1:9": { count: 5, totalWeight: 5, mean: 1, sumSquaredDiff: 0 },
+        }),
+      });
+
+      expect(bucketUpsertCalls).toEqual([
+        [
+          {
+            archive_dataset_id: ARCHIVE_DATASET_ID,
+            blockface_id: "bf-final",
+            iso_day: 1,
+            hour: 9,
+            count: 5,
+            total_weight: 5,
+            mean: 1,
+            sum_squared_diff: 0,
+          },
+        ],
+      ]);
+      expect(cursorUpdateCalls).toHaveLength(1);
+      expect(cursorUpdateCalls[0]?.values).toEqual({
+        accumulator_snapshot_last_processed_id: "row-x2-0",
+      });
+      expect(deleteCalls).toEqual([ARCHIVE_DATASET_ID]);
+    });
+
+    it("does not double-flush when natural completion lands exactly on a periodic snapshot boundary", async () => {
+      const { clients, bucketUpsertCalls } = makeMockClients({ existingCheckpointRow: null });
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse(makeRecords(2, "y1")))
+        .mockResolvedValueOnce(jsonResponse(makeRecords(1, "y2"))); // short -> stop, exactly at snapshotIntervalChunks=2
+
+      await streamArchiveWithResume(clients, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        chunkSize: 2,
+        snapshotIntervalChunks: 2,
+        onChunk: () => ({
+          "bf-y:1:9": { count: 1, totalWeight: 1, mean: 1, sumSquaredDiff: 0 },
+        }),
+      });
+
+      // The periodic snapshot fires after chunk 2 and resets
+      // chunksSinceLastSnapshot to 0; chunk 2 is also the short page that
+      // ends the run, so chunksSinceLastSnapshot is already 0 by the time
+      // natural completion is reached -- no redundant second flush.
+      expect(bucketUpsertCalls).toHaveLength(1);
+    });
+
+    it("performs no final flush at all when the checkpoint already existed fully caught-up and the run fetches nothing new", async () => {
+      const { clients, bucketUpsertCalls, cursorUpdateCalls } = makeMockClients({
+        existingCheckpointRow: {
+          archive_dataset_id: ARCHIVE_DATASET_ID,
+          last_processed_id: "row-z-0",
+          readings_processed_count: 1,
+          accumulator_snapshot_last_processed_id: "row-z-0",
+        },
+        existingBucketRows: accumulatorSnapshotToBucketRows(ARCHIVE_DATASET_ID, SAMPLE_ACCUMULATOR_SNAPSHOT),
+      });
+      fetchMock.mockResolvedValueOnce(jsonResponse([])); // nothing new at all -- the loop body never runs
+
+      await streamArchiveWithResume(clients, {
+        archiveDatasetId: ARCHIVE_DATASET_ID,
+        chunkSize: 50,
+        onChunk: () => ({}),
+      });
+
+      // chunksSinceLastSnapshot never left 0 (the loop broke on the very
+      // first, empty page) -- nothing to flush, so no snapshot write at all.
+      expect(bucketUpsertCalls).toEqual([]);
+      expect(cursorUpdateCalls).toEqual([]);
     });
   });
 });

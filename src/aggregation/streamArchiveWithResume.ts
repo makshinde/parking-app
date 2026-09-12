@@ -851,5 +851,36 @@ export async function streamArchiveWithResume(clients: ArchiveStreamClients, opt
     }
   }
 
+  // Natural completion (the loop above reached the real end of the
+  // dataset, rather than being interrupted by a crash or --max-chunks)
+  // skips the periodic every-snapshotIntervalChunks boundary check inside
+  // the loop, so anything accumulated since the last periodic snapshot
+  // would otherwise never reach the database at all -- and
+  // clearArchiveStreamCheckpoint (right below) deletes the very checkpoint
+  // state a future resume would need to recover it, since there is no
+  // "next run" that will ever see this dataset as incomplete again.
+  //
+  // Live-confirmed as a real, not hypothetical, bug (2026-09-12): a
+  // completed rke9-rsvs fold reported 105,936 buckets in its own final
+  // in-memory accumulator state, but only 105,935 ever reached
+  // archive_stream_accumulator_buckets, because the run's last few chunks
+  // fell short of a full snapshot interval when the stream ended. This
+  // final flush closes that gap -- chunksSinceLastSnapshot > 0 means at
+  // least one chunk was folded since the last periodic snapshot (or ever,
+  // for a short-lived dataset that never crosses snapshotIntervalChunks at
+  // all) and needs writing before the checkpoint disappears.
+  if (chunksSinceLastSnapshot > 0) {
+    if (cursorId === null) {
+      throw new Error(
+        "streamArchiveWithResume: unreachable -- chunksSinceLastSnapshot > 0 means at least one chunk was processed, which always sets cursorId",
+      );
+    }
+    await saveArchiveStreamAccumulatorSnapshot(clients, {
+      archiveDatasetId: storageIdentity,
+      accumulatorSnapshotLastProcessedId: cursorId,
+      accumulatorState,
+    });
+  }
+
   await clearArchiveStreamCheckpoint(checkpointClient, storageIdentity);
 }
