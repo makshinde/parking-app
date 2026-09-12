@@ -139,8 +139,13 @@ describe("handleResolveDestinationRequest", () => {
       expect(result.response).toMatchObject({ status: "geocoding_service_unavailable" });
     });
 
-    it("returns internal_error (500), not geocoding_service_unavailable, if Google ever rejects a request that passed our own validation (INVALID_REQUEST)", async () => {
-      fetchMock.mockResolvedValueOnce(jsonResponse({ status: "INVALID_REQUEST", results: [] }));
+    it("returns internal_error (500), not geocoding_service_unavailable, if Google ever rejects a request that passed our own validation (real, live-verified INVALID_REQUEST shape, HTTP 400)", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse(
+          { error_message: "Invalid request. Invalid 'place_id' parameter.", results: [], status: "INVALID_REQUEST" },
+          { ok: false, status: 400, statusText: "Bad Request" },
+        ),
+      );
 
       const result = await handleResolveDestinationRequest(makeDeps(), JSON.stringify({ placeId: PLACE_ID }));
 
