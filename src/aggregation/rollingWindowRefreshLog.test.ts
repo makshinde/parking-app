@@ -76,8 +76,8 @@ describe("fetchCurrentCoverage", () => {
     vi.unstubAllGlobals();
   });
 
-  it("parses a real, live-observed response shape", async () => {
-    fetchMock.mockResolvedValueOnce(
+  it("parses a real, live-observed response shape (all re-reads agree)", async () => {
+    fetchMock.mockResolvedValue(
       jsonResponse([{ earliest: "2026-07-31T11:05:00.000", latest: "2026-09-01T21:59:00.000", row_count: "28111190" }]),
     );
 
@@ -88,34 +88,62 @@ describe("fetchCurrentCoverage", () => {
       latestCovered: "2026-09-01T21:59:00.000",
       rowCount: 28111190,
     });
+    // Takes several rapid re-reads, not just one -- see fetchCurrentCoverage's
+    // own comment for why.
+    expect(fetchMock).toHaveBeenCalledTimes(5);
   });
 
-  it("requests the correct min/max/count aggregate query", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse([{ earliest: "a", latest: "b", row_count: "1" }]));
+  it("requests the correct min/max/count aggregate query on every re-read", async () => {
+    fetchMock.mockResolvedValue(jsonResponse([{ earliest: "a", latest: "b", row_count: "1" }]));
 
     await fetchCurrentCoverage("https://data.seattle.gov/resource/rke9-rsvs.json");
 
-    const requestedUrl = new URL(fetchMock.mock.calls[0]?.[0] as string);
-    expect(requestedUrl.searchParams.get("$select")).toBe("min(occupancydatetime) as earliest, max(occupancydatetime) as latest, count(*) as row_count");
+    for (const call of fetchMock.mock.calls) {
+      const requestedUrl = new URL(call[0] as string);
+      expect(requestedUrl.searchParams.get("$select")).toBe("min(occupancydatetime) as earliest, max(occupancydatetime) as latest, count(*) as row_count");
+    }
+  });
+
+  it("takes the most-evicted (largest earliestCovered) reading across re-reads, keeping its fields together", async () => {
+    // Modeled directly on the real, live-observed flip-flop between two
+    // distinct answers found immediately before the first real rke9-rsvs
+    // ingestion (see fetchCurrentCoverage's own comment) -- the
+    // less-evicted reading (earlier earliest, higher row_count) must lose
+    // to the more-evicted one (later earliest, lower row_count),
+    // regardless of the order they arrive in.
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([{ earliest: "2026-07-31T11:05:00.000", latest: "2026-09-01T21:59:00.000", row_count: "28111190" }]))
+      .mockResolvedValueOnce(jsonResponse([{ earliest: "2026-07-31T12:03:00.000", latest: "2026-09-01T21:59:00.000", row_count: "28026190" }]))
+      .mockResolvedValueOnce(jsonResponse([{ earliest: "2026-07-31T11:05:00.000", latest: "2026-09-01T21:59:00.000", row_count: "28111190" }]))
+      .mockResolvedValueOnce(jsonResponse([{ earliest: "2026-07-31T12:03:00.000", latest: "2026-09-01T21:59:00.000", row_count: "28026190" }]))
+      .mockResolvedValueOnce(jsonResponse([{ earliest: "2026-07-31T11:05:00.000", latest: "2026-09-01T21:59:00.000", row_count: "28111190" }]));
+
+    const result = await fetchCurrentCoverage("https://data.seattle.gov/resource/rke9-rsvs.json");
+
+    expect(result).toEqual({
+      earliestCovered: "2026-07-31T12:03:00.000",
+      latestCovered: "2026-09-01T21:59:00.000",
+      rowCount: 28026190,
+    });
   });
 
   it("throws on a non-ok response", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse({}, { ok: false, status: 503, statusText: "Service Unavailable" }));
+    fetchMock.mockResolvedValue(jsonResponse({}, { ok: false, status: 503, statusText: "Service Unavailable" }));
     await expect(fetchCurrentCoverage("https://data.seattle.gov/resource/rke9-rsvs.json")).rejects.toThrow(/status 503/);
   });
 
   it("throws on an empty array response", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse([]));
+    fetchMock.mockResolvedValue(jsonResponse([]));
     await expect(fetchCurrentCoverage("https://data.seattle.gov/resource/rke9-rsvs.json")).rejects.toThrow(/unexpected response shape/);
   });
 
   it("throws on a row missing the expected fields", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse([{ earliest: "a" }]));
+    fetchMock.mockResolvedValue(jsonResponse([{ earliest: "a" }]));
     await expect(fetchCurrentCoverage("https://data.seattle.gov/resource/rke9-rsvs.json")).rejects.toThrow(/unexpected row shape/);
   });
 
   it("throws on a non-numeric row_count", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse([{ earliest: "a", latest: "b", row_count: "not-a-number" }]));
+    fetchMock.mockResolvedValue(jsonResponse([{ earliest: "a", latest: "b", row_count: "not-a-number" }]));
     await expect(fetchCurrentCoverage("https://data.seattle.gov/resource/rke9-rsvs.json")).rejects.toThrow(/not a valid number/);
   });
 });
@@ -214,7 +242,7 @@ describe("checkAndRecordCoverage", () => {
   });
 
   it("fetches real coverage, checks it against the last recorded entry, and records the outcome", async () => {
-    fetchMock.mockResolvedValueOnce(
+    fetchMock.mockResolvedValue(
       jsonResponse([{ earliest: "2026-08-02T00:00:00.000", latest: "2026-08-05T00:00:00.000", row_count: "500" }]),
     );
     const { client, inserted } = makeFakeClient([
@@ -230,7 +258,7 @@ describe("checkAndRecordCoverage", () => {
   });
 
   it("records a clean (no-gap) outcome on the very first check for a dataset id", async () => {
-    fetchMock.mockResolvedValueOnce(
+    fetchMock.mockResolvedValue(
       jsonResponse([{ earliest: "2026-07-31T11:05:00.000", latest: "2026-09-01T21:59:00.000", row_count: "28111190" }]),
     );
     const { client, inserted } = makeFakeClient([]);
