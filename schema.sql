@@ -1054,3 +1054,32 @@ ALTER TABLE reverse_geocode_cache ENABLE ROW LEVEL SECURITY;
 -- the reverse-geocode Edge Function itself reads/writes (via
 -- reverseGeocodeCoordinates.ts, using the service-role key); an anon/
 -- frontend client never queries this table directly.
+
+-- Added by migrations/023_add_rolling_window_refresh_log.sql. See that
+-- migration's own header comment for the full reasoning (detecting a
+-- real, live-confirmed eviction-driven data-loss gap in rke9-rsvs, the
+-- current-year rolling-window Paid Parking Occupancy dataset).
+CREATE TABLE rolling_window_refresh_log (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  archive_dataset_id text NOT NULL,
+  checked_at timestamptz NOT NULL DEFAULT now(),
+  earliest_covered text NOT NULL,
+  latest_covered text NOT NULL,
+  row_count bigint NOT NULL,
+  gap_detected boolean NOT NULL,
+  gap_detail text,
+  CHECK (gap_detected = (gap_detail IS NOT NULL))
+);
+
+COMMENT ON TABLE rolling_window_refresh_log IS
+  'Append-only audit log of each rolling-window (e.g. rke9-rsvs) refresh''s real observed data coverage, used to detect a real eviction-driven data-loss gap between consecutive refreshes -- see migrations/023''s own header comment and rollingWindowRefreshLog.ts''s detectCoverageGap for the full reasoning. Purely internal/operational bookkeeping, not part of the public-facing schema.';
+
+CREATE INDEX idx_rolling_window_refresh_log_dataset_checked_at
+  ON rolling_window_refresh_log (archive_dataset_id, checked_at DESC);
+
+ALTER TABLE rolling_window_refresh_log ENABLE ROW LEVEL SECURITY;
+-- No CREATE POLICY statements, intentionally: same reasoning as
+-- occupancy_stats_backfill_progress/occupancy_stats_backfill_failures. It
+-- holds no parking data of any public interest, only this project's own
+-- refresh-bookkeeping. With RLS enabled and zero policies, only the
+-- service-role key can read or write it.
