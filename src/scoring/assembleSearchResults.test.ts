@@ -7,7 +7,6 @@ import {
   type NearbyBlockfaceRow,
   type NearbyOffStreetFacilityRow,
   type OccupancyStatsSupabaseClient,
-  type OffStreetFacilityResult,
 } from "./assembleSearchResults";
 
 // --- Mock occupancy_stats client ------------------------------------------
@@ -120,7 +119,7 @@ describe("assembleSearchResults", () => {
     const { client } = makeMockOccupancyStatsClient([]);
     const facility = makeFacilityRow({ id: "os-1" });
 
-    const [result] = await assembleSearchResults(client, {
+    const { facilityResults } = await assembleSearchResults(client, {
       blockfaceCandidates: [],
       facilityCandidates: [facility],
       isoDay: 1,
@@ -128,14 +127,14 @@ describe("assembleSearchResults", () => {
       daysInFuture: 0,
     });
 
-    expect(result).toMatchObject({ type: "off_street_facility", hasData: false, id: "os-1" });
+    expect(facilityResults[0]).toMatchObject({ type: "off_street_facility", hasData: false, id: "os-1" });
   });
 
   it("marks a blockface with no matching occupancy_stats row hasData: false", async () => {
     const { client } = makeMockOccupancyStatsClient([]); // no rows at all
     const blockface = makeBlockfaceRow({ id: "bf-1" });
 
-    const [result] = await assembleSearchResults(client, {
+    const { blockfaceResults } = await assembleSearchResults(client, {
       blockfaceCandidates: [blockface],
       facilityCandidates: [],
       isoDay: 1,
@@ -143,7 +142,7 @@ describe("assembleSearchResults", () => {
       daysInFuture: 0,
     });
 
-    expect(result).toMatchObject({ type: "blockface", hasData: false, id: "bf-1" });
+    expect(blockfaceResults[0]).toMatchObject({ type: "blockface", hasData: false, id: "bf-1" });
   });
 
   it("skips the occupancy_stats query entirely when there are no blockface candidates", async () => {
@@ -167,7 +166,7 @@ describe("assembleSearchResults", () => {
       // bf-2 deliberately has no matching row.
     ]);
 
-    const results = await assembleSearchResults(client, {
+    const { blockfaceResults } = await assembleSearchResults(client, {
       blockfaceCandidates: [
         makeBlockfaceRow({ id: "bf-1" }),
         makeBlockfaceRow({ id: "bf-2" }),
@@ -187,13 +186,13 @@ describe("assembleSearchResults", () => {
     ]);
     expect(getInCallArgs()).toEqual(["bf-1", "bf-2", "bf-3"]);
 
-    const byId = new Map(results.map((r) => [r.id, r]));
+    const byId = new Map(blockfaceResults.map((r) => [r.id, r]));
     expect(byId.get("bf-1")).toMatchObject({ hasData: true, confidence: { score: 10 } });
     expect(byId.get("bf-2")).toMatchObject({ hasData: false });
     expect(byId.get("bf-3")).toMatchObject({ hasData: true, confidence: { score: 2 } });
   });
 
-  it("sorts a realistic mixed set: hasData first by ascending occupancy band then descending confidence, no-data last by real combined distance", async () => {
+  it("sorts blockfaceResults: hasData first by ascending occupancy band then descending confidence, no-data blockfaces last by distance", async () => {
     const { client } = makeMockOccupancyStatsClient([
       { blockface_id: "bf-a", mean_occupancy: 0.12, std_dev: 0.1, sample_count: 200 }, // band 1, 100% (green)
       { blockface_id: "bf-b", mean_occupancy: 0.14, std_dev: 0.5, sample_count: 100 }, // band 1, 60% (yellow)
@@ -206,41 +205,89 @@ describe("assembleSearchResults", () => {
       makeBlockfaceRow({ id: "bf-b", distance_meters: 410 }),
       makeBlockfaceRow({ id: "bf-c", distance_meters: 420 }),
       makeBlockfaceRow({ id: "bf-d", distance_meters: 430 }),
-      makeBlockfaceRow({ id: "bf-e", distance_meters: 50 }), // no occupancy_stats row -> hasData: false
-    ];
-    const facilityCandidates = [
-      makeFacilityRow({ id: "os-f", distance_meters: 30 }),
-      makeFacilityRow({ id: "os-g", distance_meters: 200 }),
+      makeBlockfaceRow({ id: "bf-e", distance_meters: 200 }), // no occupancy_stats row -> hasData: false
+      makeBlockfaceRow({ id: "bf-f", distance_meters: 50 }), // no occupancy_stats row -> hasData: false
     ];
 
-    const results = await assembleSearchResults(client, {
+    const { blockfaceResults } = await assembleSearchResults(client, {
+      blockfaceCandidates,
+      facilityCandidates: [],
+      isoDay: 1,
+      hour: 9,
+      daysInFuture: 0,
+      blockfaceLimit: "all",
+    });
+
+    expect(blockfaceResults.map((r) => r.id)).toEqual(["bf-a", "bf-b", "bf-c", "bf-d", "bf-f", "bf-e"]);
+
+    // Confirm the hasData block really is grouped/ordered by band then confidence, not by coincidence.
+    const hasDataResults = blockfaceResults.slice(0, 4) as BlockfaceHasDataResult[];
+    expect(hasDataResults.map((r) => r.confidence.color)).toEqual(["green", "yellow", "orange", "red"]);
+
+    // Confirm the no-data tail really is in distance order (50, 200).
+    const noDataResults = blockfaceResults.slice(4) as BlockfaceNoDataResult[];
+    expect(noDataResults.map((r) => r.distanceMeters)).toEqual([50, 200]);
+    expect(noDataResults.every((r) => r.hasData === false)).toBe(true);
+  });
+
+  it("sorts facilityResults by distance alone, independent of any blockface in the same search", async () => {
+    const { client } = makeMockOccupancyStatsClient([]);
+
+    const { facilityResults } = await assembleSearchResults(client, {
+      blockfaceCandidates: [makeBlockfaceRow({ id: "bf-a", distance_meters: 10 })], // closer than every facility below
+      facilityCandidates: [
+        makeFacilityRow({ id: "os-far", distance_meters: 200 }),
+        makeFacilityRow({ id: "os-near", distance_meters: 30 }),
+        makeFacilityRow({ id: "os-mid", distance_meters: 90 }),
+      ],
+      isoDay: 1,
+      hour: 9,
+      daysInFuture: 0,
+      blockfaceLimit: "all",
+      facilityLimit: "all",
+    });
+
+    expect(facilityResults.map((r) => r.id)).toEqual(["os-near", "os-mid", "os-far"]);
+  });
+
+  it("REGRESSION (the real 2026-09-17 field-test bug): a dense blockface area never crowds facilities out, because each category has its own independent cap", async () => {
+    // Exactly the failure mode found live: 69 real blockfaces vs. 6 real
+    // facilities within the same radius, with a real Diamond Parking
+    // location genuinely closer (69m) than most blockfaces shown -- yet
+    // the old shared-cap design could fill all 20 slots with blockfaces
+    // alone before a single facility was ever considered. Modeled here at
+    // a smaller but structurally identical scale: more blockfaces than
+    // the default cap, plus facilities that a shared cap would have
+    // silently dropped.
+    const stats = Array.from({ length: 25 }, (_, i) => ({ blockface_id: `bf-${i}`, ...GREEN_STATS, mean_occupancy: 0.1 }));
+    const { client } = makeMockOccupancyStatsClient(stats);
+    const blockfaceCandidates = Array.from({ length: 25 }, (_, i) => makeBlockfaceRow({ id: `bf-${i}`, distance_meters: i }));
+    const facilityCandidates = [
+      makeFacilityRow({ id: "os-1", distance_meters: 69 }),
+      makeFacilityRow({ id: "os-2", distance_meters: 150 }),
+    ];
+
+    const { blockfaceResults, facilityResults } = await assembleSearchResults(client, {
       blockfaceCandidates,
       facilityCandidates,
       isoDay: 1,
       hour: 9,
       daysInFuture: 0,
-      limit: "all",
+      // default caps (20 each) -- no explicit limit passed, matching what
+      // a real request with no limit fields set would get.
     });
 
-    expect(results.map((r) => r.id)).toEqual(["bf-a", "bf-b", "bf-c", "bf-d", "os-f", "bf-e", "os-g"]);
-
-    // Confirm the hasData block really is grouped/ordered by band then confidence, not by coincidence.
-    const hasDataResults = results.slice(0, 4) as BlockfaceHasDataResult[];
-    expect(hasDataResults.map((r) => r.confidence.color)).toEqual(["green", "yellow", "orange", "red"]);
-
-    // Confirm the no-data tail really is in combined distance order (30, 50, 200),
-    // interleaving both candidate types rather than grouping by type.
-    const noDataResults = results.slice(4) as (BlockfaceNoDataResult | OffStreetFacilityResult)[];
-    expect(noDataResults.map((r) => r.distanceMeters)).toEqual([30, 50, 200]);
-    expect(noDataResults.every((r) => r.hasData === false)).toBe(true);
+    expect(blockfaceResults).toHaveLength(20); // the default cap, exactly as before
+    expect(facilityResults).toHaveLength(2); // BOTH facilities present -- never crowded out by the 25 blockfaces
+    expect(facilityResults.map((r) => r.id)).toEqual(["os-1", "os-2"]);
   });
 
-  it("caps the result list at 20 by default", async () => {
+  it("caps blockfaceResults at 20 by default", async () => {
     const stats = Array.from({ length: 25 }, (_, i) => ({ blockface_id: `bf-${i}`, ...GREEN_STATS, mean_occupancy: 0.1 }));
     const { client } = makeMockOccupancyStatsClient(stats);
     const blockfaceCandidates = Array.from({ length: 25 }, (_, i) => makeBlockfaceRow({ id: `bf-${i}` }));
 
-    const results = await assembleSearchResults(client, {
+    const { blockfaceResults } = await assembleSearchResults(client, {
       blockfaceCandidates,
       facilityCandidates: [],
       isoDay: 1,
@@ -248,44 +295,110 @@ describe("assembleSearchResults", () => {
       daysInFuture: 0,
     });
 
-    expect(results).toHaveLength(20);
+    expect(blockfaceResults).toHaveLength(20);
   });
 
-  it("returns the full, uncapped list when limit: 'all' is requested", async () => {
-    const stats = Array.from({ length: 25 }, (_, i) => ({ blockface_id: `bf-${i}`, ...GREEN_STATS, mean_occupancy: 0.1 }));
-    const { client } = makeMockOccupancyStatsClient(stats);
-    const blockfaceCandidates = Array.from({ length: 25 }, (_, i) => makeBlockfaceRow({ id: `bf-${i}` }));
+  it("caps facilityResults at 20 by default, independently of blockfaceResults' own cap", async () => {
+    const facilityCandidates = Array.from({ length: 25 }, (_, i) => makeFacilityRow({ id: `os-${i}`, distance_meters: i }));
+    const { client } = makeMockOccupancyStatsClient([]);
 
-    const results = await assembleSearchResults(client, {
-      blockfaceCandidates,
-      facilityCandidates: [],
+    const { facilityResults } = await assembleSearchResults(client, {
+      blockfaceCandidates: [],
+      facilityCandidates,
       isoDay: 1,
       hour: 9,
       daysInFuture: 0,
-      limit: "all",
     });
 
-    expect(results).toHaveLength(25);
+    expect(facilityResults).toHaveLength(20);
   });
 
-  it("respects an explicit numeric limit smaller than the result set", async () => {
+  it("returns the full, uncapped blockfaceResults list when blockfaceLimit: 'all' is requested, without affecting facilityResults' own cap", async () => {
+    const stats = Array.from({ length: 25 }, (_, i) => ({ blockface_id: `bf-${i}`, ...GREEN_STATS, mean_occupancy: 0.1 }));
+    const { client } = makeMockOccupancyStatsClient(stats);
+    const blockfaceCandidates = Array.from({ length: 25 }, (_, i) => makeBlockfaceRow({ id: `bf-${i}` }));
+    const facilityCandidates = Array.from({ length: 25 }, (_, i) => makeFacilityRow({ id: `os-${i}`, distance_meters: i }));
+
+    const { blockfaceResults, facilityResults } = await assembleSearchResults(client, {
+      blockfaceCandidates,
+      facilityCandidates,
+      isoDay: 1,
+      hour: 9,
+      daysInFuture: 0,
+      blockfaceLimit: "all",
+      // facilityLimit deliberately omitted -- "all" for one category must
+      // not force the other to uncap too.
+    });
+
+    expect(blockfaceResults).toHaveLength(25);
+    expect(facilityResults).toHaveLength(20);
+  });
+
+  it("returns the full, uncapped facilityResults list when facilityLimit: 'all' is requested", async () => {
+    const facilityCandidates = Array.from({ length: 25 }, (_, i) => makeFacilityRow({ id: `os-${i}`, distance_meters: i }));
+    const { client } = makeMockOccupancyStatsClient([]);
+
+    const { facilityResults } = await assembleSearchResults(client, {
+      blockfaceCandidates: [],
+      facilityCandidates,
+      isoDay: 1,
+      hour: 9,
+      daysInFuture: 0,
+      facilityLimit: "all",
+    });
+
+    expect(facilityResults).toHaveLength(25);
+  });
+
+  it("respects an explicit numeric blockfaceLimit smaller than the result set", async () => {
     const stats = Array.from({ length: 10 }, (_, i) => ({ blockface_id: `bf-${i}`, ...GREEN_STATS, mean_occupancy: 0.1 }));
     const { client } = makeMockOccupancyStatsClient(stats);
     const blockfaceCandidates = Array.from({ length: 10 }, (_, i) => makeBlockfaceRow({ id: `bf-${i}` }));
 
-    const results = await assembleSearchResults(client, {
+    const { blockfaceResults } = await assembleSearchResults(client, {
       blockfaceCandidates,
       facilityCandidates: [],
       isoDay: 1,
       hour: 9,
       daysInFuture: 0,
-      limit: 5,
+      blockfaceLimit: 5,
     });
 
-    expect(results).toHaveLength(5);
+    expect(blockfaceResults).toHaveLength(5);
   });
 
-  it.each([0, -1, 1.5])("rejects an invalid limit (%s) rather than silently coercing it", async (badLimit) => {
+  it("respects an explicit numeric facilityLimit smaller than the result set", async () => {
+    const facilityCandidates = Array.from({ length: 10 }, (_, i) => makeFacilityRow({ id: `os-${i}`, distance_meters: i }));
+    const { client } = makeMockOccupancyStatsClient([]);
+
+    const { facilityResults } = await assembleSearchResults(client, {
+      blockfaceCandidates: [],
+      facilityCandidates,
+      isoDay: 1,
+      hour: 9,
+      daysInFuture: 0,
+      facilityLimit: 5,
+    });
+
+    expect(facilityResults).toHaveLength(5);
+  });
+
+  it.each([0, -1, 1.5])("rejects an invalid blockfaceLimit (%s) rather than silently coercing it", async (badLimit) => {
+    const { client } = makeMockOccupancyStatsClient([]);
+
+    await expect(
+      assembleSearchResults(client, {
+        blockfaceCandidates: [makeBlockfaceRow({ id: "bf-1" })],
+        facilityCandidates: [],
+        isoDay: 1,
+        hour: 9,
+        daysInFuture: 0,
+        blockfaceLimit: badLimit,
+      }),
+    ).rejects.toThrow(RangeError);
+  });
+
+  it.each([0, -1, 1.5])("rejects an invalid facilityLimit (%s) rather than silently coercing it", async (badLimit) => {
     const { client } = makeMockOccupancyStatsClient([]);
 
     await expect(
@@ -295,7 +408,7 @@ describe("assembleSearchResults", () => {
         isoDay: 1,
         hour: 9,
         daysInFuture: 0,
-        limit: badLimit,
+        facilityLimit: badLimit,
       }),
     ).rejects.toThrow(RangeError);
   });
@@ -310,7 +423,7 @@ describe("assembleSearchResults", () => {
       side_of_street: "N",
     });
 
-    const [result] = await assembleSearchResults(client, {
+    const { blockfaceResults } = await assembleSearchResults(client, {
       blockfaceCandidates: [blockface],
       facilityCandidates: [],
       isoDay: 1,
@@ -318,7 +431,7 @@ describe("assembleSearchResults", () => {
       daysInFuture: 0,
     });
 
-    expect(result).toEqual({
+    expect(blockfaceResults[0]).toEqual({
       type: "blockface",
       id: "bf-1",
       name: "PIKE ST (1ST AVE to 2ND AVE), N side",
@@ -336,7 +449,7 @@ describe("assembleSearchResults", () => {
     const { client } = makeMockOccupancyStatsClient([]);
     const facility = makeFacilityRow({ id: "os-1", name: "DIAMOND PARKING WX04" });
 
-    const [result] = await assembleSearchResults(client, {
+    const { facilityResults } = await assembleSearchResults(client, {
       blockfaceCandidates: [],
       facilityCandidates: [facility],
       isoDay: 1,
@@ -344,7 +457,7 @@ describe("assembleSearchResults", () => {
       daysInFuture: 0,
     });
 
-    expect(result).toEqual({
+    expect(facilityResults[0]).toEqual({
       type: "off_street_facility",
       id: "os-1",
       name: "DIAMOND PARKING WX04",
@@ -395,13 +508,14 @@ describe("assembleSearchResults", () => {
     it("computes occupancyPercent as meanOccupancy formatted as a percentage, independent of confidence", async () => {
       const { client } = makeMockOccupancyStatsClient([{ blockface_id: "bf-1", ...OCCUPANCY_AT_25 }]);
 
-      const [result] = (await assembleSearchResults(client, {
+      const { blockfaceResults } = await assembleSearchResults(client, {
         blockfaceCandidates: [makeBlockfaceRow({ id: "bf-1" })],
         facilityCandidates: [],
         isoDay: 1,
         hour: 9,
         daysInFuture: 0,
-      })) as [BlockfaceHasDataResult];
+      });
+      const [result] = blockfaceResults as [BlockfaceHasDataResult];
 
       expect(result.occupancyPercent).toBe(25);
       expect(result.occupancyColor).toBe("yellow");
@@ -416,13 +530,14 @@ describe("assembleSearchResults", () => {
       // this would wrongly come back green. It must be red.
       const { client } = makeMockOccupancyStatsClient([{ blockface_id: "bf-1", ...OCCUPANCY_HIGH }]);
 
-      const [result] = (await assembleSearchResults(client, {
+      const { blockfaceResults } = await assembleSearchResults(client, {
         blockfaceCandidates: [makeBlockfaceRow({ id: "bf-1" })],
         facilityCandidates: [],
         isoDay: 1,
         hour: 9,
         daysInFuture: 0,
-      })) as [BlockfaceHasDataResult];
+      });
+      const [result] = blockfaceResults as [BlockfaceHasDataResult];
 
       expect(result.occupancyPercent).toBe(90);
       expect(result.occupancyColor).toBe("red");
@@ -438,7 +553,7 @@ describe("assembleSearchResults", () => {
         { blockface_id: "bf-red", ...OCCUPANCY_HIGH },
       ]);
 
-      const results = (await assembleSearchResults(client, {
+      const { blockfaceResults } = await assembleSearchResults(client, {
         blockfaceCandidates: [
           makeBlockfaceRow({ id: "bf-green" }),
           makeBlockfaceRow({ id: "bf-yellow" }),
@@ -449,8 +564,9 @@ describe("assembleSearchResults", () => {
         isoDay: 1,
         hour: 9,
         daysInFuture: 0,
-        limit: "all",
-      })) as BlockfaceHasDataResult[];
+        blockfaceLimit: "all",
+      });
+      const results = blockfaceResults as BlockfaceHasDataResult[];
 
       const byId = new Map(results.map((r) => [r.id, r]));
       expect(byId.get("bf-green")?.occupancyColor).toBe("green");
@@ -470,13 +586,14 @@ describe("assembleSearchResults", () => {
       // both directions, not just that occupancy ignores confidence.
       const { client } = makeMockOccupancyStatsClient([{ blockface_id: "bf-1", ...GREEN_STATS, mean_occupancy: 0.9 }]);
 
-      const [result] = (await assembleSearchResults(client, {
+      const { blockfaceResults } = await assembleSearchResults(client, {
         blockfaceCandidates: [makeBlockfaceRow({ id: "bf-1" })],
         facilityCandidates: [],
         isoDay: 1,
         hour: 9,
         daysInFuture: 0,
-      })) as [BlockfaceHasDataResult];
+      });
+      const [result] = blockfaceResults as [BlockfaceHasDataResult];
 
       expect(result.confidence.color).toBe("green");
       expect(result.confidence.percentage).toBe(100);

@@ -131,7 +131,8 @@ interface ValidatedRequest {
   searchCenter: SearchCenterWire;
   time: PredictionTimeRequest;
   radiusMeters: number;
-  limit: number | "all" | undefined;
+  blockfaceLimit: number | "all" | undefined;
+  facilityLimit: number | "all" | undefined;
 }
 
 function invalidRequest(reason: InvalidRequestReason, message: string): HandleParkingSearchResult {
@@ -176,6 +177,30 @@ function parseSearchCenter(rawSearchCenter: unknown): SearchCenterWire | HandleP
   );
 }
 
+// Shared between blockfaceLimit and facilityLimit -- both fields have
+// identical validation rules (see assembleSearchResults.ts's own
+// applyLimit), just applied to two independent fields instead of one
+// combined one. fieldName feeds directly into the error message so the
+// caller can tell which of the two was malformed. Returns a tagged result
+// rather than a bare union so the caller never needs a runtime `typeof`/
+// `in` guard to tell "successfully parsed" apart from "here's an error
+// response" -- "all" and a plain number would otherwise be structurally
+// ambiguous with HandleParkingSearchResult for that purpose.
+type ParsedLimitField = { ok: true; value: number | "all" | undefined } | { ok: false; result: HandleParkingSearchResult };
+
+function parseLimitField(rawValue: unknown, fieldName: "blockfaceLimit" | "facilityLimit"): ParsedLimitField {
+  if (rawValue === undefined) {
+    return { ok: true, value: undefined };
+  }
+  if (rawValue === "all") {
+    return { ok: true, value: "all" };
+  }
+  if (typeof rawValue === "number" && Number.isInteger(rawValue) && rawValue > 0) {
+    return { ok: true, value: rawValue };
+  }
+  return { ok: false, result: invalidRequest("invalid_limit", `"${fieldName}" must be a positive integer or "all".`) };
+}
+
 function parseAndValidateRequest(rawBody: string): ValidatedRequest | HandleParkingSearchResult {
   let parsed: unknown;
   try {
@@ -210,18 +235,16 @@ function parseAndValidateRequest(rawBody: string): ValidatedRequest | HandlePark
     radiusMeters = body.radiusMeters;
   }
 
-  let limit: number | "all" | undefined;
-  if (body.limit !== undefined) {
-    if (body.limit === "all") {
-      limit = "all";
-    } else if (typeof body.limit === "number" && Number.isInteger(body.limit) && body.limit > 0) {
-      limit = body.limit;
-    } else {
-      return invalidRequest("invalid_limit", '"limit" must be a positive integer or "all".');
-    }
+  const parsedBlockfaceLimit = parseLimitField(body.blockfaceLimit, "blockfaceLimit");
+  if (!parsedBlockfaceLimit.ok) {
+    return parsedBlockfaceLimit.result;
+  }
+  const parsedFacilityLimit = parseLimitField(body.facilityLimit, "facilityLimit");
+  if (!parsedFacilityLimit.ok) {
+    return parsedFacilityLimit.result;
   }
 
-  return { searchCenter, time, radiusMeters, limit };
+  return { searchCenter, time, radiusMeters, blockfaceLimit: parsedBlockfaceLimit.value, facilityLimit: parsedFacilityLimit.value };
 }
 
 // --- Error classification --------------------------------------------------
@@ -339,7 +362,7 @@ export async function handleParkingSearchRequest(
   if ("response" in validated) {
     return validated;
   }
-  const { searchCenter, time, radiusMeters, limit } = validated;
+  const { searchCenter, time, radiusMeters, blockfaceLimit, facilityLimit } = validated;
 
   let resolvedTime;
   try {
@@ -412,13 +435,14 @@ export async function handleParkingSearchRequest(
     const blockfaceCandidates = blockfacesResult.data ?? [];
     const facilityCandidates = facilitiesResult.data ?? [];
 
-    const results = await assembleSearchResults(deps.occupancyStatsClient, {
+    const { blockfaceResults, facilityResults } = await assembleSearchResults(deps.occupancyStatsClient, {
       blockfaceCandidates,
       facilityCandidates,
       isoDay: resolvedTime.isoDay,
       hour: resolvedTime.hour,
       daysInFuture: resolvedTime.daysInFuture,
-      limit,
+      blockfaceLimit,
+      facilityLimit,
     });
 
     return {
@@ -426,8 +450,9 @@ export async function handleParkingSearchRequest(
         status: "ok",
         resolvedTime,
         resolvedCenter,
-        results,
-        totalCandidateCount: blockfaceCandidates.length + facilityCandidates.length,
+        blockfaceResults,
+        facilityResults,
+        totalCandidateCount: { blockfaces: blockfaceCandidates.length, facilities: facilityCandidates.length },
       },
       status: PARKING_SEARCH_HTTP_STATUS.ok,
     };
