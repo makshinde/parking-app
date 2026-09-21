@@ -287,17 +287,28 @@ function occupancyBand(meanOccupancy: number): number {
   return Math.round(meanOccupancy * 10);
 }
 
-// hasData results first: grouped by occupancy band ascending (emptiest
+// hasData blockfaces first: grouped by occupancy band ascending (emptiest
 // blocks first -- the whole point of a parking-availability app), and
 // within a band, descending by confidence (the most trustworthy prediction
-// for a given occupancy level first). hasData:false results come after all
-// of those, in real combined distance order (nearest first) across BOTH
-// candidate types together, not grouped by type -- a garage 50m away and a
-// no-data blockface 200m away should sort by their actual distance to each
-// other, not by which RPC they came from.
-function sortResults(results: CandidateResult[]): CandidateResult[] {
+// for a given occupancy level first). hasData:false blockfaces come after,
+// by distance.
+//
+// Off-street facilities are deliberately NOT part of this list (or its
+// distance-sort tail) any more -- they used to share a combined "no-data"
+// bucket with hasData:false blockfaces, sorted by real combined distance,
+// specifically so the two competed fairly for the same limited slots. That
+// was the bug: in any area dense with metered blockfaces (most of downtown
+// Seattle), hasData blockfaces alone could fill the entire shared cap
+// before a single garage was ever considered, even one genuinely closer
+// than every blockface shown -- live-confirmed 2026-09-17 (see CLAUDE.md),
+// a real Diamond Parking location 69m away, correctly returned by
+// nearby_off_street_facilities with no filtering bug anywhere, silently
+// never appearing in a 69-blockface-dense area's results. Facilities now
+// get their own independent list and cap (see sortFacilityResults/
+// assembleSearchResults below) -- this function only ever sorts blockfaces.
+function sortBlockfaceResults(results: (BlockfaceHasDataResult | BlockfaceNoDataResult)[]): (BlockfaceHasDataResult | BlockfaceNoDataResult)[] {
   const withData = results.filter((r): r is BlockfaceHasDataResult => r.hasData);
-  const withoutData = results.filter((r): r is BlockfaceNoDataResult | OffStreetFacilityResult => !r.hasData);
+  const withoutData = results.filter((r): r is BlockfaceNoDataResult => !r.hasData);
 
   withData.sort((a, b) => {
     const bandDiff = occupancyBand(a.confidence.meanOccupancy) - occupancyBand(b.confidence.meanOccupancy);
@@ -312,6 +323,14 @@ function sortResults(results: CandidateResult[]): CandidateResult[] {
   return [...withData, ...withoutData];
 }
 
+// Off-street facilities: nearest first. Unchanged from before the split --
+// this category never had a "hasData" concept to group by, and doesn't
+// need one; the only thing that changed is that it's no longer merged into
+// the same sorted/capped list as blockfaces.
+function sortFacilityResults(results: OffStreetFacilityResult[]): OffStreetFacilityResult[] {
+  return [...results].sort((a, b) => a.distanceMeters - b.distanceMeters);
+}
+
 // --- Capping -----------------------------------------------------------
 
 const DEFAULT_RESULT_LIMIT = 20;
@@ -321,14 +340,16 @@ const DEFAULT_RESULT_LIMIT = 20;
 // already used for nearby_blockfaces/nearby_off_street_facilities' own
 // radius_meters: an invalid value here signals a real bug in the caller,
 // not imprecise-but-real intent, so this throws rather than silently
-// coercing it into range.
-function applyLimit(results: CandidateResult[], limit: number | "all" | undefined): CandidateResult[] {
+// coercing it into range. limitName is threaded through purely so a
+// thrown message says which of the two independent limits (blockfaceLimit
+// vs facilityLimit) was the malformed one.
+function applyLimit<T>(results: T[], limit: number | "all" | undefined, limitName: string): T[] {
   if (limit === "all") {
     return results;
   }
   const effectiveLimit = limit ?? DEFAULT_RESULT_LIMIT;
   if (!Number.isInteger(effectiveLimit) || effectiveLimit <= 0) {
-    throw new RangeError(`assembleSearchResults: limit must be a positive integer or "all", got ${JSON.stringify(limit)}`);
+    throw new RangeError(`assembleSearchResults: ${limitName} must be a positive integer or "all", got ${JSON.stringify(limit)}`);
   }
   return results.slice(0, effectiveLimit);
 }
@@ -341,18 +362,30 @@ export interface AssembleSearchResultsOptions {
   isoDay: number;
   hour: number;
   daysInFuture: number;
-  // Omit for the default cap (20); pass "all" for the full, uncapped list.
-  limit?: number | "all";
+  // Each independently defaults to 20 and independently accepts "all" --
+  // street blocks and off-street facilities no longer share one combined
+  // cap (see sortBlockfaceResults' own comment for the real bug this
+  // fixes), so a dense area's blockfaces can never crowd every garage out
+  // of the response, and "show all" for one category doesn't force
+  // uncapping the other.
+  blockfaceLimit?: number | "all";
+  facilityLimit?: number | "all";
+}
+
+export interface AssembledSearchResults {
+  blockfaceResults: (BlockfaceHasDataResult | BlockfaceNoDataResult)[];
+  facilityResults: OffStreetFacilityResult[];
 }
 
 // Turns the raw results of nearby_blockfaces/nearby_off_street_facilities
-// into the Edge Function's final, sorted, capped response list. isoDay/
-// hour/daysInFuture are expected to already be validated (they come from
+// into the Edge Function's final response shape: two independently sorted
+// and independently capped lists, never merged into one. isoDay/hour/
+// daysInFuture are expected to already be validated (they come from
 // resolveRequestTime.ts's output) -- not re-validated here.
 export async function assembleSearchResults(
   client: OccupancyStatsSupabaseClient,
   options: AssembleSearchResultsOptions,
-): Promise<CandidateResult[]> {
+): Promise<AssembledSearchResults> {
   const statsByBlockfaceId = await fetchOccupancyStatsForCandidates(
     client,
     options.blockfaceCandidates.map((row) => row.id),
@@ -365,6 +398,8 @@ export async function assembleSearchResults(
   );
   const facilityResults = options.facilityCandidates.map(buildFacilityResult);
 
-  const sorted = sortResults([...blockfaceResults, ...facilityResults]);
-  return applyLimit(sorted, options.limit);
+  return {
+    blockfaceResults: applyLimit(sortBlockfaceResults(blockfaceResults), options.blockfaceLimit, "blockfaceLimit"),
+    facilityResults: applyLimit(sortFacilityResults(facilityResults), options.facilityLimit, "facilityLimit"),
+  };
 }

@@ -224,17 +224,28 @@ describe("handleParkingSearchRequest", () => {
       expect(result.response).toMatchObject({ status: "invalid_request", reason: "invalid_radius" });
     });
 
-    it.each([0, -1, 1.5])("rejects an invalid limit (%s)", async (limit) => {
+    it.each([0, -1, 1.5])("rejects an invalid blockfaceLimit (%s)", async (blockfaceLimit) => {
       const { deps } = makeMockDeps();
-      const result = await handleParkingSearchRequest(deps, validBody({ limit }), NOW);
+      const result = await handleParkingSearchRequest(deps, validBody({ blockfaceLimit }), NOW);
       expect(result.response).toMatchObject({ status: "invalid_request", reason: "invalid_limit" });
     });
 
-    it('accepts limit: "all"', async () => {
+    it.each([0, -1, 1.5])("rejects an invalid facilityLimit (%s)", async (facilityLimit) => {
+      const { deps } = makeMockDeps();
+      const result = await handleParkingSearchRequest(deps, validBody({ facilityLimit }), NOW);
+      expect(result.response).toMatchObject({ status: "invalid_request", reason: "invalid_limit" });
+    });
+
+    it('accepts blockfaceLimit: "all" and facilityLimit: "all" independently', async () => {
       const { deps } = makeMockDeps();
       fetchMock.mockResolvedValueOnce(jsonResponse([makeLocationIQMatch()]));
-      const result = await handleParkingSearchRequest(deps, validBody({ limit: "all" }), NOW);
+      const result = await handleParkingSearchRequest(deps, validBody({ blockfaceLimit: "all" }), NOW);
       expect(result.response.status).toBe("ok");
+
+      const { deps: deps2 } = makeMockDeps();
+      fetchMock.mockResolvedValueOnce(jsonResponse([makeLocationIQMatch()]));
+      const result2 = await handleParkingSearchRequest(deps2, validBody({ facilityLimit: "all" }), NOW);
+      expect(result2.response.status).toBe("ok");
     });
   });
 
@@ -429,11 +440,13 @@ describe("handleParkingSearchRequest", () => {
         status: "ok",
         resolvedTime: { isoDay: 1, hour: 14 },
         resolvedCenter: { lat: 47.6592579, lon: -122.3124109, source: "geocoded" },
-        totalCandidateCount: 2,
+        totalCandidateCount: { blockfaces: 1, facilities: 1 },
       });
       if (result.response.status === "ok") {
-        expect(result.response.results).toHaveLength(2);
-        expect(result.response.results[0]).toMatchObject({ id: "bf-1", hasData: true });
+        expect(result.response.blockfaceResults).toHaveLength(1);
+        expect(result.response.blockfaceResults[0]).toMatchObject({ id: "bf-1", hasData: true });
+        expect(result.response.facilityResults).toHaveLength(1);
+        expect(result.response.facilityResults[0]).toMatchObject({ id: "os-1", type: "off_street_facility" });
       }
 
       expect(rpcCalls).toHaveLength(2);

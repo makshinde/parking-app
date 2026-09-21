@@ -20,7 +20,7 @@
 // which are already independently confirmed Deno-portable).
 
 import type { QuickTimeOption, ResolvedRequestTime } from "../scoring/resolveRequestTime.ts";
-import type { CandidateResult } from "../scoring/assembleSearchResults.ts";
+import type { BlockfaceHasDataResult, BlockfaceNoDataResult, OffStreetFacilityResult } from "../scoring/assembleSearchResults.ts";
 
 // --- Request -----------------------------------------------------------
 
@@ -54,9 +54,19 @@ export interface ParkingSearchRequestBody {
   // Meters, (0, 1000], matching nearby_blockfaces/nearby_off_street_facilities'
   // own radius_meters bound exactly (migrations/017). Omit for the default (200).
   radiusMeters?: number;
-  // Omit for the default cap (20, matching assembleSearchResults.ts's
-  // DEFAULT_RESULT_LIMIT); "all" for the full, uncapped list.
-  limit?: number | "all";
+  // Independent caps, one per result category -- street blocks and
+  // off-street facilities no longer share a single combined limit (see
+  // assembleSearchResults.ts's own comment for the real bug this fixes:
+  // blockfaces filling a shared cap before a single garage was ever
+  // considered, even in a real, live-confirmed case where the garage was
+  // genuinely closer than every blockface shown). Each independently
+  // omits to the default cap (20, matching assembleSearchResults.ts's
+  // DEFAULT_RESULT_LIMIT) or accepts "all" for that category's full,
+  // uncapped list -- requesting "all" for one category never forces the
+  // other to uncap too, matching the likely real UI (an independent "show
+  // all" affordance under each section).
+  blockfaceLimit?: number | "all";
+  facilityLimit?: number | "all";
 }
 
 // --- Success response ----------------------------------------------------
@@ -79,10 +89,22 @@ export interface ParkingSearchSuccessResponse {
   // picked this point") and to know the real center point results were
   // measured from.
   resolvedCenter: ResolvedSearchCenter;
-  results: CandidateResult[];
-  // Count before capping -- lets the frontend show "20 of 47 nearby" and
-  // know whether requesting limit: "all" would actually return more.
-  totalCandidateCount: number;
+  // Two independently sorted, independently capped lists, never merged
+  // into one -- see assembleSearchResults.ts's own comment for why: a
+  // shared list let hasData blockfaces silently crowd every off-street
+  // facility out of dense-area results, even a garage genuinely closer
+  // than every blockface shown (live-confirmed 2026-09-17, see
+  // CLAUDE.md). blockfaceResults includes both hasData and no-data
+  // blockfaces (hasData first); facilityResults is off-street facilities
+  // only, nearest first.
+  blockfaceResults: (BlockfaceHasDataResult | BlockfaceNoDataResult)[];
+  facilityResults: OffStreetFacilityResult[];
+  // Counts before capping, one per category -- lets the frontend show "20
+  // of 47 street blocks" and "6 of 6 garages" as two independent "show
+  // more"/"show all" affordances, and know whether requesting
+  // blockfaceLimit/facilityLimit: "all" would actually return more for
+  // that specific category.
+  totalCandidateCount: { blockfaces: number; facilities: number };
 }
 
 // --- "Valid request, nothing to show" responses ---------------------------
@@ -173,7 +195,7 @@ export type InvalidRequestReason =
   | "invalid_coordinates" // searchCenter.type === "coordinates" with a non-finite lat/lon or one outside real-world range ([-90,90]/[-180,180]) -- reject, don't clamp; see validateCoordinates.ts's own comment for the full reasoning
   | "time_too_far_in_future" // daysInFuture would exceed MAX_DAYS_IN_FUTURE (7 -- see confidenceScore.ts), called out as its own reason (not folded into invalid_time_request) so the frontend can show a specific "pick a time within the next 7 days" message
   | "invalid_time_request" // a specific instant that resolves to the past, or an unrecognized quick option/type -- resolveRequestTime.ts's other real rejection cases
-  | "invalid_limit"; // limit present, not "all", and not a positive integer -- mirrors assembleSearchResults.ts's own validation exactly
+  | "invalid_limit"; // blockfaceLimit or facilityLimit present, not "all", and not a positive integer -- mirrors assembleSearchResults.ts's own per-category validation exactly; the response `message` says which of the two fields was the problem
 
 // All InvalidRequestReason cases map to HTTP 400 -- a genuine client-
 // contract violation in every case, distinct from the geocoding/upstream/
