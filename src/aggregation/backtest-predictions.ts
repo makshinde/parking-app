@@ -12,6 +12,9 @@ import { calculateOccupancyRatio } from "./calculateOccupancyRatio.ts";
 import { decideBucketStats, type BucketStats } from "./decideBucketStats.ts";
 import type { WeightedReading } from "./weightedStats.ts";
 import { calculateConfidenceScore } from "../scoring/confidenceScore.ts";
+import { applyAreaCorrection } from "../scoring/areaCorrectionCalibration.ts";
+import type { AreaCalibration, GroupedCalibrationPairs } from "../scoring/areaCorrectionCalibration.ts";
+import { FIELD_TEST_POINTS } from "./heldOutFieldTestGroundTruth.ts";
 
 // Retrospective backtesting harness for the prediction pipeline.
 //
@@ -1185,6 +1188,201 @@ async function runFullBacktest(limit: number | null): Promise<TestCaseResult[]> 
     console.log(result.skippedReason === null ? `predicted=${pct(result.predictedMean as number)} actual=${pct(result.singleNearestActualMean as number)}` : `skipped (${result.skippedReason})`);
   }
   return results;
+}
+
+// --- Area-occupancy-correction validation ---------------------------------
+//
+// A structurally different kind of "backtest" from everything above: the
+// TEST_CASES-based harness recomputes what THIS SAME scoring pipeline
+// would have predicted from raw Socrata readings as of a past cutoff.
+// This section instead checks whether the area-aware correction layer
+// (see CLAUDE.md's field-testing investigation and
+// areaCorrectionCalibration.ts) genuinely reduces the gap between a
+// prediction and real, independent ground truth -- reusing this file's
+// own pearsonCorrelation/bootstrapMeanConfidenceInterval rather than
+// duplicating them, which is the sense in which this "extends"
+// backtest-predictions.ts rather than living as a wholly separate file.
+//
+// Three gates, all required before area_occupancy_corrections is ever
+// wired into a live-facing prediction path:
+//   1. On the Annual Study's HELD-OUT split (never used to fit the
+//      calibration), corrected predictions must show a statistically
+//      significant (bootstrap CI excluding 0) reduction in absolute gap
+//      versus raw, for every area that received a correction.
+//   2. Areas that received NO correction (insufficient evidence) must
+//      show literally zero change -- a correctness check on the gating
+//      logic itself, not an accuracy check.
+//   3. The field test (35 real points) -- which fitAreaCalibration NEVER
+//      saw, see heldOutFieldTestGroundTruth.ts's own comment -- must
+//      also show the correction moving predictions closer to real
+//      physical ground truth, area by area. This is the one gate that
+//      actually answers "does this generalize": it's the only ground
+//      truth the calibration had no chance to overfit to.
+
+export interface GateResult {
+  gateName: string;
+  passed: boolean;
+  details: string;
+}
+
+export interface AreaCorrectionValidationReport {
+  gate1HeldOutImprovement: GateResult[];
+  gate2NoRegressionOnUncorrected: GateResult;
+  gate3FieldTestConfirmation: GateResult[];
+  allGatesPassed: boolean;
+}
+
+const AREA_CORRECTION_BOOTSTRAP_RESAMPLES = 10_000;
+const AREA_CORRECTION_CONFIDENCE_LEVEL = 0.95;
+
+function absoluteGap(predictedPct: number, groundTruthPct: number): number {
+  return Math.abs(predictedPct - groundTruthPct);
+}
+
+// Positive = the correction helped (raw was further from ground truth
+// than corrected); negative = it hurt. Bootstrapping THIS quantity's mean
+// (rather than bootstrapping raw and corrected error separately and
+// comparing) is deliberate: it directly answers "is the improvement
+// itself significantly different from zero" in one test, which is the
+// actual claim each gate needs to support.
+function improvement(rawPredictedPct: number, correctedPredictedPct: number, groundTruthPct: number): number {
+  return absoluteGap(rawPredictedPct, groundTruthPct) - absoluteGap(correctedPredictedPct, groundTruthPct);
+}
+
+// Gate 1: per area/subarea that received a real correction, does it
+// significantly reduce error on data that correction was never fit from?
+export function runGate1HeldOutImprovement(
+  calibrations: readonly AreaCalibration[],
+  holdoutGroups: readonly GroupedCalibrationPairs[],
+  randomFn: () => number = Math.random,
+): GateResult[] {
+  const results: GateResult[] = [];
+  for (const calibration of calibrations) {
+    const group = holdoutGroups.find(
+      (g) => g.paidParkingArea === calibration.paidParkingArea && g.paidParkingSubarea === calibration.paidParkingSubarea,
+    );
+    const label = calibration.paidParkingSubarea === null ? calibration.paidParkingArea : `${calibration.paidParkingArea} / ${calibration.paidParkingSubarea}`;
+
+    if (group === undefined || group.pairs.length === 0) {
+      results.push({ gateName: `gate1:${label}`, passed: false, details: "no held-out pairs available for this area -- cannot validate" });
+      continue;
+    }
+
+    const improvements = group.pairs.map((pair) =>
+      improvement(pair.predictedPct, applyAreaCorrection(pair.predictedPct, calibrations, calibration.paidParkingArea, calibration.paidParkingSubarea), pair.groundTruthPct),
+    );
+    const bootstrap = bootstrapMeanConfidenceInterval(improvements, AREA_CORRECTION_BOOTSTRAP_RESAMPLES, AREA_CORRECTION_CONFIDENCE_LEVEL, randomFn);
+    const passed = bootstrap.lowerBound > 0;
+    results.push({
+      gateName: `gate1:${label}`,
+      passed,
+      details: `n=${group.pairs.length}, mean improvement=${bootstrap.observedMean.toFixed(2)}pts, 95% CI=[${bootstrap.lowerBound.toFixed(2)}, ${bootstrap.upperBound.toFixed(2)}]`,
+    });
+  }
+  return results;
+}
+
+// Gate 2: an area/subarea NOT present in `calibrations` (insufficient
+// evidence, per fitAreaCalibration's own gating) must pass through every
+// held-out pair completely unchanged -- correctness of the fallback
+// itself, checked against real data rather than only trusted from the
+// unit tests.
+export function runGate2NoRegressionOnUncorrected(
+  calibrations: readonly AreaCalibration[],
+  holdoutGroups: readonly GroupedCalibrationPairs[],
+): GateResult {
+  const uncorrectedGroups = holdoutGroups.filter(
+    (g) => !calibrations.some((c) => c.paidParkingArea === g.paidParkingArea && c.paidParkingSubarea === g.paidParkingSubarea),
+  );
+  let checked = 0;
+  for (const group of uncorrectedGroups) {
+    for (const pair of group.pairs) {
+      const corrected = applyAreaCorrection(pair.predictedPct, calibrations, group.paidParkingArea, group.paidParkingSubarea);
+      checked += 1;
+      if (corrected !== pair.predictedPct) {
+        return {
+          gateName: "gate2",
+          passed: false,
+          details: `${group.paidParkingArea}/${group.paidParkingSubarea ?? "(area level)"}: an uncorrected area's prediction changed (${pair.predictedPct} -> ${corrected}) -- the no-correction fallback is broken`,
+        };
+      }
+    }
+  }
+  return { gateName: "gate2", passed: true, details: `${checked} held-out pairs across ${uncorrectedGroups.length} uncorrected areas, all unchanged as expected` };
+}
+
+// Gate 3: the field test's 35 real points, which fitAreaCalibration never
+// saw at all -- grouped by area, same bootstrap-CI standard as gate 1.
+// Points with no confirmed paidParkingArea (see heldOutFieldTestGroundTruth.ts)
+// are excluded, the same as an uncorrected area would be.
+export function runGate3FieldTestConfirmation(
+  calibrations: readonly AreaCalibration[],
+  randomFn: () => number = Math.random,
+): GateResult[] {
+  const byArea = new Map<string, number[]>();
+  for (const point of FIELD_TEST_POINTS) {
+    if (point.paidParkingArea === null) continue;
+    const hasCorrection = calibrations.some((c) => c.paidParkingArea === point.paidParkingArea);
+    if (!hasCorrection) continue;
+
+    const realPct = (100 * point.realOccupiedCount) / point.realTotalSpaces;
+    const correctedPct = applyAreaCorrection(point.appPredictedPct, calibrations, point.paidParkingArea, null);
+    const values = byArea.get(point.paidParkingArea) ?? [];
+    values.push(improvement(point.appPredictedPct, correctedPct, realPct));
+    byArea.set(point.paidParkingArea, values);
+  }
+
+  const results: GateResult[] = [];
+  for (const [area, improvements] of byArea) {
+    if (improvements.length < 5) {
+      results.push({ gateName: `gate3:${area}`, passed: false, details: `only ${improvements.length} field-test points in this area -- too few to bootstrap meaningfully` });
+      continue;
+    }
+    const bootstrap = bootstrapMeanConfidenceInterval(improvements, AREA_CORRECTION_BOOTSTRAP_RESAMPLES, AREA_CORRECTION_CONFIDENCE_LEVEL, randomFn);
+    const passed = bootstrap.lowerBound > 0;
+    results.push({
+      gateName: `gate3:${area}`,
+      passed,
+      details: `n=${improvements.length}, mean improvement=${bootstrap.observedMean.toFixed(2)}pts, 95% CI=[${bootstrap.lowerBound.toFixed(2)}, ${bootstrap.upperBound.toFixed(2)}]`,
+    });
+  }
+  return results;
+}
+
+export function runAreaCorrectionValidation(
+  calibrations: readonly AreaCalibration[],
+  holdoutGroups: readonly GroupedCalibrationPairs[],
+  randomFn: () => number = Math.random,
+): AreaCorrectionValidationReport {
+  const gate1HeldOutImprovement = runGate1HeldOutImprovement(calibrations, holdoutGroups, randomFn);
+  const gate2NoRegressionOnUncorrected = runGate2NoRegressionOnUncorrected(calibrations, holdoutGroups);
+  const gate3FieldTestConfirmation = runGate3FieldTestConfirmation(calibrations, randomFn);
+
+  const allGatesPassed =
+    gate1HeldOutImprovement.length > 0 &&
+    gate1HeldOutImprovement.every((g) => g.passed) &&
+    gate2NoRegressionOnUncorrected.passed &&
+    gate3FieldTestConfirmation.length > 0 &&
+    gate3FieldTestConfirmation.every((g) => g.passed);
+
+  return { gate1HeldOutImprovement, gate2NoRegressionOnUncorrected, gate3FieldTestConfirmation, allGatesPassed };
+}
+
+export function formatAreaCorrectionValidationReport(report: AreaCorrectionValidationReport): string {
+  const lines: string[] = [];
+  lines.push("=== Area-occupancy-correction validation ===\n");
+  lines.push("Gate 1 -- held-out Annual Study improvement, per area:");
+  for (const g of report.gate1HeldOutImprovement) {
+    lines.push(`  [${g.passed ? "PASS" : "FAIL"}] ${g.gateName}: ${g.details}`);
+  }
+  lines.push("\nGate 2 -- no regression on uncorrected areas:");
+  lines.push(`  [${report.gate2NoRegressionOnUncorrected.passed ? "PASS" : "FAIL"}] ${report.gate2NoRegressionOnUncorrected.details}`);
+  lines.push("\nGate 3 -- independent field-test confirmation, per area:");
+  for (const g of report.gate3FieldTestConfirmation) {
+    lines.push(`  [${g.passed ? "PASS" : "FAIL"}] ${g.gateName}: ${g.details}`);
+  }
+  lines.push(`\nALL GATES ${report.allGatesPassed ? "PASSED" : "NOT PASSED"} -- ${report.allGatesPassed ? "safe to consider wiring into a live-facing path" : "do NOT wire into any live-facing prediction path"}`);
+  return lines.join("\n");
 }
 
 export async function main(): Promise<void> {

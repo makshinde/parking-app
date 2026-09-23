@@ -12,6 +12,10 @@ import {
   pearsonCorrelation,
   resolveGroundTruthDataset,
   resolveTrainingDatasets,
+  runAreaCorrectionValidation,
+  runGate1HeldOutImprovement,
+  runGate2NoRegressionOnUncorrected,
+  runGate3FieldTestConfirmation,
   runTestCase,
   TEST_CASES,
   type BacktestDeps,
@@ -20,6 +24,7 @@ import {
 } from "./backtest-predictions.ts";
 import type { RawReading } from "./blockfaceLookup.ts";
 import type { SocrataRecord } from "../utils/fetchSocrataRecords.ts";
+import type { AreaCalibration, GroupedCalibrationPairs } from "../scoring/areaCorrectionCalibration.ts";
 
 // --- pacificMidnightInstant ------------------------------------------------
 
@@ -613,4 +618,106 @@ describe("TEST_CASES", () => {
     expect(multiOccCases.every((tc) => tc.slice === "capitol_hill_saturday")).toBe(true);
   });
 
+});
+
+// --- Area-occupancy-correction validation gates ---------------------------
+
+const BALLARD_CALIBRATION: AreaCalibration = {
+  paidParkingArea: "Ballard",
+  paidParkingSubarea: null,
+  bands: [
+    { predictedBandLow: 0, predictedBandHigh: 25, correctedPct: 45, sampleCount: 100 },
+    { predictedBandLow: 50, predictedBandHigh: 75, correctedPct: 75, sampleCount: 100 },
+  ],
+};
+
+describe("runGate1HeldOutImprovement", () => {
+  it("passes for an area where the correction genuinely, consistently reduces error on held-out data", () => {
+    // Raw predicted 10 vs real ~45-50 is a huge gap; the fitted band
+    // corrects 10 -> 45, which is consistently much closer.
+    const holdout: GroupedCalibrationPairs[] = [
+      {
+        paidParkingArea: "Ballard",
+        paidParkingSubarea: null,
+        pairs: Array.from({ length: 40 }, (_, i) => ({ predictedPct: 10, groundTruthPct: 44 + (i % 5) })),
+      },
+    ];
+    const results = runGate1HeldOutImprovement([BALLARD_CALIBRATION], holdout, makeSeededRandom(7));
+    expect(results).toHaveLength(1);
+    expect(results[0]?.passed).toBe(true);
+  });
+
+  it("fails for an area whose correction makes predictions LESS accurate on held-out data", () => {
+    // Real occupancy is near the raw predicted value (10) already -- the
+    // correction (10 -> 45) makes every point worse, not better.
+    const holdout: GroupedCalibrationPairs[] = [
+      {
+        paidParkingArea: "Ballard",
+        paidParkingSubarea: null,
+        pairs: Array.from({ length: 40 }, (_, i) => ({ predictedPct: 10, groundTruthPct: 8 + (i % 5) })),
+      },
+    ];
+    const results = runGate1HeldOutImprovement([BALLARD_CALIBRATION], holdout, makeSeededRandom(7));
+    expect(results[0]?.passed).toBe(false);
+  });
+
+  it("fails (rather than silently skipping) an area with no held-out pairs at all", () => {
+    const results = runGate1HeldOutImprovement([BALLARD_CALIBRATION], [], makeSeededRandom(7));
+    expect(results).toHaveLength(1);
+    expect(results[0]?.passed).toBe(false);
+    expect(results[0]?.details).toMatch(/no held-out pairs/);
+  });
+});
+
+describe("runGate2NoRegressionOnUncorrected", () => {
+  it("passes when every uncorrected area's held-out predictions are genuinely unchanged", () => {
+    const holdout: GroupedCalibrationPairs[] = [
+      { paidParkingArea: "SomeOtherArea", paidParkingSubarea: null, pairs: [{ predictedPct: 30, groundTruthPct: 60 }] },
+    ];
+    const result = runGate2NoRegressionOnUncorrected([BALLARD_CALIBRATION], holdout);
+    expect(result.passed).toBe(true);
+  });
+
+  it("correctly ignores areas that DID receive a correction -- gate 2 only checks the uncorrected ones", () => {
+    const holdout: GroupedCalibrationPairs[] = [
+      { paidParkingArea: "Ballard", paidParkingSubarea: null, pairs: [{ predictedPct: 10, groundTruthPct: 60 }] },
+    ];
+    const result = runGate2NoRegressionOnUncorrected([BALLARD_CALIBRATION], holdout);
+    expect(result.passed).toBe(true);
+    expect(result.details).toMatch(/0 held-out pairs across 0 uncorrected areas/);
+  });
+});
+
+describe("runGate3FieldTestConfirmation", () => {
+  it("skips areas with no real field-test evidence and areas with no fitted calibration", () => {
+    // FIELD_TEST_POINTS' real areas are Belltown/South Lake Union/Ballard/
+    // Commercial Core -- a calibration for an area with zero field-test
+    // points should produce no gate 3 result at all.
+    const results = runGate3FieldTestConfirmation(
+      [{ paidParkingArea: "NoFieldTestDataForThisArea", paidParkingSubarea: null, bands: [] }],
+      makeSeededRandom(3),
+    );
+    expect(results).toHaveLength(0);
+  });
+
+  it("produces a real, bootstrapped result for Ballard once a Ballard calibration exists (Ballard has 10 real field-test points)", () => {
+    const results = runGate3FieldTestConfirmation([BALLARD_CALIBRATION], makeSeededRandom(3));
+    const ballardResult = results.find((r) => r.gateName === "gate3:Ballard");
+    expect(ballardResult).toBeDefined();
+    expect(ballardResult?.details).toMatch(/n=10/);
+  });
+});
+
+describe("runAreaCorrectionValidation", () => {
+  it("reports allGatesPassed=false when any individual gate fails (never overstates readiness)", () => {
+    // No held-out data at all -> gate 1 fails outright, which must sink
+    // the overall verdict even if gates 2/3 would otherwise pass.
+    const report = runAreaCorrectionValidation([BALLARD_CALIBRATION], [], makeSeededRandom(7));
+    expect(report.allGatesPassed).toBe(false);
+  });
+
+  it("reports allGatesPassed=false (never true) when there are zero calibrations to validate at all", () => {
+    const report = runAreaCorrectionValidation([], [], makeSeededRandom(7));
+    expect(report.allGatesPassed).toBe(false);
+  });
 });

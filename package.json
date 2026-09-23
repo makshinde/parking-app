@@ -9,7 +9,11 @@
     "import:blockfaces": "node src/importers/import-blockfaces.ts",
     "import:off-street-facilities": "node src/importers/import-off-street-facilities.ts",
     "backfill:occupancy-stats": "node src/aggregation/backfill-occupancy-stats.ts",
-    "backtest:predictions": "node src/aggregation/backtest-predictions.ts"
+    "backtest:predictions": "node src/aggregation/backtest-predictions.ts",
+    "sync:blockface-parking-areas": "node src/aggregation/syncBlockfaceParkingAreas.ts",
+    "fetch:annual-study-calibration-data": "node src/aggregation/fetch-annual-study-calibration-data.ts",
+    "validate:area-corrections": "node src/aggregation/validate-area-corrections.ts",
+    "fit:area-corrections": "node src/aggregation/fit-and-write-area-corrections.ts"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
