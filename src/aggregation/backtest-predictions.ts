@@ -1282,20 +1282,34 @@ export function runGate1HeldOutImprovement(
   return results;
 }
 
-// Gate 2: an area/subarea NOT present in `calibrations` (insufficient
-// evidence, per fitAreaCalibration's own gating) must pass through every
-// held-out pair completely unchanged -- correctness of the fallback
-// itself, checked against real data rather than only trusted from the
-// unit tests.
+// Gate 2: a group with NO calibration applicable to it at all -- neither a
+// subarea-specific fit NOR the area-level fallback -- must pass through
+// every held-out pair completely unchanged. Genuinely uncorrected means
+// BOTH are absent, not just the exact subarea match: a group with no
+// subarea-specific calibration but a real area-level one is EXPECTED to
+// change when applyAreaCorrection falls back to it -- that's the
+// documented subarea -> area -> none hierarchy (see
+// areaCorrectionCalibration.ts) working as designed, not a regression.
+// An earlier version of this gate checked only for an exact subarea
+// match, which meant any area whose subarea-level fit failed but whose
+// area-level fallback succeeded (e.g. Westlake Ave N/South, live-run
+// 2026-09-23) was wrongly flagged as broken -- caught by inspecting that
+// specific failure directly rather than trusting the gate's own verdict,
+// and fixed here.
 export function runGate2NoRegressionOnUncorrected(
   calibrations: readonly AreaCalibration[],
   holdoutGroups: readonly GroupedCalibrationPairs[],
 ): GateResult {
-  const uncorrectedGroups = holdoutGroups.filter(
-    (g) => !calibrations.some((c) => c.paidParkingArea === g.paidParkingArea && c.paidParkingSubarea === g.paidParkingSubarea),
-  );
+  function hasAnyApplicableCalibration(area: string, subarea: string | null): boolean {
+    const hasSubareaCalibration = subarea !== null && calibrations.some((c) => c.paidParkingArea === area && c.paidParkingSubarea === subarea);
+    const hasAreaLevelFallback = calibrations.some((c) => c.paidParkingArea === area && c.paidParkingSubarea === null);
+    return hasSubareaCalibration || hasAreaLevelFallback;
+  }
+
+  const genuinelyUncorrectedGroups = holdoutGroups.filter((g) => !hasAnyApplicableCalibration(g.paidParkingArea, g.paidParkingSubarea));
+
   let checked = 0;
-  for (const group of uncorrectedGroups) {
+  for (const group of genuinelyUncorrectedGroups) {
     for (const pair of group.pairs) {
       const corrected = applyAreaCorrection(pair.predictedPct, calibrations, group.paidParkingArea, group.paidParkingSubarea);
       checked += 1;
@@ -1303,12 +1317,16 @@ export function runGate2NoRegressionOnUncorrected(
         return {
           gateName: "gate2",
           passed: false,
-          details: `${group.paidParkingArea}/${group.paidParkingSubarea ?? "(area level)"}: an uncorrected area's prediction changed (${pair.predictedPct} -> ${corrected}) -- the no-correction fallback is broken`,
+          details: `${group.paidParkingArea}/${group.paidParkingSubarea ?? "(area level)"}: a genuinely uncorrected group (no subarea-specific OR area-level calibration applies) still changed (${pair.predictedPct} -> ${corrected}) -- the no-correction fallback is actually broken`,
         };
       }
     }
   }
-  return { gateName: "gate2", passed: true, details: `${checked} held-out pairs across ${uncorrectedGroups.length} uncorrected areas, all unchanged as expected` };
+  return {
+    gateName: "gate2",
+    passed: true,
+    details: `${checked} held-out pairs across ${genuinelyUncorrectedGroups.length} genuinely uncorrected groups (no subarea-specific or area-level calibration applies to any of them), all unchanged as expected`,
+  };
 }
 
 // Gate 3: the field test's 35 real points, which fitAreaCalibration never

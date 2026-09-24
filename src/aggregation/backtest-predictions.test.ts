@@ -670,7 +670,7 @@ describe("runGate1HeldOutImprovement", () => {
 });
 
 describe("runGate2NoRegressionOnUncorrected", () => {
-  it("passes when every uncorrected area's held-out predictions are genuinely unchanged", () => {
+  it("passes when every genuinely uncorrected area's held-out predictions are unchanged", () => {
     const holdout: GroupedCalibrationPairs[] = [
       { paidParkingArea: "SomeOtherArea", paidParkingSubarea: null, pairs: [{ predictedPct: 30, groundTruthPct: 60 }] },
     ];
@@ -684,7 +684,30 @@ describe("runGate2NoRegressionOnUncorrected", () => {
     ];
     const result = runGate2NoRegressionOnUncorrected([BALLARD_CALIBRATION], holdout);
     expect(result.passed).toBe(true);
-    expect(result.details).toMatch(/0 held-out pairs across 0 uncorrected areas/);
+    expect(result.details).toMatch(/0 held-out pairs across 0 genuinely uncorrected groups/);
+  });
+
+  // Direct regression test for the real bug found on the 2026-09-23 live
+  // run: a subarea with no exact calibration match but a real area-level
+  // fallback (Westlake Ave N/South, in practice) is legitimately supposed
+  // to change -- that's the documented fallback hierarchy firing, not a
+  // regression -- and gate 2 must not flag it.
+  it("does NOT flag a subarea correctly falling back to its area-level calibration as a regression", () => {
+    const holdout: GroupedCalibrationPairs[] = [
+      { paidParkingArea: "Ballard", paidParkingSubarea: "SomeSubareaWithNoOwnFit", pairs: [{ predictedPct: 10, groundTruthPct: 60 }] },
+    ];
+    const result = runGate2NoRegressionOnUncorrected([BALLARD_CALIBRATION], holdout);
+    expect(result.passed).toBe(true);
+    expect(result.details).toMatch(/0 held-out pairs across 0 genuinely uncorrected groups/);
+  });
+
+  it("correctly counts a real, structurally uncorrected group (no subarea AND no area-level match) as checked", () => {
+    const holdout: GroupedCalibrationPairs[] = [
+      { paidParkingArea: "SomeOtherArea", paidParkingSubarea: null, pairs: [{ predictedPct: 30, groundTruthPct: 60 }] },
+    ];
+    const result = runGate2NoRegressionOnUncorrected([BALLARD_CALIBRATION], holdout);
+    expect(result.passed).toBe(true);
+    expect(result.details).toMatch(/1 held-out pairs across 1 genuinely uncorrected groups/);
   });
 });
 
