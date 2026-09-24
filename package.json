@@ -13,7 +13,8 @@
     "sync:blockface-parking-areas": "node src/aggregation/syncBlockfaceParkingAreas.ts",
     "fetch:annual-study-calibration-data": "node src/aggregation/fetch-annual-study-calibration-data.ts",
     "validate:area-corrections": "node src/aggregation/validate-area-corrections.ts",
-    "fit:area-corrections": "node src/aggregation/fit-and-write-area-corrections.ts"
+    "fit:area-corrections": "node src/aggregation/fit-and-write-area-corrections.ts",
+    "export:field-test-candidates": "node src/aggregation/export-field-test-candidates.ts"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",

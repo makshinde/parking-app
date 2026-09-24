@@ -7,3 +7,4 @@ Supabase Table Exports/
 supabase/.temp/
 backtest-output/
 calibration-data/
+field-test-exports/
