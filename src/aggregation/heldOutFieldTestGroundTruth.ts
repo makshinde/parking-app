@@ -66,8 +66,12 @@ export const FIELD_TEST_POINTS: readonly FieldTestPoint[] = [
 
   // Pike Place batch -- only PP3 has a real fraction and a confirmed
   // blockface match (PP1/PP2 were given with no cross streets and were
-  // never mapped to a specific blockface -- see CLAUDE.md).
-  { name: "1st Ave (Lenora-Blanchard)", sourceElementKey: 1022, sideOfStreet: "NE", paidParkingArea: "Commercial Core", realOccupiedCount: 100, realTotalSpaces: 100, appPredictedPct: 43 },
+  // never mapped to a specific blockface -- see CLAUDE.md). paidParkingArea
+  // was originally guessed as "Commercial Core" ("near Pike Place Market")
+  // without checking directly -- corrected after syncBlockfaceParkingAreas.ts's
+  // real sync run showed this blockface's actual PAIDAREA is "Belltown"
+  // (subarea "South"), live-verified against the database directly.
+  { name: "1st Ave (Lenora-Blanchard)", sourceElementKey: 1022, sideOfStreet: "NE", paidParkingArea: "Belltown", realOccupiedCount: 100, realTotalSpaces: 100, appPredictedPct: 43 },
 ] as const;
 
 // Real, independently-reconstructed transaction-coverage results from
