@@ -6,3 +6,4 @@ node_modules
 Supabase Table Exports/
 supabase/.temp/
 backtest-output/
+calibration-data/
