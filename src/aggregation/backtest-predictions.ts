@@ -1329,37 +1329,62 @@ export function runGate2NoRegressionOnUncorrected(
   };
 }
 
+// Shared by every gate-3 variant below: a point is only usable if SOME
+// calibration actually applies to it -- either its own real subarea-
+// specific row, or that area's area-level fallback (the same subarea ->
+// area -> none hierarchy applyAreaCorrection itself follows). Deliberately
+// a separate copy from gate 2's own version of this check (rather than a
+// shared export) -- gate 1/gate 2 are out of scope for this change.
+function hasApplicableCalibrationForGate3(calibrations: readonly AreaCalibration[], area: string, subarea: string | null): boolean {
+  const hasSubareaCalibration = subarea !== null && calibrations.some((c) => c.paidParkingArea === area && c.paidParkingSubarea === subarea);
+  const hasAreaLevelFallback = calibrations.some((c) => c.paidParkingArea === area && c.paidParkingSubarea === null);
+  return hasSubareaCalibration || hasAreaLevelFallback;
+}
+
+function gate3GroupLabel(area: string, subarea: string | null): string {
+  return subarea === null ? area : `${area}/${subarea}`;
+}
+
 // Gate 3: the field test's 35 real points, which fitAreaCalibration never
-// saw at all -- grouped by area, same bootstrap-CI standard as gate 1.
-// Points with no confirmed paidParkingArea (see heldOutFieldTestGroundTruth.ts)
-// are excluded, the same as an uncorrected area would be.
+// saw at all -- grouped by the point's own REAL subarea (see
+// heldOutFieldTestGroundTruth.ts's paidParkingSubarea, DB-confirmed the
+// same way every other blockface's subarea is, not a null placeholder),
+// same bootstrap-CI standard as gate 1. This means gate 3 now exercises
+// the actual subarea-specific calibration row applyAreaCorrection would
+// select in production for each real point, not the area-level fallback
+// row alone -- an earlier version of this function always passed `null`
+// for subarea, which meant gate 3 never actually validated the subarea-
+// specific rows Gate 1 was testing, only the (rarely-fired-in-production)
+// area-level fallback. Points with no confirmed paidParkingArea (see
+// heldOutFieldTestGroundTruth.ts) are excluded, the same as an uncorrected
+// area would be.
 export function runGate3FieldTestConfirmation(
   calibrations: readonly AreaCalibration[],
   randomFn: () => number = Math.random,
 ): GateResult[] {
-  const byArea = new Map<string, number[]>();
+  const byGroup = new Map<string, number[]>();
   for (const point of FIELD_TEST_POINTS) {
     if (point.paidParkingArea === null) continue;
-    const hasCorrection = calibrations.some((c) => c.paidParkingArea === point.paidParkingArea);
-    if (!hasCorrection) continue;
+    if (!hasApplicableCalibrationForGate3(calibrations, point.paidParkingArea, point.paidParkingSubarea)) continue;
 
     const realPct = (100 * point.realOccupiedCount) / point.realTotalSpaces;
-    const correctedPct = applyAreaCorrection(point.appPredictedPct, calibrations, point.paidParkingArea, null);
-    const values = byArea.get(point.paidParkingArea) ?? [];
+    const correctedPct = applyAreaCorrection(point.appPredictedPct, calibrations, point.paidParkingArea, point.paidParkingSubarea);
+    const label = gate3GroupLabel(point.paidParkingArea, point.paidParkingSubarea);
+    const values = byGroup.get(label) ?? [];
     values.push(improvement(point.appPredictedPct, correctedPct, realPct));
-    byArea.set(point.paidParkingArea, values);
+    byGroup.set(label, values);
   }
 
   const results: GateResult[] = [];
-  for (const [area, improvements] of byArea) {
+  for (const [label, improvements] of byGroup) {
     if (improvements.length < 5) {
-      results.push({ gateName: `gate3:${area}`, passed: false, details: `only ${improvements.length} field-test points in this area -- too few to bootstrap meaningfully` });
+      results.push({ gateName: `gate3:${label}`, passed: false, details: `only ${improvements.length} field-test points in this group -- too few to bootstrap meaningfully` });
       continue;
     }
     const bootstrap = bootstrapMeanConfidenceInterval(improvements, AREA_CORRECTION_BOOTSTRAP_RESAMPLES, AREA_CORRECTION_CONFIDENCE_LEVEL, randomFn);
     const passed = bootstrap.lowerBound > 0;
     results.push({
-      gateName: `gate3:${area}`,
+      gateName: `gate3:${label}`,
       passed,
       details: `n=${improvements.length}, mean improvement=${bootstrap.observedMean.toFixed(2)}pts, 95% CI=[${bootstrap.lowerBound.toFixed(2)}, ${bootstrap.upperBound.toFixed(2)}]`,
     });
@@ -1389,19 +1414,19 @@ export function runGate3FieldTestConfirmation(
 
 function computeGate3ImprovementsByArea(
   calibrations: readonly AreaCalibration[],
-  points: readonly { paidParkingArea: string | null; appPredictedPct: number; groundTruthPct: number }[],
+  points: readonly { paidParkingArea: string | null; paidParkingSubarea: string | null; appPredictedPct: number; groundTruthPct: number }[],
 ): Map<string, number[]> {
-  const byArea = new Map<string, number[]>();
+  const byGroup = new Map<string, number[]>();
   for (const point of points) {
     if (point.paidParkingArea === null) continue;
-    const hasCorrection = calibrations.some((c) => c.paidParkingArea === point.paidParkingArea);
-    if (!hasCorrection) continue;
-    const correctedPct = applyAreaCorrection(point.appPredictedPct, calibrations, point.paidParkingArea, null);
-    const values = byArea.get(point.paidParkingArea) ?? [];
+    if (!hasApplicableCalibrationForGate3(calibrations, point.paidParkingArea, point.paidParkingSubarea)) continue;
+    const correctedPct = applyAreaCorrection(point.appPredictedPct, calibrations, point.paidParkingArea, point.paidParkingSubarea);
+    const label = gate3GroupLabel(point.paidParkingArea, point.paidParkingSubarea);
+    const values = byGroup.get(label) ?? [];
     values.push(improvement(point.appPredictedPct, correctedPct, point.groundTruthPct));
-    byArea.set(point.paidParkingArea, values);
+    byGroup.set(label, values);
   }
-  return byArea;
+  return byGroup;
 }
 
 function bootstrapGateResult(gateLabel: string, improvements: readonly number[], randomFn: () => number): GateResult {
@@ -1420,13 +1445,13 @@ function bootstrapGateResult(gateLabel: string, improvements: readonly number[],
 // recover each point's area and the app's raw predicted percentage --
 // the transaction-coverage fixture deliberately doesn't duplicate those
 // fields itself (see heldOutFieldTestGroundTruth.ts).
-function buildTransactionCoveragePoints(): { paidParkingArea: string | null; appPredictedPct: number; groundTruthPct: number }[] {
+function buildTransactionCoveragePoints(): { paidParkingArea: string | null; paidParkingSubarea: string | null; appPredictedPct: number; groundTruthPct: number }[] {
   const fieldTestByName = new Map(FIELD_TEST_POINTS.map((p) => [p.name, p]));
-  const points: { paidParkingArea: string | null; appPredictedPct: number; groundTruthPct: number }[] = [];
+  const points: { paidParkingArea: string | null; paidParkingSubarea: string | null; appPredictedPct: number; groundTruthPct: number }[] = [];
   for (const tx of TRANSACTION_COVERAGE_POINTS) {
     const fieldPoint = fieldTestByName.get(tx.name);
     if (fieldPoint === undefined) continue;
-    points.push({ paidParkingArea: fieldPoint.paidParkingArea, appPredictedPct: fieldPoint.appPredictedPct, groundTruthPct: tx.coveragePct });
+    points.push({ paidParkingArea: fieldPoint.paidParkingArea, paidParkingSubarea: fieldPoint.paidParkingSubarea, appPredictedPct: fieldPoint.appPredictedPct, groundTruthPct: tx.coveragePct });
   }
   return points;
 }
@@ -1460,6 +1485,7 @@ export function runGate3PooledAcrossAreas(
 ): { physicalCount: GateResult; transactionCoverage: GateResult } {
   const physicalPoints = FIELD_TEST_POINTS.map((p) => ({
     paidParkingArea: p.paidParkingArea,
+    paidParkingSubarea: p.paidParkingSubarea,
     appPredictedPct: p.appPredictedPct,
     groundTruthPct: (100 * p.realOccupiedCount) / p.realTotalSpaces,
   }));

@@ -725,25 +725,31 @@ describe("runGate3FieldTestConfirmation", () => {
     expect(results).toHaveLength(0);
   });
 
-  it("produces a real, bootstrapped result for Ballard once a Ballard calibration exists (Ballard has 10 real field-test points)", () => {
+  it("produces real, bootstrapped per-subarea results for Ballard once an area-level Ballard calibration exists to fall back to (Ballard's 10 real field-test points split into 5 real Core points and 5 real Edge ones, their own real, DB-confirmed subareas, not the area-level null)", () => {
     const results = runGate3FieldTestConfirmation([BALLARD_CALIBRATION], makeSeededRandom(3));
-    const ballardResult = results.find((r) => r.gateName === "gate3:Ballard");
-    expect(ballardResult).toBeDefined();
-    expect(ballardResult?.details).toMatch(/n=10/);
+    const coreResult = results.find((r) => r.gateName === "gate3:Ballard/Core");
+    const edgeResult = results.find((r) => r.gateName === "gate3:Ballard/Edge");
+    expect(coreResult).toBeDefined();
+    expect(coreResult?.details).toMatch(/n=5/);
+    expect(edgeResult).toBeDefined();
+    expect(edgeResult?.details).toMatch(/n=5/);
   });
 });
 
 describe("runGate3TransactionCoverageConfirmation", () => {
-  it("produces a real, bootstrapped result for Ballard using the independently-reconstructed transaction-coverage rebuild, not the physical field count", () => {
+  it("produces real, bootstrapped per-subarea results for Ballard using the independently-reconstructed transaction-coverage rebuild, not the physical field count", () => {
     // All 10 real Ballard field-test points are covered by the
     // transaction-coverage rebuild (only Bell St and the Belltown-area PP3
-    // point are excluded from it, and neither is in Ballard), so Ballard's
-    // n here happens to equal gate 3's physical-count n for this area --
-    // that's real, verified against the fixture directly, not assumed.
+    // point are excluded from it, and neither is in Ballard), split into
+    // their own real, DB-confirmed subareas: 5 Core, 5 Edge -- verified
+    // directly against the fixture, not assumed.
     const results = runGate3TransactionCoverageConfirmation([BALLARD_CALIBRATION], makeSeededRandom(3));
-    const ballardResult = results.find((r) => r.gateName === "gate3-tx:Ballard");
-    expect(ballardResult).toBeDefined();
-    expect(ballardResult?.details).toMatch(/n=10/);
+    const coreResult = results.find((r) => r.gateName === "gate3-tx:Ballard/Core");
+    const edgeResult = results.find((r) => r.gateName === "gate3-tx:Ballard/Edge");
+    expect(coreResult).toBeDefined();
+    expect(coreResult?.details).toMatch(/n=5/);
+    expect(edgeResult).toBeDefined();
+    expect(edgeResult?.details).toMatch(/n=5/);
   });
 
   it("skips areas with no fitted calibration, the same as the physical-count gate", () => {
