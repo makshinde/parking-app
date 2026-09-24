@@ -14,7 +14,7 @@ import type { WeightedReading } from "./weightedStats.ts";
 import { calculateConfidenceScore } from "../scoring/confidenceScore.ts";
 import { applyAreaCorrection } from "../scoring/areaCorrectionCalibration.ts";
 import type { AreaCalibration, GroupedCalibrationPairs } from "../scoring/areaCorrectionCalibration.ts";
-import { FIELD_TEST_POINTS } from "./heldOutFieldTestGroundTruth.ts";
+import { FIELD_TEST_POINTS, TRANSACTION_COVERAGE_POINTS } from "./heldOutFieldTestGroundTruth.ts";
 
 // Retrospective backtesting harness for the prediction pipeline.
 //
@@ -1365,6 +1365,111 @@ export function runGate3FieldTestConfirmation(
     });
   }
   return results;
+}
+
+// --- Transaction-coverage confirmation and pooled-across-areas gate 3 ----
+//
+// TRANSACTION_COVERAGE_POINTS and FIELD_TEST_POINTS cover mostly the same
+// real physical locations, but measure two DIFFERENT quantities, not two
+// noisy replicates of the same one: the field test counts every vehicle
+// physically present (paid or not); the transaction rebuild reconstructs
+// only the fraction of capacity-minutes covered by an actual paid
+// transaction. Paid coverage is a structural LOWER BOUND on physical
+// presence (every paying vehicle is physically there; not every present
+// vehicle pays) -- tonight's own investigation already confirmed a large,
+// systematic ~35-point average gap between them. Averaging the two into
+// one "more precise" ground-truth point per location would blend a true
+// value with a known-biased lower bound into a number that's a faithful
+// estimate of neither -- so this deliberately does NOT merge them.
+// Instead: a second, separate, clearly-labeled confirmation asking a
+// genuinely different question (does the correction move predictions
+// closer to the independently-reconstructed paid-coverage figure, not
+// closer to real physical truth), reported alongside the physical-count
+// gate, never pooled into it.
+
+function computeGate3ImprovementsByArea(
+  calibrations: readonly AreaCalibration[],
+  points: readonly { paidParkingArea: string | null; appPredictedPct: number; groundTruthPct: number }[],
+): Map<string, number[]> {
+  const byArea = new Map<string, number[]>();
+  for (const point of points) {
+    if (point.paidParkingArea === null) continue;
+    const hasCorrection = calibrations.some((c) => c.paidParkingArea === point.paidParkingArea);
+    if (!hasCorrection) continue;
+    const correctedPct = applyAreaCorrection(point.appPredictedPct, calibrations, point.paidParkingArea, null);
+    const values = byArea.get(point.paidParkingArea) ?? [];
+    values.push(improvement(point.appPredictedPct, correctedPct, point.groundTruthPct));
+    byArea.set(point.paidParkingArea, values);
+  }
+  return byArea;
+}
+
+function bootstrapGateResult(gateLabel: string, improvements: readonly number[], randomFn: () => number): GateResult {
+  if (improvements.length < 5) {
+    return { gateName: gateLabel, passed: false, details: `only ${improvements.length} points -- too few to bootstrap meaningfully` };
+  }
+  const bootstrap = bootstrapMeanConfidenceInterval(improvements, AREA_CORRECTION_BOOTSTRAP_RESAMPLES, AREA_CORRECTION_CONFIDENCE_LEVEL, randomFn);
+  return {
+    gateName: gateLabel,
+    passed: bootstrap.lowerBound > 0,
+    details: `n=${improvements.length}, mean improvement=${bootstrap.observedMean.toFixed(2)}pts, 95% CI=[${bootstrap.lowerBound.toFixed(2)}, ${bootstrap.upperBound.toFixed(2)}]`,
+  };
+}
+
+// Joins TRANSACTION_COVERAGE_POINTS back to FIELD_TEST_POINTS by name to
+// recover each point's area and the app's raw predicted percentage --
+// the transaction-coverage fixture deliberately doesn't duplicate those
+// fields itself (see heldOutFieldTestGroundTruth.ts).
+function buildTransactionCoveragePoints(): { paidParkingArea: string | null; appPredictedPct: number; groundTruthPct: number }[] {
+  const fieldTestByName = new Map(FIELD_TEST_POINTS.map((p) => [p.name, p]));
+  const points: { paidParkingArea: string | null; appPredictedPct: number; groundTruthPct: number }[] = [];
+  for (const tx of TRANSACTION_COVERAGE_POINTS) {
+    const fieldPoint = fieldTestByName.get(tx.name);
+    if (fieldPoint === undefined) continue;
+    points.push({ paidParkingArea: fieldPoint.paidParkingArea, appPredictedPct: fieldPoint.appPredictedPct, groundTruthPct: tx.coveragePct });
+  }
+  return points;
+}
+
+export function runGate3TransactionCoverageConfirmation(
+  calibrations: readonly AreaCalibration[],
+  randomFn: () => number = Math.random,
+): GateResult[] {
+  const byArea = computeGate3ImprovementsByArea(calibrations, buildTransactionCoveragePoints());
+  const results: GateResult[] = [];
+  for (const [area, improvements] of byArea) {
+    results.push(bootstrapGateResult(`gate3-tx:${area}`, improvements, randomFn));
+  }
+  return results;
+}
+
+// The "coarser" pooled question, explicitly separate from the per-area
+// gates above: does the correction help overall, across the UNION of
+// areas actually tested, rather than in each area individually? A real,
+// different, equally rigorous question -- not a way to relax the
+// per-area bar. A pooled PASS does not mean any one specific area's
+// correction is individually trustworthy: Ballard Locks (confirmed in
+// gate 1 to be a genuine, statistically significant bad fit) is exactly
+// the kind of area-level failure a pooled result alone could mask.
+// Reports both the physical-count and transaction-coverage pooled
+// results, kept separate from each other for the same reason they're
+// kept separate per-area above.
+export function runGate3PooledAcrossAreas(
+  calibrations: readonly AreaCalibration[],
+  randomFn: () => number = Math.random,
+): { physicalCount: GateResult; transactionCoverage: GateResult } {
+  const physicalPoints = FIELD_TEST_POINTS.map((p) => ({
+    paidParkingArea: p.paidParkingArea,
+    appPredictedPct: p.appPredictedPct,
+    groundTruthPct: (100 * p.realOccupiedCount) / p.realTotalSpaces,
+  }));
+  const allPhysicalImprovements = Array.from(computeGate3ImprovementsByArea(calibrations, physicalPoints).values()).flat();
+  const allTxImprovements = Array.from(computeGate3ImprovementsByArea(calibrations, buildTransactionCoveragePoints()).values()).flat();
+
+  return {
+    physicalCount: bootstrapGateResult("gate3-pooled:physical-count", allPhysicalImprovements, randomFn),
+    transactionCoverage: bootstrapGateResult("gate3-pooled:transaction-coverage", allTxImprovements, randomFn),
+  };
 }
 
 export function runAreaCorrectionValidation(

@@ -16,6 +16,8 @@ import {
   runGate1HeldOutImprovement,
   runGate2NoRegressionOnUncorrected,
   runGate3FieldTestConfirmation,
+  runGate3PooledAcrossAreas,
+  runGate3TransactionCoverageConfirmation,
   runTestCase,
   TEST_CASES,
   type BacktestDeps,
@@ -713,9 +715,9 @@ describe("runGate2NoRegressionOnUncorrected", () => {
 
 describe("runGate3FieldTestConfirmation", () => {
   it("skips areas with no real field-test evidence and areas with no fitted calibration", () => {
-    // FIELD_TEST_POINTS' real areas are Belltown/South Lake Union/Ballard/
-    // Commercial Core -- a calibration for an area with zero field-test
-    // points should produce no gate 3 result at all.
+    // FIELD_TEST_POINTS' real areas are Belltown/South Lake Union/Ballard --
+    // a calibration for an area with zero field-test points should produce
+    // no gate 3 result at all.
     const results = runGate3FieldTestConfirmation(
       [{ paidParkingArea: "NoFieldTestDataForThisArea", paidParkingSubarea: null, bands: [] }],
       makeSeededRandom(3),
@@ -728,6 +730,53 @@ describe("runGate3FieldTestConfirmation", () => {
     const ballardResult = results.find((r) => r.gateName === "gate3:Ballard");
     expect(ballardResult).toBeDefined();
     expect(ballardResult?.details).toMatch(/n=10/);
+  });
+});
+
+describe("runGate3TransactionCoverageConfirmation", () => {
+  it("produces a real, bootstrapped result for Ballard using the independently-reconstructed transaction-coverage rebuild, not the physical field count", () => {
+    // All 10 real Ballard field-test points are covered by the
+    // transaction-coverage rebuild (only Bell St and the Belltown-area PP3
+    // point are excluded from it, and neither is in Ballard), so Ballard's
+    // n here happens to equal gate 3's physical-count n for this area --
+    // that's real, verified against the fixture directly, not assumed.
+    const results = runGate3TransactionCoverageConfirmation([BALLARD_CALIBRATION], makeSeededRandom(3));
+    const ballardResult = results.find((r) => r.gateName === "gate3-tx:Ballard");
+    expect(ballardResult).toBeDefined();
+    expect(ballardResult?.details).toMatch(/n=10/);
+  });
+
+  it("skips areas with no fitted calibration, the same as the physical-count gate", () => {
+    const results = runGate3TransactionCoverageConfirmation(
+      [{ paidParkingArea: "NoFieldTestDataForThisArea", paidParkingSubarea: null, bands: [] }],
+      makeSeededRandom(3),
+    );
+    expect(results).toHaveLength(0);
+  });
+});
+
+describe("runGate3PooledAcrossAreas", () => {
+  it("pools every area's improvements into one physical-count result and one transaction-coverage result, kept separate from each other", () => {
+    const result = runGate3PooledAcrossAreas([BALLARD_CALIBRATION], makeSeededRandom(3));
+    // Only Ballard has a fitted calibration in this test -- pooling across
+    // "all tested areas" here still means just Ballard's own 10/9 points,
+    // confirming the pooled path doesn't silently include areas with no
+    // calibration at all.
+    expect(result.physicalCount.gateName).toBe("gate3-pooled:physical-count");
+    expect(result.physicalCount.details).toMatch(/n=10/);
+    expect(result.transactionCoverage.gateName).toBe("gate3-pooled:transaction-coverage");
+    expect(result.transactionCoverage.details).toMatch(/n=10/);
+  });
+
+  it("genuinely pools across multiple areas when more than one has a fitted calibration", () => {
+    const belltownCalibration: AreaCalibration = {
+      paidParkingArea: "Belltown",
+      paidParkingSubarea: null,
+      bands: [{ predictedBandLow: 0, predictedBandHigh: 25, correctedPct: 45, sampleCount: 100 }],
+    };
+    const result = runGate3PooledAcrossAreas([BALLARD_CALIBRATION, belltownCalibration], makeSeededRandom(3));
+    // 10 Ballard + 10 Belltown physical-count points pooled into one n=20 test.
+    expect(result.physicalCount.details).toMatch(/n=20/);
   });
 });
 
