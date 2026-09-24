@@ -13,7 +13,7 @@ import {
   type ParkingSearchRpcClient,
 } from "../../../src/edge-function/handleParkingSearchRequest.ts";
 import type { GeocodeCacheSupabaseClient } from "../../../src/geocoding/geocodeAddress.ts";
-import type { OccupancyStatsSupabaseClient } from "../../../src/scoring/assembleSearchResults.ts";
+import type { AreaCorrectionsSupabaseClient, OccupancyStatsSupabaseClient } from "../../../src/scoring/assembleSearchResults.ts";
 
 // Standard Supabase Edge Function CORS boilerplate. Access-Control-Allow-
 // Origin is deliberately "*", not a specific origin: this endpoint serves
@@ -49,13 +49,15 @@ if (supabaseUrl === undefined || supabaseServiceRoleKey === undefined || locatio
 // select() shape of their own.
 //
 // service_role, not anon, for every table this function touches
-// (geocode_cache, occupancy_stats, both RPCs) -- geocode_cache in
-// particular has zero RLS policies by design (migrations/018) and is only
-// ever meant to be read/written server-side.
+// (geocode_cache, occupancy_stats, area_occupancy_corrections, both RPCs)
+// -- geocode_cache and area_occupancy_corrections in particular have zero
+// RLS policies by design (migrations/018, 025) and are only ever meant to
+// be read/written server-side.
 const rawClient = createClient(supabaseUrl, supabaseServiceRoleKey);
 const deps: HandleParkingSearchRequestDeps = {
   geocodeCacheClient: rawClient as unknown as GeocodeCacheSupabaseClient,
   occupancyStatsClient: rawClient as unknown as OccupancyStatsSupabaseClient,
+  areaCorrectionsClient: rawClient as unknown as AreaCorrectionsSupabaseClient,
   rpcClient: rawClient as unknown as ParkingSearchRpcClient,
   locationIqApiKey,
 };

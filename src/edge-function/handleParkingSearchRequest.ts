@@ -2,6 +2,7 @@ import { resolveRequestTime, type PredictionTimeRequest, type QuickTimeOption } 
 import { geocodeAddress, LocationIQRequestError, type GeocodeCacheSupabaseClient } from "../geocoding/geocodeAddress.ts";
 import {
   assembleSearchResults,
+  type AreaCorrectionsSupabaseClient,
   type NearbyBlockfaceRow,
   type NearbyOffStreetFacilityRow,
   type OccupancyStatsSupabaseClient,
@@ -65,6 +66,7 @@ export interface ParkingSearchRpcClient {
 export interface HandleParkingSearchRequestDeps {
   geocodeCacheClient: GeocodeCacheSupabaseClient;
   occupancyStatsClient: OccupancyStatsSupabaseClient;
+  areaCorrectionsClient: AreaCorrectionsSupabaseClient;
   rpcClient: ParkingSearchRpcClient;
   locationIqApiKey: string;
 }
@@ -435,15 +437,18 @@ export async function handleParkingSearchRequest(
     const blockfaceCandidates = blockfacesResult.data ?? [];
     const facilityCandidates = facilitiesResult.data ?? [];
 
-    const { blockfaceResults, facilityResults } = await assembleSearchResults(deps.occupancyStatsClient, {
-      blockfaceCandidates,
-      facilityCandidates,
-      isoDay: resolvedTime.isoDay,
-      hour: resolvedTime.hour,
-      daysInFuture: resolvedTime.daysInFuture,
-      blockfaceLimit,
-      facilityLimit,
-    });
+    const { blockfaceResults, facilityResults } = await assembleSearchResults(
+      { occupancyStatsClient: deps.occupancyStatsClient, areaCorrectionsClient: deps.areaCorrectionsClient },
+      {
+        blockfaceCandidates,
+        facilityCandidates,
+        isoDay: resolvedTime.isoDay,
+        hour: resolvedTime.hour,
+        daysInFuture: resolvedTime.daysInFuture,
+        blockfaceLimit,
+        facilityLimit,
+      },
+    );
 
     return {
       response: {

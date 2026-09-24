@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleParkingSearchRequest, type HandleParkingSearchRequestDeps, type SearchLocalAddressesRow } from "./handleParkingSearchRequest";
 import type { GeocodeCacheSupabaseClient } from "../geocoding/geocodeAddress";
-import type { NearbyBlockfaceRow, NearbyOffStreetFacilityRow, OccupancyStatsSupabaseClient } from "../scoring/assembleSearchResults";
+import type { AreaCorrectionsSupabaseClient, NearbyBlockfaceRow, NearbyOffStreetFacilityRow, OccupancyStatsSupabaseClient } from "../scoring/assembleSearchResults";
 import type { ParkingSearchRpcClient, RpcQueryResult } from "./handleParkingSearchRequest";
 
 const API_KEY = "test-locationiq-key";
@@ -41,6 +41,7 @@ const NO_MATCH_RESPONSE = jsonResponse({ error: "Unable to geocode" }, { ok: fal
 function makeMockDeps(
   options: {
     occupancyStatsRows?: Record<string, unknown>[];
+    areaCorrectionsRows?: Record<string, unknown>[];
     blockfaceRows?: NearbyBlockfaceRow[];
     facilityRows?: NearbyOffStreetFacilityRow[];
     blockfaceRpcError?: { message: string } | null;
@@ -81,6 +82,13 @@ function makeMockDeps(
     from: () => ({ select: () => occupancyQueryBuilder }),
   } as unknown as OccupancyStatsSupabaseClient;
 
+  const areaCorrectionsQueryBuilder = {
+    then: (onFulfilled?: (v: unknown) => unknown) => Promise.resolve({ data: options.areaCorrectionsRows ?? [], error: null }).then(onFulfilled),
+  };
+  const areaCorrectionsClient = {
+    from: () => ({ select: () => areaCorrectionsQueryBuilder }),
+  } as unknown as AreaCorrectionsSupabaseClient;
+
   const rpcClient: ParkingSearchRpcClient = {
     rpc: (<T>(fn: string, args: Record<string, unknown>): PromiseLike<RpcQueryResult<T>> => {
       rpcCalls.push({ fn, args });
@@ -107,7 +115,7 @@ function makeMockDeps(
     }) as ParkingSearchRpcClient["rpc"],
   };
 
-  const deps: HandleParkingSearchRequestDeps = { geocodeCacheClient, occupancyStatsClient, rpcClient, locationIqApiKey: API_KEY };
+  const deps: HandleParkingSearchRequestDeps = { geocodeCacheClient, occupancyStatsClient, areaCorrectionsClient, rpcClient, locationIqApiKey: API_KEY };
   return { deps, rpcCalls, getCacheRow: () => cacheRow };
 }
 
@@ -125,6 +133,8 @@ function makeBlockfaceRow(overrides: Partial<NearbyBlockfaceRow> & { id: string 
     rate_tiers: [],
     location_geojson: { type: "LineString", coordinates: [] },
     distance_meters: 100,
+    paidparkingarea: null,
+    paidparkingsubarea: null,
     ...overrides,
   };
 }
@@ -467,6 +477,68 @@ describe("handleParkingSearchRequest", () => {
       await handleParkingSearchRequest(deps, validBody(), NOW);
 
       expect(rpcCalls[0]?.args).toMatchObject({ radius_meters: 200 });
+    });
+  });
+
+  describe("area correction, end to end through the real request handler", () => {
+    it("a real Ballard/Core candidate's occupancyPercent comes back corrected in the actual ok response", async () => {
+      const { deps } = makeMockDeps({
+        blockfaceRows: [makeBlockfaceRow({ id: "bf-core", paidparkingarea: "Ballard", paidparkingsubarea: "Core" })],
+        occupancyStatsRows: [{ blockface_id: "bf-core", mean_occupancy: 0.48, std_dev: 0.1, sample_count: 200 }],
+        areaCorrectionsRows: [
+          { paidparkingarea: "Ballard", paidparkingsubarea: "Core", predicted_band_low: 25, predicted_band_high: 50, corrected_pct: 61.6, sample_count: 413 },
+        ],
+      });
+      fetchMock.mockResolvedValueOnce(jsonResponse([makeLocationIQMatch()]));
+
+      const result = await handleParkingSearchRequest(deps, validBody(), NOW);
+
+      expect(result.status).toBe(200);
+      if (result.response.status === "ok") {
+        expect(result.response.blockfaceResults[0]).toMatchObject({ id: "bf-core", occupancyPercent: 61.6 });
+      }
+    });
+
+    it("a real Ballard/Edge candidate in the SAME request stays fully unchanged, even while Ballard/Core corrects", async () => {
+      const { deps } = makeMockDeps({
+        blockfaceRows: [
+          makeBlockfaceRow({ id: "bf-core", paidparkingarea: "Ballard", paidparkingsubarea: "Core" }),
+          makeBlockfaceRow({ id: "bf-edge", paidparkingarea: "Ballard", paidparkingsubarea: "Edge" }),
+        ],
+        occupancyStatsRows: [
+          { blockface_id: "bf-core", mean_occupancy: 0.48, std_dev: 0.1, sample_count: 200 },
+          { blockface_id: "bf-edge", mean_occupancy: 0.48, std_dev: 0.1, sample_count: 200 },
+        ],
+        areaCorrectionsRows: [
+          { paidparkingarea: "Ballard", paidparkingsubarea: "Core", predicted_band_low: 25, predicted_band_high: 50, corrected_pct: 61.6, sample_count: 413 },
+        ],
+      });
+      fetchMock.mockResolvedValueOnce(jsonResponse([makeLocationIQMatch()]));
+
+      const result = await handleParkingSearchRequest(deps, validBody({ blockfaceLimit: "all" }), NOW);
+
+      expect(result.status).toBe(200);
+      if (result.response.status === "ok") {
+        const byId = new Map(result.response.blockfaceResults.map((r) => [r.id, r]));
+        expect(byId.get("bf-core")).toMatchObject({ occupancyPercent: 61.6 });
+        expect(byId.get("bf-edge")).toMatchObject({ occupancyPercent: 48 });
+      }
+    });
+
+    it("with zero rows in area_occupancy_corrections (today's real state for most of the city), every real candidate's occupancyPercent is untouched", async () => {
+      const { deps } = makeMockDeps({
+        blockfaceRows: [makeBlockfaceRow({ id: "bf-1", paidparkingarea: "Pioneer Square", paidparkingsubarea: "Core" })],
+        occupancyStatsRows: [{ blockface_id: "bf-1", mean_occupancy: 0.46, std_dev: 0.1, sample_count: 200 }],
+        areaCorrectionsRows: [],
+      });
+      fetchMock.mockResolvedValueOnce(jsonResponse([makeLocationIQMatch()]));
+
+      const result = await handleParkingSearchRequest(deps, validBody(), NOW);
+
+      expect(result.status).toBe(200);
+      if (result.response.status === "ok") {
+        expect(result.response.blockfaceResults[0]).toMatchObject({ id: "bf-1", occupancyPercent: 46 });
+      }
     });
   });
 });
