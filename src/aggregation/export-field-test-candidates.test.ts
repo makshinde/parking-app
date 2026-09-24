@@ -10,24 +10,30 @@ import {
 import type { CandidateBlockface, FieldTestCandidateRow } from "./export-field-test-candidates.ts";
 
 describe("parseCliOptions", () => {
-  it("parses a real, minimal invocation with only --area", () => {
+  it("parses a real, minimal invocation with only --area, defaulting to paid-only", () => {
     expect(parseCliOptions(["--area=Ballard"])).toEqual({
       area: "Ballard",
       subarea: null,
       isoDay: null,
       hour: null,
       outPath: null,
+      includeUnpaid: false,
     });
   });
 
-  it("parses every flag when all are given", () => {
-    expect(parseCliOptions(["--area=South Lake Union", "--subarea=North", "--day=2", "--hour=14", "--out=/tmp/x.csv"])).toEqual({
+  it("parses every flag when all are given, including --include-unpaid", () => {
+    expect(parseCliOptions(["--area=South Lake Union", "--subarea=North", "--day=2", "--hour=14", "--out=/tmp/x.csv", "--include-unpaid"])).toEqual({
       area: "South Lake Union",
       subarea: "North",
       isoDay: 2,
       hour: 14,
       outPath: "/tmp/x.csv",
+      includeUnpaid: true,
     });
+  });
+
+  it("defaults includeUnpaid to false when --include-unpaid is not passed", () => {
+    expect(parseCliOptions(["--area=Ballard"]).includeUnpaid).toBe(false);
   });
 
   it("throws when --area is missing -- there is no sensible default area", () => {

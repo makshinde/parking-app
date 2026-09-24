@@ -28,6 +28,7 @@ export interface CliOptions {
   isoDay: number | null;
   hour: number | null;
   outPath: string | null;
+  includeUnpaid: boolean;
 }
 
 function parseFlag(argv: readonly string[], key: string): string | null {
@@ -64,7 +65,23 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
     }
   }
 
-  return { area, subarea: parseFlag(argv, "subarea"), isoDay, hour, outPath: parseFlag(argv, "out") };
+  return {
+    area,
+    subarea: parseFlag(argv, "subarea"),
+    isoDay,
+    hour,
+    outPath: parseFlag(argv, "out"),
+    // Defaults to real, paid blockfaces only -- a PAIDAREA/SUBAREA tag on
+    // the Blockface FeatureServer carries across an ENTIRE segment
+    // regardless of which side is actually paid (live-confirmed against
+    // South Lake Union/North: 17 of its 93 blockfaces are tagged with a
+    // real subarea but are genuinely unpaid, is_paid=false, 0 real
+    // PAID_SPACES, "No Parking Allowed"), so exporting every tagged row
+    // unfiltered would hand a field tester unpaid segments with nothing
+    // to actually count. --include-unpaid is the explicit, real override
+    // for the rare case someone genuinely wants those too.
+    includeUnpaid: argv.includes("--include-unpaid"),
+  };
 }
 
 // Defaults to right now (Seattle local time, matching where a real field
@@ -224,6 +241,7 @@ interface BlockfaceRow {
   cross_street_to: string;
   paidparkingarea: string | null;
   paidparkingsubarea: string | null;
+  is_paid: boolean;
 }
 
 interface OccupancyStatsRow {
@@ -235,7 +253,7 @@ export async function main(): Promise<void> {
   const options = parseCliOptions(process.argv.slice(2));
   const { isoDay, hour } = resolveIsoDayAndHour(options);
 
-  console.log(`Area: "${options.area}"${options.subarea === null ? "" : ` / "${options.subarea}"`} -- day=${isoDay} (ISO), hour=${hour}`);
+  console.log(`Area: "${options.area}"${options.subarea === null ? "" : ` / "${options.subarea}"`} -- day=${isoDay} (ISO), hour=${hour}${options.includeUnpaid ? " -- including unpaid blockfaces" : ""}`);
 
   const supabaseUrl = getRequiredEnvVar("SUPABASE_URL");
   const supabaseServiceRoleKey = getRequiredEnvVar("SUPABASE_SERVICE_ROLE_KEY");
@@ -244,18 +262,28 @@ export async function main(): Promise<void> {
   console.log("Reading real candidate blockfaces directly from blockfaces...");
   let blockfaceQuery = supabase
     .from("blockfaces")
-    .select("id, source_element_key, side_of_street, street_name, cross_street_from, cross_street_to, paidparkingarea, paidparkingsubarea")
+    .select("id, source_element_key, side_of_street, street_name, cross_street_from, cross_street_to, paidparkingarea, paidparkingsubarea, is_paid")
     .eq("paidparkingarea", options.area);
   if (options.subarea !== null) {
     blockfaceQuery = blockfaceQuery.eq("paidparkingsubarea", options.subarea);
   }
+  // A PAIDAREA/SUBAREA tag carries across an entire street segment on the
+  // source FeatureServer regardless of which specific side is actually
+  // paid -- live-confirmed against South Lake Union/North, where 17 of 93
+  // tagged blockfaces are genuinely unpaid (is_paid=false, 0 real
+  // PAID_SPACES). Excluding those by default is what --include-unpaid
+  // overrides.
+  if (!options.includeUnpaid) {
+    blockfaceQuery = blockfaceQuery.eq("is_paid", true);
+  }
   const blockfaceRows = (await fetchAllRows(blockfaceQuery.order("street_name").order("cross_street_from"), "reading blockfaces")) as unknown as BlockfaceRow[];
 
   if (blockfaceRows.length === 0) {
-    console.log(`No real blockfaces found for area="${options.area}"${options.subarea === null ? "" : `, subarea="${options.subarea}"`} -- nothing to export.`);
+    const filterNote = options.includeUnpaid ? "" : " (excluding unpaid blockfaces -- try --include-unpaid if you expect real unpaid segments here)";
+    console.log(`No real blockfaces found for area="${options.area}"${options.subarea === null ? "" : `, subarea="${options.subarea}"`}${filterNote} -- nothing to export.`);
     return;
   }
-  console.log(`${blockfaceRows.length} real candidate blockfaces found.`);
+  console.log(`${blockfaceRows.length} real candidate blockfaces found${options.includeUnpaid ? "" : " (paid only)"}.`);
 
   console.log("Reading this project's own current occupancy_stats prediction for each, at the requested day/hour...");
   const meanOccupancyByBlockfaceId = new Map<string, number>();
