@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   assembleSearchResults,
   calculateOccupancyColor,
+  type AreaCorrectionsSupabaseClient,
   type BlockfaceHasDataResult,
   type BlockfaceNoDataResult,
   type NearbyBlockfaceRow,
@@ -47,6 +48,36 @@ function makeMockOccupancyStatsClient(rows: Record<string, unknown>[]) {
   return { client, fromCalls, eqCalls, getInCallArgs: () => inCallArgs };
 }
 
+// --- Mock area_occupancy_corrections client -------------------------------
+//
+// Simpler than occupancy_stats' mock: no .eq()/.in() to simulate, since the
+// real client always reads the whole table in one unfiltered .select().
+
+function makeMockAreaCorrectionsClient(rows: Record<string, unknown>[]) {
+  const fromCalls: string[] = [];
+  const client = {
+    from: (table: string) => {
+      fromCalls.push(table);
+      return {
+        select: () => ({
+          then: (onFulfilled?: (value: { data: unknown; error: null }) => unknown, onRejected?: (reason: unknown) => unknown) =>
+            Promise.resolve({ data: rows, error: null }).then(onFulfilled, onRejected),
+        }),
+      };
+    },
+  } as unknown as AreaCorrectionsSupabaseClient;
+  return { client, fromCalls };
+}
+
+// The overwhelming majority of tests in this file don't care about area
+// corrections at all -- this shared, always-empty client keeps every
+// pre-existing occupancyPercent/occupancyColor value in this file exactly
+// as it was before area corrections existed (identity: no calibration
+// rows means applyAreaCorrection always returns its input unchanged).
+// Tests that DO care about corrections (see "area correction" describe
+// block below) build their own, real, non-empty rows instead.
+const { client: NO_CORRECTIONS_CLIENT } = makeMockAreaCorrectionsClient([]);
+
 // --- Fixtures --------------------------------------------------------------
 
 function makeBlockfaceRow(overrides: Partial<NearbyBlockfaceRow> & { id: string }): NearbyBlockfaceRow {
@@ -63,6 +94,8 @@ function makeBlockfaceRow(overrides: Partial<NearbyBlockfaceRow> & { id: string 
     rate_tiers: [{ day_type: "WKD", tier_number: 1, start_time: "08:00:00", end_time: "18:00:00", rate_usd: 2 }],
     location_geojson: { type: "LineString", coordinates: [[-122.33, 47.6], [-122.331, 47.601]] },
     distance_meters: 100,
+    paidparkingarea: null,
+    paidparkingsubarea: null,
     ...overrides,
   };
 }
@@ -119,7 +152,7 @@ describe("assembleSearchResults", () => {
     const { client } = makeMockOccupancyStatsClient([]);
     const facility = makeFacilityRow({ id: "os-1" });
 
-    const { facilityResults } = await assembleSearchResults(client, {
+    const { facilityResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
       blockfaceCandidates: [],
       facilityCandidates: [facility],
       isoDay: 1,
@@ -134,7 +167,7 @@ describe("assembleSearchResults", () => {
     const { client } = makeMockOccupancyStatsClient([]); // no rows at all
     const blockface = makeBlockfaceRow({ id: "bf-1" });
 
-    const { blockfaceResults } = await assembleSearchResults(client, {
+    const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
       blockfaceCandidates: [blockface],
       facilityCandidates: [],
       isoDay: 1,
@@ -148,7 +181,7 @@ describe("assembleSearchResults", () => {
   it("skips the occupancy_stats query entirely when there are no blockface candidates", async () => {
     const { client, fromCalls } = makeMockOccupancyStatsClient([]);
 
-    await assembleSearchResults(client, {
+    await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
       blockfaceCandidates: [],
       facilityCandidates: [makeFacilityRow({ id: "os-1" })],
       isoDay: 1,
@@ -166,7 +199,7 @@ describe("assembleSearchResults", () => {
       // bf-2 deliberately has no matching row.
     ]);
 
-    const { blockfaceResults } = await assembleSearchResults(client, {
+    const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
       blockfaceCandidates: [
         makeBlockfaceRow({ id: "bf-1" }),
         makeBlockfaceRow({ id: "bf-2" }),
@@ -209,7 +242,7 @@ describe("assembleSearchResults", () => {
       makeBlockfaceRow({ id: "bf-f", distance_meters: 50 }), // no occupancy_stats row -> hasData: false
     ];
 
-    const { blockfaceResults } = await assembleSearchResults(client, {
+    const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
       blockfaceCandidates,
       facilityCandidates: [],
       isoDay: 1,
@@ -233,7 +266,7 @@ describe("assembleSearchResults", () => {
   it("sorts facilityResults by distance alone, independent of any blockface in the same search", async () => {
     const { client } = makeMockOccupancyStatsClient([]);
 
-    const { facilityResults } = await assembleSearchResults(client, {
+    const { facilityResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
       blockfaceCandidates: [makeBlockfaceRow({ id: "bf-a", distance_meters: 10 })], // closer than every facility below
       facilityCandidates: [
         makeFacilityRow({ id: "os-far", distance_meters: 200 }),
@@ -267,7 +300,7 @@ describe("assembleSearchResults", () => {
       makeFacilityRow({ id: "os-2", distance_meters: 150 }),
     ];
 
-    const { blockfaceResults, facilityResults } = await assembleSearchResults(client, {
+    const { blockfaceResults, facilityResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
       blockfaceCandidates,
       facilityCandidates,
       isoDay: 1,
@@ -287,7 +320,7 @@ describe("assembleSearchResults", () => {
     const { client } = makeMockOccupancyStatsClient(stats);
     const blockfaceCandidates = Array.from({ length: 25 }, (_, i) => makeBlockfaceRow({ id: `bf-${i}` }));
 
-    const { blockfaceResults } = await assembleSearchResults(client, {
+    const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
       blockfaceCandidates,
       facilityCandidates: [],
       isoDay: 1,
@@ -302,7 +335,7 @@ describe("assembleSearchResults", () => {
     const facilityCandidates = Array.from({ length: 25 }, (_, i) => makeFacilityRow({ id: `os-${i}`, distance_meters: i }));
     const { client } = makeMockOccupancyStatsClient([]);
 
-    const { facilityResults } = await assembleSearchResults(client, {
+    const { facilityResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
       blockfaceCandidates: [],
       facilityCandidates,
       isoDay: 1,
@@ -319,7 +352,7 @@ describe("assembleSearchResults", () => {
     const blockfaceCandidates = Array.from({ length: 25 }, (_, i) => makeBlockfaceRow({ id: `bf-${i}` }));
     const facilityCandidates = Array.from({ length: 25 }, (_, i) => makeFacilityRow({ id: `os-${i}`, distance_meters: i }));
 
-    const { blockfaceResults, facilityResults } = await assembleSearchResults(client, {
+    const { blockfaceResults, facilityResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
       blockfaceCandidates,
       facilityCandidates,
       isoDay: 1,
@@ -338,7 +371,7 @@ describe("assembleSearchResults", () => {
     const facilityCandidates = Array.from({ length: 25 }, (_, i) => makeFacilityRow({ id: `os-${i}`, distance_meters: i }));
     const { client } = makeMockOccupancyStatsClient([]);
 
-    const { facilityResults } = await assembleSearchResults(client, {
+    const { facilityResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
       blockfaceCandidates: [],
       facilityCandidates,
       isoDay: 1,
@@ -355,7 +388,7 @@ describe("assembleSearchResults", () => {
     const { client } = makeMockOccupancyStatsClient(stats);
     const blockfaceCandidates = Array.from({ length: 10 }, (_, i) => makeBlockfaceRow({ id: `bf-${i}` }));
 
-    const { blockfaceResults } = await assembleSearchResults(client, {
+    const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
       blockfaceCandidates,
       facilityCandidates: [],
       isoDay: 1,
@@ -371,7 +404,7 @@ describe("assembleSearchResults", () => {
     const facilityCandidates = Array.from({ length: 10 }, (_, i) => makeFacilityRow({ id: `os-${i}`, distance_meters: i }));
     const { client } = makeMockOccupancyStatsClient([]);
 
-    const { facilityResults } = await assembleSearchResults(client, {
+    const { facilityResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
       blockfaceCandidates: [],
       facilityCandidates,
       isoDay: 1,
@@ -387,7 +420,7 @@ describe("assembleSearchResults", () => {
     const { client } = makeMockOccupancyStatsClient([]);
 
     await expect(
-      assembleSearchResults(client, {
+      assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
         blockfaceCandidates: [makeBlockfaceRow({ id: "bf-1" })],
         facilityCandidates: [],
         isoDay: 1,
@@ -402,7 +435,7 @@ describe("assembleSearchResults", () => {
     const { client } = makeMockOccupancyStatsClient([]);
 
     await expect(
-      assembleSearchResults(client, {
+      assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
         blockfaceCandidates: [],
         facilityCandidates: [makeFacilityRow({ id: "os-1" })],
         isoDay: 1,
@@ -423,7 +456,7 @@ describe("assembleSearchResults", () => {
       side_of_street: "N",
     });
 
-    const { blockfaceResults } = await assembleSearchResults(client, {
+    const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
       blockfaceCandidates: [blockface],
       facilityCandidates: [],
       isoDay: 1,
@@ -449,7 +482,7 @@ describe("assembleSearchResults", () => {
     const { client } = makeMockOccupancyStatsClient([]);
     const facility = makeFacilityRow({ id: "os-1", name: "DIAMOND PARKING WX04" });
 
-    const { facilityResults } = await assembleSearchResults(client, {
+    const { facilityResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
       blockfaceCandidates: [],
       facilityCandidates: [facility],
       isoDay: 1,
@@ -508,7 +541,7 @@ describe("assembleSearchResults", () => {
     it("computes occupancyPercent as meanOccupancy formatted as a percentage, independent of confidence", async () => {
       const { client } = makeMockOccupancyStatsClient([{ blockface_id: "bf-1", ...OCCUPANCY_AT_25 }]);
 
-      const { blockfaceResults } = await assembleSearchResults(client, {
+      const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
         blockfaceCandidates: [makeBlockfaceRow({ id: "bf-1" })],
         facilityCandidates: [],
         isoDay: 1,
@@ -530,7 +563,7 @@ describe("assembleSearchResults", () => {
       // this would wrongly come back green. It must be red.
       const { client } = makeMockOccupancyStatsClient([{ blockface_id: "bf-1", ...OCCUPANCY_HIGH }]);
 
-      const { blockfaceResults } = await assembleSearchResults(client, {
+      const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
         blockfaceCandidates: [makeBlockfaceRow({ id: "bf-1" })],
         facilityCandidates: [],
         isoDay: 1,
@@ -553,7 +586,7 @@ describe("assembleSearchResults", () => {
         { blockface_id: "bf-red", ...OCCUPANCY_HIGH },
       ]);
 
-      const { blockfaceResults } = await assembleSearchResults(client, {
+      const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
         blockfaceCandidates: [
           makeBlockfaceRow({ id: "bf-green" }),
           makeBlockfaceRow({ id: "bf-yellow" }),
@@ -586,7 +619,7 @@ describe("assembleSearchResults", () => {
       // both directions, not just that occupancy ignores confidence.
       const { client } = makeMockOccupancyStatsClient([{ blockface_id: "bf-1", ...GREEN_STATS, mean_occupancy: 0.9 }]);
 
-      const { blockfaceResults } = await assembleSearchResults(client, {
+      const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: client, areaCorrectionsClient: NO_CORRECTIONS_CLIENT }, {
         blockfaceCandidates: [makeBlockfaceRow({ id: "bf-1" })],
         facilityCandidates: [],
         isoDay: 1,
@@ -598,6 +631,170 @@ describe("assembleSearchResults", () => {
       expect(result.confidence.color).toBe("green");
       expect(result.confidence.percentage).toBe(100);
       expect(result.occupancyColor).toBe("red");
+    });
+  });
+
+  describe("area correction wiring (area_occupancy_corrections)", () => {
+    it("applies a real, matching area/subarea+band calibration to occupancyPercent/occupancyColor", async () => {
+      const { client: statsClient } = makeMockOccupancyStatsClient([{ blockface_id: "bf-1", ...GREEN_STATS, mean_occupancy: 0.48 }]);
+      const { client: correctionsClient } = makeMockAreaCorrectionsClient([
+        { paidparkingarea: "Ballard", paidparkingsubarea: "Core", predicted_band_low: 25, predicted_band_high: 50, corrected_pct: 61.6, sample_count: 413 },
+      ]);
+      const blockface = makeBlockfaceRow({ id: "bf-1", paidparkingarea: "Ballard", paidparkingsubarea: "Core" });
+
+      const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: statsClient, areaCorrectionsClient: correctionsClient }, {
+        blockfaceCandidates: [blockface],
+        facilityCandidates: [],
+        isoDay: 2,
+        hour: 14,
+        daysInFuture: 0,
+      });
+      const [result] = blockfaceResults as [BlockfaceHasDataResult];
+
+      expect(result.occupancyPercent).toBe(61.6);
+      expect(result.occupancyColor).toBe("orange"); // 61.6% -> orange band (50-75)
+    });
+
+    it("leaves confidence.meanOccupancy RAW even when occupancyPercent is corrected -- they must never both carry the correction", async () => {
+      const { client: statsClient } = makeMockOccupancyStatsClient([{ blockface_id: "bf-1", ...GREEN_STATS, mean_occupancy: 0.48 }]);
+      const { client: correctionsClient } = makeMockAreaCorrectionsClient([
+        { paidparkingarea: "Ballard", paidparkingsubarea: "Core", predicted_band_low: 25, predicted_band_high: 50, corrected_pct: 61.6, sample_count: 413 },
+      ]);
+      const blockface = makeBlockfaceRow({ id: "bf-1", paidparkingarea: "Ballard", paidparkingsubarea: "Core" });
+
+      const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: statsClient, areaCorrectionsClient: correctionsClient }, {
+        blockfaceCandidates: [blockface],
+        facilityCandidates: [],
+        isoDay: 2,
+        hour: 14,
+        daysInFuture: 0,
+      });
+      const [result] = blockfaceResults as [BlockfaceHasDataResult];
+
+      expect(result.confidence.meanOccupancy).toBe(0.48);
+      expect(result.occupancyPercent).toBe(61.6);
+    });
+
+    it("does NOT apply a Core calibration to a real Edge blockface in the same area -- subarea must match exactly", async () => {
+      const { client: statsClient } = makeMockOccupancyStatsClient([{ blockface_id: "bf-edge", ...GREEN_STATS, mean_occupancy: 0.48 }]);
+      const { client: correctionsClient } = makeMockAreaCorrectionsClient([
+        { paidparkingarea: "Ballard", paidparkingsubarea: "Core", predicted_band_low: 25, predicted_band_high: 50, corrected_pct: 61.6, sample_count: 413 },
+      ]);
+      const blockface = makeBlockfaceRow({ id: "bf-edge", paidparkingarea: "Ballard", paidparkingsubarea: "Edge" });
+
+      const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: statsClient, areaCorrectionsClient: correctionsClient }, {
+        blockfaceCandidates: [blockface],
+        facilityCandidates: [],
+        isoDay: 2,
+        hour: 14,
+        daysInFuture: 0,
+      });
+      const [result] = blockfaceResults as [BlockfaceHasDataResult];
+
+      expect(result.occupancyPercent).toBe(48);
+    });
+
+    it("does NOT apply a Ballard/Core calibration to a blockface in an entirely different area", async () => {
+      const { client: statsClient } = makeMockOccupancyStatsClient([{ blockface_id: "bf-other", ...GREEN_STATS, mean_occupancy: 0.48 }]);
+      const { client: correctionsClient } = makeMockAreaCorrectionsClient([
+        { paidparkingarea: "Ballard", paidparkingsubarea: "Core", predicted_band_low: 25, predicted_band_high: 50, corrected_pct: 61.6, sample_count: 413 },
+      ]);
+      const blockface = makeBlockfaceRow({ id: "bf-other", paidparkingarea: "Belltown", paidparkingsubarea: "North" });
+
+      const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: statsClient, areaCorrectionsClient: correctionsClient }, {
+        blockfaceCandidates: [blockface],
+        facilityCandidates: [],
+        isoDay: 2,
+        hour: 14,
+        daysInFuture: 0,
+      });
+      const [result] = blockfaceResults as [BlockfaceHasDataResult];
+
+      expect(result.occupancyPercent).toBe(48);
+    });
+
+    it("does NOT apply any correction to a blockface with no paidparkingarea at all (the overwhelming majority of the city)", async () => {
+      const { client: statsClient } = makeMockOccupancyStatsClient([{ blockface_id: "bf-unareaed", ...GREEN_STATS, mean_occupancy: 0.48 }]);
+      const { client: correctionsClient } = makeMockAreaCorrectionsClient([
+        { paidparkingarea: "Ballard", paidparkingsubarea: "Core", predicted_band_low: 25, predicted_band_high: 50, corrected_pct: 61.6, sample_count: 413 },
+      ]);
+      const blockface = makeBlockfaceRow({ id: "bf-unareaed", paidparkingarea: null, paidparkingsubarea: null });
+
+      const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: statsClient, areaCorrectionsClient: correctionsClient }, {
+        blockfaceCandidates: [blockface],
+        facilityCandidates: [],
+        isoDay: 2,
+        hour: 14,
+        daysInFuture: 0,
+      });
+      const [result] = blockfaceResults as [BlockfaceHasDataResult];
+
+      expect(result.occupancyPercent).toBe(48);
+    });
+
+    it("multiple distinct real candidates in the same request each get correctly, independently matched -- no cross-contamination between them", async () => {
+      const { client: statsClient } = makeMockOccupancyStatsClient([
+        { blockface_id: "bf-core", ...GREEN_STATS, mean_occupancy: 0.48 },
+        { blockface_id: "bf-edge", ...GREEN_STATS, mean_occupancy: 0.48 },
+        { blockface_id: "bf-none", ...GREEN_STATS, mean_occupancy: 0.48 },
+      ]);
+      const { client: correctionsClient } = makeMockAreaCorrectionsClient([
+        { paidparkingarea: "Ballard", paidparkingsubarea: "Core", predicted_band_low: 25, predicted_band_high: 50, corrected_pct: 61.6, sample_count: 413 },
+      ]);
+
+      const { blockfaceResults } = await assembleSearchResults({ occupancyStatsClient: statsClient, areaCorrectionsClient: correctionsClient }, {
+        blockfaceCandidates: [
+          makeBlockfaceRow({ id: "bf-core", paidparkingarea: "Ballard", paidparkingsubarea: "Core" }),
+          makeBlockfaceRow({ id: "bf-edge", paidparkingarea: "Ballard", paidparkingsubarea: "Edge" }),
+          makeBlockfaceRow({ id: "bf-none", paidparkingarea: null, paidparkingsubarea: null }),
+        ],
+        facilityCandidates: [],
+        isoDay: 2,
+        hour: 14,
+        daysInFuture: 0,
+        blockfaceLimit: "all",
+      });
+      const byId = new Map((blockfaceResults as BlockfaceHasDataResult[]).map((r) => [r.id, r]));
+
+      expect(byId.get("bf-core")?.occupancyPercent).toBe(61.6);
+      expect(byId.get("bf-edge")?.occupancyPercent).toBe(48);
+      expect(byId.get("bf-none")?.occupancyPercent).toBe(48);
+    });
+
+    it("reads area_occupancy_corrections exactly once per request, via a single unfiltered select -- not once per candidate", async () => {
+      const { client: statsClient } = makeMockOccupancyStatsClient([]);
+      const { client: correctionsClient, fromCalls } = makeMockAreaCorrectionsClient([]);
+
+      await assembleSearchResults({ occupancyStatsClient: statsClient, areaCorrectionsClient: correctionsClient }, {
+        blockfaceCandidates: [makeBlockfaceRow({ id: "bf-1" }), makeBlockfaceRow({ id: "bf-2" }), makeBlockfaceRow({ id: "bf-3" })],
+        facilityCandidates: [],
+        isoDay: 2,
+        hour: 14,
+        daysInFuture: 0,
+      });
+
+      expect(fromCalls).toEqual(["area_occupancy_corrections"]);
+    });
+
+    it("propagates a real area_occupancy_corrections read failure as a thrown error, the same as an occupancy_stats failure would", async () => {
+      const { client: statsClient } = makeMockOccupancyStatsClient([]);
+      const correctionsClient = {
+        from: () => ({
+          select: () => ({
+            then: (onFulfilled?: (v: unknown) => unknown) => Promise.resolve({ data: null, error: { message: "connection reset" } }).then(onFulfilled),
+          }),
+        }),
+      } as unknown as AreaCorrectionsSupabaseClient;
+
+      await expect(
+        assembleSearchResults({ occupancyStatsClient: statsClient, areaCorrectionsClient: correctionsClient }, {
+          blockfaceCandidates: [makeBlockfaceRow({ id: "bf-1" })],
+          facilityCandidates: [],
+          isoDay: 2,
+          hour: 14,
+          daysInFuture: 0,
+        }),
+      ).rejects.toThrow(/connection reset/);
     });
   });
 });

@@ -16,12 +16,22 @@
 // null means it was never confirmed against a specific area and should be
 // excluded from any area-specific validation slice (it can still count
 // toward a citywide, uncorrected-vs-uncorrected sanity check).
-
+//
+// paidParkingSubarea is likewise a real, DB-confirmed value, not a guess:
+// each point's (sourceElementKey, sideOfStreet) was looked up directly
+// against the live blockfaces table's own paidparkingsubarea column
+// (populated by syncBlockfaceParkingAreas.ts from the same authoritative
+// Blockface FeatureServer paidParkingArea itself came from) on 2026-09-23,
+// the same way paidparkingsubarea is sourced for every other blockface in
+// this project -- not inferred from the point's name or area. null means
+// that blockface genuinely has no subarea division in the source data
+// (not that it was never checked).
 export interface FieldTestPoint {
   name: string;
   sourceElementKey: number;
   sideOfStreet: string;
   paidParkingArea: string | null;
+  paidParkingSubarea: string | null;
   realOccupiedCount: number;
   realTotalSpaces: number;
   appPredictedPct: number;
@@ -29,40 +39,40 @@ export interface FieldTestPoint {
 
 export const FIELD_TEST_POINTS: readonly FieldTestPoint[] = [
   // Destination 1 -- Imperial Kitchen and Bar, Belltown
-  { name: "1st Ave (Battery-Wall)", sourceElementKey: 1026, sideOfStreet: "NE", paidParkingArea: "Belltown", realOccupiedCount: 9, realTotalSpaces: 18, appPredictedPct: 40 },
-  { name: "1st Ave (Wall-Vine)", sourceElementKey: 24045, sideOfStreet: "SW", paidParkingArea: "Belltown", realOccupiedCount: 3, realTotalSpaces: 9, appPredictedPct: 25 },
-  { name: "Wall St (1st-Western)", sourceElementKey: 58681, sideOfStreet: "NW", paidParkingArea: "Belltown", realOccupiedCount: 10, realTotalSpaces: 15, appPredictedPct: 43 },
-  { name: "Wall St (2nd-3rd)", sourceElementKey: 58685, sideOfStreet: "NW", paidParkingArea: "Belltown", realOccupiedCount: 6, realTotalSpaces: 12, appPredictedPct: 28 },
-  { name: "2nd Ave (Vine-Cedar)", sourceElementKey: 25717, sideOfStreet: "SW", paidParkingArea: "Belltown", realOccupiedCount: 7, realTotalSpaces: 10, appPredictedPct: 28 },
-  { name: "Vine St (2nd-3rd)", sourceElementKey: 58621, sideOfStreet: "NW", paidParkingArea: "Belltown", realOccupiedCount: 1, realTotalSpaces: 7, appPredictedPct: 26 },
-  { name: "Battery St (2nd-3rd)", sourceElementKey: 76986, sideOfStreet: "SE", paidParkingArea: "Belltown", realOccupiedCount: 13, realTotalSpaces: 16, appPredictedPct: 43 },
-  { name: "Bell St (1st-2nd)", sourceElementKey: 32022, sideOfStreet: "SE", paidParkingArea: "Belltown", realOccupiedCount: 3, realTotalSpaces: 5, appPredictedPct: 10 },
-  { name: "1st Ave (Bell-Blanchard)", sourceElementKey: 24037, sideOfStreet: "SW", paidParkingArea: "Belltown", realOccupiedCount: 17, realTotalSpaces: 25, appPredictedPct: 30 },
+  { name: "1st Ave (Battery-Wall)", sourceElementKey: 1026, sideOfStreet: "NE", paidParkingArea: "Belltown", paidParkingSubarea: "North", realOccupiedCount: 9, realTotalSpaces: 18, appPredictedPct: 40 },
+  { name: "1st Ave (Wall-Vine)", sourceElementKey: 24045, sideOfStreet: "SW", paidParkingArea: "Belltown", paidParkingSubarea: "North", realOccupiedCount: 3, realTotalSpaces: 9, appPredictedPct: 25 },
+  { name: "Wall St (1st-Western)", sourceElementKey: 58681, sideOfStreet: "NW", paidParkingArea: "Belltown", paidParkingSubarea: "North", realOccupiedCount: 10, realTotalSpaces: 15, appPredictedPct: 43 },
+  { name: "Wall St (2nd-3rd)", sourceElementKey: 58685, sideOfStreet: "NW", paidParkingArea: "Belltown", paidParkingSubarea: "North", realOccupiedCount: 6, realTotalSpaces: 12, appPredictedPct: 28 },
+  { name: "2nd Ave (Vine-Cedar)", sourceElementKey: 25717, sideOfStreet: "SW", paidParkingArea: "Belltown", paidParkingSubarea: "North", realOccupiedCount: 7, realTotalSpaces: 10, appPredictedPct: 28 },
+  { name: "Vine St (2nd-3rd)", sourceElementKey: 58621, sideOfStreet: "NW", paidParkingArea: "Belltown", paidParkingSubarea: "North", realOccupiedCount: 1, realTotalSpaces: 7, appPredictedPct: 26 },
+  { name: "Battery St (2nd-3rd)", sourceElementKey: 76986, sideOfStreet: "SE", paidParkingArea: "Belltown", paidParkingSubarea: "North", realOccupiedCount: 13, realTotalSpaces: 16, appPredictedPct: 43 },
+  { name: "Bell St (1st-2nd)", sourceElementKey: 32022, sideOfStreet: "SE", paidParkingArea: "Belltown", paidParkingSubarea: "South", realOccupiedCount: 3, realTotalSpaces: 5, appPredictedPct: 10 },
+  { name: "1st Ave (Bell-Blanchard)", sourceElementKey: 24037, sideOfStreet: "SW", paidParkingArea: "Belltown", paidParkingSubarea: "South", realOccupiedCount: 17, realTotalSpaces: 25, appPredictedPct: 30 },
 
   // Destination 2 -- Sizzle n Crunch, South Lake Union
-  { name: "9th Ave N (Republican-Mercer)", sourceElementKey: 53810, sideOfStreet: "E", paidParkingArea: "South Lake Union", realOccupiedCount: 1, realTotalSpaces: 3, appPredictedPct: 23 },
-  { name: "9th Ave N (Republican-Harrison)", sourceElementKey: 76434, sideOfStreet: "E", paidParkingArea: "South Lake Union", realOccupiedCount: 9, realTotalSpaces: 10, appPredictedPct: 16 },
-  { name: "8th Ave N (Republican-Harrison)", sourceElementKey: 76202, sideOfStreet: "E", paidParkingArea: "South Lake Union", realOccupiedCount: 13, realTotalSpaces: 17, appPredictedPct: 19 },
-  { name: "Republican St (8th-Dexter)", sourceElementKey: 12538, sideOfStreet: "S", paidParkingArea: "South Lake Union", realOccupiedCount: 8, realTotalSpaces: 12, appPredictedPct: 23 },
-  { name: "Republican St (8th-9th)", sourceElementKey: 80545, sideOfStreet: "N", paidParkingArea: "South Lake Union", realOccupiedCount: 2, realTotalSpaces: 6, appPredictedPct: 14 },
-  { name: "Republican St (Westlake-9thAveN)", sourceElementKey: 80550, sideOfStreet: "S", paidParkingArea: "South Lake Union", realOccupiedCount: 3, realTotalSpaces: 3, appPredictedPct: 6 },
-  { name: "Republican St (Westlake-Terry)", sourceElementKey: 12542, sideOfStreet: "S", paidParkingArea: "South Lake Union", realOccupiedCount: 10, realTotalSpaces: 16, appPredictedPct: 25 },
-  { name: "Republican St (Terry-Boren)", sourceElementKey: 35198, sideOfStreet: "S", paidParkingArea: "South Lake Union", realOccupiedCount: 8, realTotalSpaces: 11, appPredictedPct: 16 },
-  { name: "Mercer St (Terry-Westlake)", sourceElementKey: 11778, sideOfStreet: "S", paidParkingArea: "South Lake Union", realOccupiedCount: 2, realTotalSpaces: 13, appPredictedPct: 19 },
-  { name: "Mercer St (Westlake-9th)", sourceElementKey: 79778, sideOfStreet: "S", paidParkingArea: "South Lake Union", realOccupiedCount: 3, realTotalSpaces: 4, appPredictedPct: 21 },
-  { name: "Mercer St (8th-9th)", sourceElementKey: 34386, sideOfStreet: "S", paidParkingArea: "South Lake Union", realOccupiedCount: 5, realTotalSpaces: 11, appPredictedPct: 21 },
+  { name: "9th Ave N (Republican-Mercer)", sourceElementKey: 53810, sideOfStreet: "E", paidParkingArea: "South Lake Union", paidParkingSubarea: "South", realOccupiedCount: 1, realTotalSpaces: 3, appPredictedPct: 23 },
+  { name: "9th Ave N (Republican-Harrison)", sourceElementKey: 76434, sideOfStreet: "E", paidParkingArea: "South Lake Union", paidParkingSubarea: "South", realOccupiedCount: 9, realTotalSpaces: 10, appPredictedPct: 16 },
+  { name: "8th Ave N (Republican-Harrison)", sourceElementKey: 76202, sideOfStreet: "E", paidParkingArea: "South Lake Union", paidParkingSubarea: "South", realOccupiedCount: 13, realTotalSpaces: 17, appPredictedPct: 19 },
+  { name: "Republican St (8th-Dexter)", sourceElementKey: 12538, sideOfStreet: "S", paidParkingArea: "South Lake Union", paidParkingSubarea: "South", realOccupiedCount: 8, realTotalSpaces: 12, appPredictedPct: 23 },
+  { name: "Republican St (8th-9th)", sourceElementKey: 80545, sideOfStreet: "N", paidParkingArea: "South Lake Union", paidParkingSubarea: "South", realOccupiedCount: 2, realTotalSpaces: 6, appPredictedPct: 14 },
+  { name: "Republican St (Westlake-9thAveN)", sourceElementKey: 80550, sideOfStreet: "S", paidParkingArea: "South Lake Union", paidParkingSubarea: "South", realOccupiedCount: 3, realTotalSpaces: 3, appPredictedPct: 6 },
+  { name: "Republican St (Westlake-Terry)", sourceElementKey: 12542, sideOfStreet: "S", paidParkingArea: "South Lake Union", paidParkingSubarea: "South", realOccupiedCount: 10, realTotalSpaces: 16, appPredictedPct: 25 },
+  { name: "Republican St (Terry-Boren)", sourceElementKey: 35198, sideOfStreet: "S", paidParkingArea: "South Lake Union", paidParkingSubarea: "South", realOccupiedCount: 8, realTotalSpaces: 11, appPredictedPct: 16 },
+  { name: "Mercer St (Terry-Westlake)", sourceElementKey: 11778, sideOfStreet: "S", paidParkingArea: "South Lake Union", paidParkingSubarea: "South", realOccupiedCount: 2, realTotalSpaces: 13, appPredictedPct: 19 },
+  { name: "Mercer St (Westlake-9th)", sourceElementKey: 79778, sideOfStreet: "S", paidParkingArea: "South Lake Union", paidParkingSubarea: "South", realOccupiedCount: 3, realTotalSpaces: 4, appPredictedPct: 21 },
+  { name: "Mercer St (8th-9th)", sourceElementKey: 34386, sideOfStreet: "S", paidParkingArea: "South Lake Union", paidParkingSubarea: "South", realOccupiedCount: 5, realTotalSpaces: 11, appPredictedPct: 21 },
 
   // Ballard batch
-  { name: "Ballard Ave (20th-Vernon, Sabine side)", sourceElementKey: 76961, sideOfStreet: "SW", paidParkingArea: "Ballard", realOccupiedCount: 6, realTotalSpaces: 7, appPredictedPct: 58 },
-  { name: "NW Vernon Place (Ballard-Shilshole)", sourceElementKey: 87285, sideOfStreet: "NW", paidParkingArea: "Ballard", realOccupiedCount: 11, realTotalSpaces: 13, appPredictedPct: 77 },
-  { name: "22nd Ave (Shilshole-Ballard Ave)", sourceElementKey: 3338, sideOfStreet: "E", paidParkingArea: "Ballard", realOccupiedCount: 12, realTotalSpaces: 16, appPredictedPct: 58 },
-  { name: "Ballard Ave (22nd-NW Market)", sourceElementKey: 31854, sideOfStreet: "NE", paidParkingArea: "Ballard", realOccupiedCount: 25, realTotalSpaces: 38, appPredictedPct: 38 },
-  { name: "20th Ave NW (Market-Russell)", sourceElementKey: 48213, sideOfStreet: "W", paidParkingArea: "Ballard", realOccupiedCount: 6, realTotalSpaces: 12, appPredictedPct: 45 },
-  { name: "Russell Ave NW (20th-Market)", sourceElementKey: 80657, sideOfStreet: "SW", paidParkingArea: "Ballard", realOccupiedCount: 14, realTotalSpaces: 25, appPredictedPct: 58 },
-  { name: "Leary Ave NW (Market-20th)", sourceElementKey: 56653, sideOfStreet: "SW", paidParkingArea: "Ballard", realOccupiedCount: 22, realTotalSpaces: 26, appPredictedPct: 40 },
-  { name: "22nd Ave (Market-Ballard Ave)", sourceElementKey: 48449, sideOfStreet: "W", paidParkingArea: "Ballard", realOccupiedCount: 13, realTotalSpaces: 18, appPredictedPct: 70 },
-  { name: "Ballard Ave (22nd-Vernon Place)", sourceElementKey: 31850, sideOfStreet: "NE", paidParkingArea: "Ballard", realOccupiedCount: 23, realTotalSpaces: 24, appPredictedPct: 72 },
-  { name: "NW Vernon Place (Ballard-Leary)", sourceElementKey: 87282, sideOfStreet: "SE", paidParkingArea: "Ballard", realOccupiedCount: 11, realTotalSpaces: 12, appPredictedPct: 82 },
+  { name: "Ballard Ave (20th-Vernon, Sabine side)", sourceElementKey: 76961, sideOfStreet: "SW", paidParkingArea: "Ballard", paidParkingSubarea: "Core", realOccupiedCount: 6, realTotalSpaces: 7, appPredictedPct: 58 },
+  { name: "NW Vernon Place (Ballard-Shilshole)", sourceElementKey: 87285, sideOfStreet: "NW", paidParkingArea: "Ballard", paidParkingSubarea: "Edge", realOccupiedCount: 11, realTotalSpaces: 13, appPredictedPct: 77 },
+  { name: "22nd Ave (Shilshole-Ballard Ave)", sourceElementKey: 3338, sideOfStreet: "E", paidParkingArea: "Ballard", paidParkingSubarea: "Edge", realOccupiedCount: 12, realTotalSpaces: 16, appPredictedPct: 58 },
+  { name: "Ballard Ave (22nd-NW Market)", sourceElementKey: 31854, sideOfStreet: "NE", paidParkingArea: "Ballard", paidParkingSubarea: "Core", realOccupiedCount: 25, realTotalSpaces: 38, appPredictedPct: 38 },
+  { name: "20th Ave NW (Market-Russell)", sourceElementKey: 48213, sideOfStreet: "W", paidParkingArea: "Ballard", paidParkingSubarea: "Edge", realOccupiedCount: 6, realTotalSpaces: 12, appPredictedPct: 45 },
+  { name: "Russell Ave NW (20th-Market)", sourceElementKey: 80657, sideOfStreet: "SW", paidParkingArea: "Ballard", paidParkingSubarea: "Edge", realOccupiedCount: 14, realTotalSpaces: 25, appPredictedPct: 58 },
+  { name: "Leary Ave NW (Market-20th)", sourceElementKey: 56653, sideOfStreet: "SW", paidParkingArea: "Ballard", paidParkingSubarea: "Core", realOccupiedCount: 22, realTotalSpaces: 26, appPredictedPct: 40 },
+  { name: "22nd Ave (Market-Ballard Ave)", sourceElementKey: 48449, sideOfStreet: "W", paidParkingArea: "Ballard", paidParkingSubarea: "Core", realOccupiedCount: 13, realTotalSpaces: 18, appPredictedPct: 70 },
+  { name: "Ballard Ave (22nd-Vernon Place)", sourceElementKey: 31850, sideOfStreet: "NE", paidParkingArea: "Ballard", paidParkingSubarea: "Core", realOccupiedCount: 23, realTotalSpaces: 24, appPredictedPct: 72 },
+  { name: "NW Vernon Place (Ballard-Leary)", sourceElementKey: 87282, sideOfStreet: "SE", paidParkingArea: "Ballard", paidParkingSubarea: "Edge", realOccupiedCount: 11, realTotalSpaces: 12, appPredictedPct: 82 },
 
   // Pike Place batch -- only PP3 has a real fraction and a confirmed
   // blockface match (PP1/PP2 were given with no cross streets and were
@@ -71,7 +81,7 @@ export const FIELD_TEST_POINTS: readonly FieldTestPoint[] = [
   // without checking directly -- corrected after syncBlockfaceParkingAreas.ts's
   // real sync run showed this blockface's actual PAIDAREA is "Belltown"
   // (subarea "South"), live-verified against the database directly.
-  { name: "1st Ave (Lenora-Blanchard)", sourceElementKey: 1022, sideOfStreet: "NE", paidParkingArea: "Belltown", realOccupiedCount: 100, realTotalSpaces: 100, appPredictedPct: 43 },
+  { name: "1st Ave (Lenora-Blanchard)", sourceElementKey: 1022, sideOfStreet: "NE", paidParkingArea: "Belltown", paidParkingSubarea: "South", realOccupiedCount: 100, realTotalSpaces: 100, appPredictedPct: 43 },
 ] as const;
 
 // Real, independently-reconstructed transaction-coverage results from

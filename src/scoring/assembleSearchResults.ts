@@ -1,5 +1,7 @@
 import type { SupabaseQueryResult } from "../importers/upsertBlockface.ts";
 import { calculateConfidenceScore } from "./confidenceScore.ts";
+import { applyAreaCorrection } from "./areaCorrectionCalibration.ts";
+import type { AreaCalibration, CalibrationBand } from "./areaCorrectionCalibration.ts";
 
 // --- Raw RPC row shapes --------------------------------------------------
 //
@@ -26,6 +28,11 @@ export interface NearbyBlockfaceRow {
   rate_tiers: BlockfaceRateTier[];
   location_geojson: GeoJsonGeometry;
   distance_meters: number;
+  // Added by migrations/026 -- null for the vast majority of blockfaces
+  // (most of the city has no SDOT-designated paid-parking area at all).
+  // Feeds applyAreaCorrection below; otherwise unused.
+  paidparkingarea: string | null;
+  paidparkingsubarea: string | null;
 }
 
 export interface BlockfaceRateTier {
@@ -115,6 +122,64 @@ async function fetchOccupancyStatsForCandidates(
   return map;
 }
 
+// --- area_occupancy_corrections client shape -----------------------------
+//
+// Deliberately no .eq()/.in() -- unlike occupancy_stats (keyed per
+// candidate blockface), this table is read in full on every request: it's
+// small (a handful of rows per staged area/subarea, not one row per
+// blockface) and every band across every calibrated area/subarea is
+// needed up front, since which specific band applies depends on each
+// candidate's own raw predicted percentage.
+
+interface AreaCorrectionRow {
+  paidparkingarea: string;
+  paidparkingsubarea: string | null;
+  predicted_band_low: number;
+  predicted_band_high: number;
+  corrected_pct: number;
+  sample_count: number;
+}
+
+export type AreaCorrectionsQueryResult = PromiseLike<SupabaseQueryResult<AreaCorrectionRow[]>>;
+
+export interface AreaCorrectionsSupabaseTableBuilder {
+  select(columns: string): AreaCorrectionsQueryResult;
+}
+
+export interface AreaCorrectionsSupabaseClient {
+  from(table: string): AreaCorrectionsSupabaseTableBuilder;
+}
+
+// Groups the table's per-band rows back into areaCorrectionCalibration.ts's
+// AreaCalibration shape (one entry per real area/subarea, each holding all
+// of its bands) -- the inverse of fit-and-write-area-corrections.ts's own
+// buildRows, which flattened calibrations into these same per-band rows in
+// the first place.
+async function fetchAreaCalibrations(client: AreaCorrectionsSupabaseClient): Promise<AreaCalibration[]> {
+  const { data, error } = await client.from("area_occupancy_corrections").select("paidparkingarea, paidparkingsubarea, predicted_band_low, predicted_band_high, corrected_pct, sample_count");
+  if (error !== null) {
+    throw new Error(`assembleSearchResults: reading area_occupancy_corrections failed: ${error.message}`);
+  }
+
+  const byKey = new Map<string, AreaCalibration>();
+  for (const row of data ?? []) {
+    const key = `${row.paidparkingarea}|${row.paidparkingsubarea ?? ""}`;
+    const band: CalibrationBand = {
+      predictedBandLow: row.predicted_band_low,
+      predictedBandHigh: row.predicted_band_high,
+      correctedPct: row.corrected_pct,
+      sampleCount: row.sample_count,
+    };
+    const existing = byKey.get(key);
+    if (existing !== undefined) {
+      existing.bands.push(band);
+    } else {
+      byKey.set(key, { paidParkingArea: row.paidparkingarea, paidParkingSubarea: row.paidparkingsubarea, bands: [band] });
+    }
+  }
+  return Array.from(byKey.values());
+}
+
 // --- Confidence percentage/color -----------------------------------------
 
 // calculateConfidenceScore already rounds to an integer 0-10, so this
@@ -182,7 +247,14 @@ export interface BlockfaceConfidence {
   score: number; // 0-10, calculateConfidenceScore's own output
   percentage: number; // 0-100
   color: ConfidenceColor;
-  meanOccupancy: number; // 0-1, the raw predicted occupancy ratio
+  // 0-1, the RAW predicted occupancy ratio straight from occupancy_stats --
+  // deliberately NEVER area-corrected, even when occupancyPercent below is.
+  // calculateConfidenceScore's inputs (sample_count/std_dev/daysInFuture)
+  // are about the RAW prediction's own statistical reliability, which the
+  // area correction doesn't change or know about -- correcting this value
+  // too would conflate "how much do we trust the raw historical data" with
+  // "how far off do we independently believe that data runs."
+  meanOccupancy: number;
 }
 
 export interface BlockfaceHasDataResult extends BaseCandidateResult {
@@ -193,8 +265,11 @@ export interface BlockfaceHasDataResult extends BaseCandidateResult {
   // from confidence.percentage/confidence.color, and NOT the same
   // percentage-to-color mapping: occupancyColor is inverted relative to
   // confidence.color (low occupancy is good/green, high is bad/red -- see
-  // calculateOccupancyColor's own comment).
-  occupancyPercent: number; // 0-100, confidence.meanOccupancy formatted as a percentage
+  // calculateOccupancyColor's own comment). This IS the area-corrected
+  // value where a real, fitted area_occupancy_corrections row applies to
+  // this blockface's area/subarea and raw percentage band -- otherwise
+  // identical to the raw prediction (see applyAreaCorrection).
+  occupancyPercent: number; // 0-100
   occupancyColor: ConfidenceColor;
   pricing: BlockfacePricing;
 }
@@ -234,6 +309,7 @@ function buildBlockfaceResult(
   row: NearbyBlockfaceRow,
   statsRow: OccupancyStatsRow | undefined,
   daysInFuture: number,
+  calibrations: readonly AreaCalibration[],
 ): BlockfaceHasDataResult | BlockfaceNoDataResult {
   const base = {
     type: "blockface" as const,
@@ -250,7 +326,11 @@ function buildBlockfaceResult(
 
   const score = calculateConfidenceScore(statsRow.sample_count, statsRow.std_dev, daysInFuture);
   const confidencePercentage = scoreToPercentage(score);
-  const occupancyPercentage = occupancyToPercentage(statsRow.mean_occupancy);
+  const rawOccupancyPercentage = occupancyToPercentage(statsRow.mean_occupancy);
+  // Identity when no calibration matches this blockface's area/subarea (or
+  // no area/subarea at all) -- see applyAreaCorrection's own subarea ->
+  // area -> none fallback hierarchy.
+  const correctedOccupancyPercentage = applyAreaCorrection(rawOccupancyPercentage, calibrations, row.paidparkingarea, row.paidparkingsubarea);
 
   return {
     ...base,
@@ -261,8 +341,8 @@ function buildBlockfaceResult(
       color: percentageToColor(confidencePercentage),
       meanOccupancy: statsRow.mean_occupancy,
     },
-    occupancyPercent: occupancyPercentage,
-    occupancyColor: calculateOccupancyColor(occupancyPercentage),
+    occupancyPercent: correctedOccupancyPercentage,
+    occupancyColor: calculateOccupancyColor(correctedOccupancyPercentage),
   };
 }
 
@@ -377,24 +457,37 @@ export interface AssembledSearchResults {
   facilityResults: OffStreetFacilityResult[];
 }
 
+// Two independent DI clients, not one combined interface (same reasoning
+// as elsewhere in this project -- each declares its own from()/select()
+// shape). Bundled into one object (rather than two positional params)
+// since both are genuinely required on every call, unlike e.g. options'
+// optional fields.
+export interface AssembleSearchResultsClients {
+  occupancyStatsClient: OccupancyStatsSupabaseClient;
+  areaCorrectionsClient: AreaCorrectionsSupabaseClient;
+}
+
 // Turns the raw results of nearby_blockfaces/nearby_off_street_facilities
 // into the Edge Function's final response shape: two independently sorted
 // and independently capped lists, never merged into one. isoDay/hour/
 // daysInFuture are expected to already be validated (they come from
 // resolveRequestTime.ts's output) -- not re-validated here.
 export async function assembleSearchResults(
-  client: OccupancyStatsSupabaseClient,
+  clients: AssembleSearchResultsClients,
   options: AssembleSearchResultsOptions,
 ): Promise<AssembledSearchResults> {
-  const statsByBlockfaceId = await fetchOccupancyStatsForCandidates(
-    client,
-    options.blockfaceCandidates.map((row) => row.id),
-    options.isoDay,
-    options.hour,
-  );
+  const [statsByBlockfaceId, calibrations] = await Promise.all([
+    fetchOccupancyStatsForCandidates(
+      clients.occupancyStatsClient,
+      options.blockfaceCandidates.map((row) => row.id),
+      options.isoDay,
+      options.hour,
+    ),
+    fetchAreaCalibrations(clients.areaCorrectionsClient),
+  ]);
 
   const blockfaceResults = options.blockfaceCandidates.map((row) =>
-    buildBlockfaceResult(row, statsByBlockfaceId.get(row.id), options.daysInFuture),
+    buildBlockfaceResult(row, statsByBlockfaceId.get(row.id), options.daysInFuture, calibrations),
   );
   const facilityResults = options.facilityCandidates.map(buildFacilityResult);
 

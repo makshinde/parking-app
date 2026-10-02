@@ -12,13 +12,37 @@ import type { AreaCalibration, GroupedCalibrationPairs } from "../scoring/areaCo
 // requires the explicit --write flag; the default is a dry run -- per
 // this build's own instructions, the calibration table does not get
 // populated with real, live data without that explicit confirmation.
+//
+// --area/--subarea optionally scope BOTH the dry-run display and the
+// real write down to exactly one fitted calibration (e.g. a single,
+// staged Tier 1 row like Ballard/Core), instead of the full fitted set --
+// for a staged rollout where only some rows have cleared every gate,
+// writing everything would deploy far more than intended. --area alone
+// (no --subarea) means that area's bare, area-level fallback row
+// (paidParkingSubarea IS NULL), matching how null subarea is treated
+// everywhere else in this pipeline.
 
 export interface CliOptions {
   write: boolean;
+  area: string | null;
+  subarea: string | null;
+}
+
+function parseFlag(argv: readonly string[], key: string): string | null {
+  const prefix = `--${key}=`;
+  const match = argv.find((arg) => arg.startsWith(prefix));
+  return match === undefined ? null : match.slice(prefix.length);
 }
 
 export function parseCliOptions(argv: readonly string[]): CliOptions {
-  return { write: argv.includes("--write") };
+  return { write: argv.includes("--write"), area: parseFlag(argv, "area"), subarea: parseFlag(argv, "subarea") };
+}
+
+// Pure so the scoping logic (and the "no --area means everything" default)
+// is directly testable without touching the network or Supabase.
+export function filterCalibrationsForScope(calibrations: readonly AreaCalibration[], area: string | null, subarea: string | null): AreaCalibration[] {
+  if (area === null) return [...calibrations];
+  return calibrations.filter((c) => c.paidParkingArea === area && c.paidParkingSubarea === subarea);
 }
 
 export interface WriteSupabaseQueryResult {
@@ -86,35 +110,52 @@ function getRequiredEnvVar(name: string): string {
 }
 
 export async function main(): Promise<void> {
-  const { write } = parseCliOptions(process.argv.slice(2));
+  const { write, area, subarea } = parseCliOptions(process.argv.slice(2));
 
   const trainPath = path.join(process.cwd(), "calibration-data", "annual-study-train.json");
   const trainGroups = JSON.parse(await readFile(trainPath, "utf-8")) as GroupedCalibrationPairs[];
   console.log(`Loaded ${trainGroups.length} (area, subarea) groups from ${trainPath}.`);
 
-  const calibrations = fitAreaCalibrationsWithFallback(trainGroups);
-  console.log(`\nFit ${calibrations.length} area/subarea calibrations with enough real evidence:\n`);
+  const allCalibrations = fitAreaCalibrationsWithFallback(trainGroups);
+  console.log(`\nFit ${allCalibrations.length} area/subarea calibrations total with enough real evidence.`);
+
+  const calibrations = filterCalibrationsForScope(allCalibrations, area, subarea);
+  if (area !== null) {
+    const label = subarea === null ? area : `${area} / ${subarea}`;
+    if (calibrations.length === 0) {
+      console.log(`\nNo fitted calibration matches the requested scope (${label}) -- nothing to show or write.`);
+      return;
+    }
+    console.log(`Scoped to "${label}" only (--area${subarea === null ? "" : "/--subarea"} passed) -- ${calibrations.length} of ${allCalibrations.length} fitted calibrations match this exact scope:\n`);
+  } else {
+    console.log("No --area given -- this would write the FULL fitted set:\n");
+  }
   for (const calibration of calibrations) {
     console.log(formatCalibration(calibration));
   }
 
-  const skippedGroups = trainGroups.filter(
-    (group) => !calibrations.some((c) => c.paidParkingArea === group.paidParkingArea && c.paidParkingSubarea === group.paidParkingSubarea),
-  );
-  if (skippedGroups.length > 0) {
-    console.log("\nGroups with insufficient evidence (no correction fit, left uncorrected):");
-    for (const group of skippedGroups) {
-      const label = group.paidParkingSubarea === null ? group.paidParkingArea : `${group.paidParkingArea} / ${group.paidParkingSubarea}`;
-      console.log(`  ${label}: ${group.pairs.length} pairs`);
+  // Skipped-evidence reporting is about the fit's overall coverage, not
+  // this run's write scope -- only worth printing on a full, unscoped run,
+  // where it's the whole picture rather than noise next to one requested row.
+  if (area === null) {
+    const skippedGroups = trainGroups.filter(
+      (group) => !allCalibrations.some((c) => c.paidParkingArea === group.paidParkingArea && c.paidParkingSubarea === group.paidParkingSubarea),
+    );
+    if (skippedGroups.length > 0) {
+      console.log("\nGroups with insufficient evidence (no correction fit, left uncorrected):");
+      for (const group of skippedGroups) {
+        const label = group.paidParkingSubarea === null ? group.paidParkingArea : `${group.paidParkingArea} / ${group.paidParkingSubarea}`;
+        console.log(`  ${label}: ${group.pairs.length} pairs`);
+      }
     }
   }
 
   if (!write) {
-    console.log("\nDry run (default) -- nothing written. Pass --write to actually populate area_occupancy_corrections.");
+    console.log(`\nDry run (default) -- nothing written. Pass --write to actually write exactly the ${calibrations.length} row-generating calibration(s) shown above to area_occupancy_corrections.`);
     return;
   }
 
-  console.log("\n--write passed -- writing to area_occupancy_corrections...");
+  console.log(`\n--write passed -- writing exactly the ${calibrations.length} calibration(s) shown above to area_occupancy_corrections...`);
   const supabaseUrl = getRequiredEnvVar("SUPABASE_URL");
   const supabaseServiceRoleKey = getRequiredEnvVar("SUPABASE_SERVICE_ROLE_KEY");
   const supabaseClient = createClient(supabaseUrl, supabaseServiceRoleKey) as unknown as WriteSupabaseClient;

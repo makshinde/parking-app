@@ -167,20 +167,52 @@ function chunk<T>(items: readonly T[], size: number): T[][] {
   return chunks;
 }
 
+// PostgREST silently caps an unpaginated .select() at 1000 rows -- NOT an
+// error, just a truncated `data` array, live-confirmed directly against
+// this project's own blockfaces table (2610 real matching rows, only
+// 1000 returned with no error at all) after that exact silent truncation
+// produced a visibly wrong "1000 blockfaces" count on a real run. Every
+// query in this file that could plausibly exceed 1000 rows -- both the
+// blockfaces read and the occupancy_stats read (a single 200-blockface
+// chunk can easily hold more than 1000 bucket rows, since one blockface
+// alone can have up to 168 -- 24 hours x 7 days) -- must page through
+// with .range() instead of trusting a single call's result to be
+// complete. Modeled on fetchArcGisFeatures.ts's own PAGE_SIZE looping,
+// same reasoning: a partial result here would be silently wrong training
+// data, not a usable best-effort answer.
+const SUPABASE_PAGE_SIZE = 1000;
+
+interface RangeableQueryBuilder<T> {
+  range(from: number, to: number): PromiseLike<{ data: T[] | null; error: { message: string } | null }>;
+}
+
+async function fetchAllRows<T>(queryBuilder: RangeableQueryBuilder<T>, context: string): Promise<T[]> {
+  const allRows: T[] = [];
+  let offset = 0;
+  for (;;) {
+    const { data, error } = await queryBuilder.range(offset, offset + SUPABASE_PAGE_SIZE - 1);
+    if (error !== null) {
+      throw new Error(`fetch-annual-study-calibration-data: ${context} failed at offset ${offset}: ${error.message}`);
+    }
+    const page = data ?? [];
+    allRows.push(...page);
+    if (page.length < SUPABASE_PAGE_SIZE) break;
+    offset += SUPABASE_PAGE_SIZE;
+  }
+  return allRows;
+}
+
 export async function main(): Promise<void> {
   const supabaseUrl = getRequiredEnvVar("SUPABASE_URL");
   const supabaseServiceRoleKey = getRequiredEnvVar("SUPABASE_SERVICE_ROLE_KEY");
   const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
 
   console.log("Reading blockfaces with a real paidparkingarea on record...");
-  const { data: blockfaceRows, error: blockfaceError } = await supabase
-    .from("blockfaces")
-    .select("id, source_element_key, side_of_street, paidparkingarea, paidparkingsubarea")
-    .not("paidparkingarea", "is", null);
-  if (blockfaceError !== null) {
-    throw new Error(`fetch-annual-study-calibration-data: reading blockfaces failed: ${blockfaceError.message}`);
-  }
-  const blockfaces = (blockfaceRows ?? []) as BlockfaceAreaRow[];
+  const blockfaceRows = await fetchAllRows(
+    supabase.from("blockfaces").select("id, source_element_key, side_of_street, paidparkingarea, paidparkingsubarea").not("paidparkingarea", "is", null),
+    "reading blockfaces",
+  );
+  const blockfaces = blockfaceRows as unknown as BlockfaceAreaRow[];
   console.log(`${blockfaces.length} blockfaces carry a paidparkingarea.`);
 
   const blockfacesByKey = new Map(blockfaces.map((b) => [`${b.source_element_key}|${b.side_of_street}`, b]));
@@ -189,14 +221,11 @@ export async function main(): Promise<void> {
   console.log("Reading this project's own current occupancy_stats predictions for those blockfaces...");
   const occupancyStatsByKey = new Map<string, OccupancyStatsBucket>();
   for (const idChunk of chunk(blockfaceIds, 200)) {
-    const { data, error } = await supabase
-      .from("occupancy_stats")
-      .select("blockface_id, day_of_week, hour_of_day, mean_occupancy")
-      .in("blockface_id", idChunk);
-    if (error !== null) {
-      throw new Error(`fetch-annual-study-calibration-data: reading occupancy_stats failed: ${error.message}`);
-    }
-    for (const row of data ?? []) {
+    const rows = await fetchAllRows(
+      supabase.from("occupancy_stats").select("blockface_id, day_of_week, hour_of_day, mean_occupancy").in("blockface_id", idChunk),
+      "reading occupancy_stats",
+    );
+    for (const row of rows) {
       occupancyStatsByKey.set(`${row.blockface_id}|${row.day_of_week}|${row.hour_of_day}`, {
         source_element_key: 0,
         side_of_street: "",

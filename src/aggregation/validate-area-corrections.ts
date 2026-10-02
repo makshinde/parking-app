@@ -3,7 +3,13 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { fitAreaCalibrationsWithFallback } from "../scoring/areaCorrectionCalibration.ts";
 import type { GroupedCalibrationPairs } from "../scoring/areaCorrectionCalibration.ts";
-import { formatAreaCorrectionValidationReport, runAreaCorrectionValidation } from "./backtest-predictions.ts";
+import {
+  formatAreaCorrectionValidationReport,
+  runAreaCorrectionValidation,
+  runGate3PooledAcrossAreas,
+  runGate3TransactionCoverageConfirmation,
+} from "./backtest-predictions.ts";
+import type { GateResult } from "./backtest-predictions.ts";
 
 // Ties fetch-annual-study-calibration-data.ts's real train/held-out data
 // to a real fit (fitAreaCalibrationsWithFallback) and all three gates
@@ -27,6 +33,27 @@ export async function main(): Promise<void> {
 
   const report = runAreaCorrectionValidation(calibrations, holdoutGroups);
   console.log(formatAreaCorrectionValidationReport(report));
+
+  // Additional, EXPLICITLY SEPARATE analysis -- not part of allGatesPassed
+  // above, and not a redefinition of what "passing" gate 3 means. See
+  // runGate3TransactionCoverageConfirmation's own comment for why the
+  // transaction-coverage rebuild is reported alongside the physical-count
+  // gate rather than merged into it, and runGate3PooledAcrossAreas' own
+  // comment for why a pooled result doesn't substitute for the per-area
+  // claim above.
+  console.log("\n\n=== Additional gate-3 analysis (informational only -- NOT part of allGatesPassed) ===\n");
+
+  const formatResult = (g: GateResult): string => `  [${g.passed ? "PASS" : "FAIL"}] ${g.gateName}: ${g.details}`;
+
+  console.log("Transaction-coverage confirmation, per area (does the correction move predictions closer to the independently-reconstructed paid-coverage figure? A genuinely different question from physical-truth accuracy):");
+  for (const g of runGate3TransactionCoverageConfirmation(calibrations)) {
+    console.log(formatResult(g));
+  }
+
+  console.log("\nPooled-across-areas gate 3 (the coarser \"does the correction help overall, across the areas actually tested\" question -- NOT a per-area confidence claim):");
+  const pooled = runGate3PooledAcrossAreas(calibrations);
+  console.log(formatResult(pooled.physicalCount));
+  console.log(formatResult(pooled.transactionCoverage));
 }
 
 const isRunDirectly = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
