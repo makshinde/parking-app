@@ -1,0 +1,35 @@
+# The weekly rolling-window refresh pipeline (src/aggregation/scheduled-rebuild.ts),
+# automating CLAUDE.md's "Rebuild policy" section end to end for the first
+# time. Deliberately workflow_dispatch-ONLY for now -- no `schedule:`
+# trigger yet. Adding that trigger (making this actually run unattended on
+# a timer) is its own separate, explicit step, done only after a manual
+# run here has been reviewed -- see the PR this workflow was introduced in.
+name: Scheduled rolling-window refresh
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    # Needed to post a GitHub Issue on failure (see createGithubIssue /
+    # scheduled-rebuild.ts's reportFailure) using the auto-provided
+    # GITHUB_TOKEN -- no new secret required for this alone.
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+
+      - run: npm install
+
+      - run: npm run scheduled-rebuild
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
