@@ -329,7 +329,12 @@ function buildAccumulatorBucketRow(
 // sits above this whole function (saveArchiveStreamAccumulatorSnapshot), so
 // throwing on the first batch error and letting that wrapper retry the
 // whole (idempotent) upsert is simpler and just as safe.
-async function upsertAccumulatorBuckets(
+// Exported so a standalone, non-checkpoint-coupled caller (e.g. a one-off
+// day-by-day catch-up fold against a staging identity, which doesn't need
+// the resumable :id-cursor machinery the rest of this module exists for)
+// can persist accumulator state directly, without going through
+// saveArchiveStreamAccumulatorSnapshot's checkpoint-cursor bookkeeping.
+export async function upsertAccumulatorBuckets(
   client: ArchiveStreamAccumulatorBucketsSupabaseClient,
   archiveDatasetId: string,
   accumulatorState: AccumulatorSnapshot,
