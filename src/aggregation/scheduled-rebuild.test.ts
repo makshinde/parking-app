@@ -1,6 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { runScheduledRebuild, type ScheduledRebuildClients } from "./scheduled-rebuild.ts";
+import { parseCliOptions, runScheduledRebuild, type ScheduledRebuildClients } from "./scheduled-rebuild.ts";
 import type { SocrataRecord } from "../utils/fetchSocrataRecords.ts";
+
+describe("parseCliOptions", () => {
+  it("defaults to dry-run (allowPromotion: false) with no flags", () => {
+    expect(parseCliOptions([])).toEqual({ allowPromotion: false });
+  });
+
+  it("enables promotion only when --allow-promotion is explicitly passed", () => {
+    expect(parseCliOptions(["--allow-promotion"])).toEqual({ allowPromotion: true });
+  });
+
+  it("ignores unrelated flags", () => {
+    expect(parseCliOptions(["--verbose"])).toEqual({ allowPromotion: false });
+  });
+});
 
 // --- Fixtures ----------------------------------------------------------------
 
@@ -268,12 +282,13 @@ describe("runScheduledRebuild", () => {
     vi.unstubAllGlobals();
   });
 
-  it("the real happy path: streams both sources, passes gap check and integrity check, promotes, reconciles, verifies, and succeeds", async () => {
+  it("the real happy path (--allow-promotion): streams both sources, passes gap check and integrity check, promotes, reconciles, verifies, and succeeds", async () => {
     const { clients, runRows, promoteCalls, occupancyStatsRows } = makeMockClients();
 
-    const result = await runScheduledRebuild(clients, NOW);
+    const result = await runScheduledRebuild(clients, NOW, { allowPromotion: true });
 
     expect(result.outcome).toBe("succeeded");
+    expect(result.dryRun).toBe(false);
     expect(result.promoted).toBe(true);
     expect(promoteCalls).toHaveLength(1);
     expect(promoteCalls[0]?.p_stable_identity).toBe("7c2e-uany");
@@ -340,7 +355,7 @@ describe("runScheduledRebuild", () => {
   it("propagates a real promote RPC failure as a failed run, with promoted still reported false (the rename itself never completed)", async () => {
     const { clients, runRows } = makeMockClients({ promoteRpcError: { message: "deadlock detected" } });
 
-    const result = await runScheduledRebuild(clients, NOW);
+    const result = await runScheduledRebuild(clients, NOW, { allowPromotion: true });
 
     expect(result.outcome).toBe("failed");
     expect(result.promoted).toBe(false);
@@ -419,5 +434,76 @@ describe("runScheduledRebuild", () => {
     expect(result.outcome).toBe("failed");
     expect(result.promoted).toBe(true);
     expect(result.failureReason).toMatch(/stale occupancy_stats row/);
+  });
+
+  describe("the dry-run gate", () => {
+    it("defaults to dry-run when no options are passed at all -- the safe behavior needs no flag", async () => {
+      const { clients, promoteCalls, runRows } = makeMockClients();
+
+      const result = await runScheduledRebuild(clients, NOW);
+
+      expect(result.outcome).toBe("succeeded");
+      expect(result.dryRun).toBe(true);
+      expect(result.promoted).toBe(false);
+      expect(promoteCalls).toHaveLength(0);
+      const finishedRun = runRows().find((r) => r.id === result.runId);
+      expect(finishedRun).toMatchObject({ status: "succeeded", step: "dry_run_complete", dry_run: true });
+    });
+
+    it("stops after every real check passes, never calling promote, when allowPromotion is explicitly false", async () => {
+      const { clients, promoteCalls } = makeMockClients();
+
+      const result = await runScheduledRebuild(clients, NOW, { allowPromotion: false });
+
+      expect(result.dryRun).toBe(true);
+      expect(result.outcome).toBe("succeeded");
+      expect(promoteCalls).toHaveLength(0);
+    });
+
+    it("still fails loudly on a dry run if the gap check itself fails -- a dry run checks for real, it doesn't fake success", async () => {
+      const { clients, promoteCalls, runRows } = makeMockClients({
+        existingRefreshLogRows: [
+          { archive_dataset_id: "rke9-rsvs", checked_at: "2026-08-01T00:00:00Z", earliest_covered: "2026-07-30T00:00:00.000", latest_covered: "2026-08-01T00:00:00.000", row_count: 500, gap_detected: false, gap_detail: null },
+        ],
+      });
+
+      const result = await runScheduledRebuild(clients, NOW);
+
+      expect(result.outcome).toBe("failed");
+      expect(result.dryRun).toBe(true);
+      expect(promoteCalls).toHaveLength(0);
+      const finishedRun = runRows().find((r) => r.id === result.runId);
+      expect(finishedRun).toMatchObject({ status: "failed", step: "gap_check" });
+    });
+
+    it("a resumed run (promotion already happened on an earlier run) is never itself a dry run, even with allowPromotion omitted", async () => {
+      const { clients, promoteCalls, runRows } = makeMockClients({
+        existingRunRows: [
+          {
+            id: "old-run",
+            started_at: "2026-10-01T00:00:00Z",
+            completed_at: "2026-10-01T01:00:00Z",
+            stable_identity: "7c2e-uany",
+            staging_identity: "7c2e-uany-staging-OLD",
+            backup_identity: "7c2e-uany-backup-OLD",
+            step: "verifying",
+            status: "failed",
+            gap_detected: false,
+            failure_reason: "some stale rows found",
+          },
+        ],
+        existingBucketRows: [
+          { archive_dataset_id: "7c2e-uany", blockface_id: "blockface-1", iso_day: 2, hour: 14, count: 100, total_weight: 80, mean: 0.4, sum_squared_diff: 2 },
+        ],
+      });
+
+      const result = await runScheduledRebuild(clients, NOW);
+
+      expect(result.dryRun).toBe(false);
+      expect(result.outcome).toBe("succeeded");
+      expect(promoteCalls).toHaveLength(0);
+      const newRun = runRows().find((r) => r.id === result.runId);
+      expect(newRun).toMatchObject({ dry_run: false });
+    });
   });
 });

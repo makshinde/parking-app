@@ -4,14 +4,36 @@
 # trigger yet. Adding that trigger (making this actually run unattended on
 # a timer) is its own separate, explicit step, done only after a manual
 # run here has been reviewed -- see the PR this workflow was introduced in.
+#
+# Defaults to a DRY RUN (allow_promotion: false): the real pipeline runs
+# all the way through streaming, the gap check, and the integrity check,
+# but stops before ever calling the promote RPC. The live accumulator
+# identity is never touched unless allow_promotion is explicitly set to
+# true for that one run. Once a `schedule:` trigger is eventually added,
+# it must rely on this same default -- never pass allow_promotion itself.
 name: Scheduled rolling-window refresh
 
 on:
   workflow_dispatch:
+    inputs:
+      allow_promotion:
+        description: "Actually promote if every check passes (default: dry run only)"
+        type: boolean
+        default: false
 
 jobs:
   rebuild:
     runs-on: ubuntu-latest
+    # 330 minutes, not GitHub's own 360-minute hard per-job cap: this
+    # pipeline's current design still re-streams the full prior-year
+    # archive every run (a known, separately-tracked inefficiency -- see
+    # the PR this timeout was added in), and CLAUDE.md's own documented
+    # Socrata slowdown (a --max-chunks=50 run taking 45+ minutes against
+    # an ~8-minute expectation, root cause unconfirmed) means a real run's
+    # true duration is genuinely uncertain. A timeout a bit under GitHub's
+    # own limit fails this job with a clear "timed out" message instead of
+    # GitHub silently killing it at 360 with less useful context.
+    timeout-minutes: 330
     # Needed to post a GitHub Issue on failure (see createGithubIssue /
     # scheduled-rebuild.ts's reportFailure) using the auto-provided
     # GITHUB_TOKEN -- no new secret required for this alone.
@@ -26,7 +48,7 @@ jobs:
 
       - run: npm install
 
-      - run: npm run scheduled-rebuild
+      - run: npm run scheduled-rebuild -- ${{ inputs.allow_promotion && '--allow-promotion' || '' }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}

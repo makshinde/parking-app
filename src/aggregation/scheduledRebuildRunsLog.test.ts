@@ -70,12 +70,18 @@ describe("fetchLatestRebuildRun", () => {
 });
 
 describe("startRebuildRun / advanceRebuildRunStep / finishRebuildRun", () => {
-  it("inserts a real, running row at step streaming_archive", async () => {
+  it("inserts a real, running row at step streaming_archive, dry_run false by default", async () => {
     const { client, insertCalls } = makeMockClient([]);
     const id = await startRebuildRun(client, { stableIdentity: "7c2e-uany", stagingIdentity: "7c2e-uany-staging-123", startedAt: new Date("2026-10-08T00:00:00Z") });
 
     expect(id).toBe("new-run-id");
-    expect(insertCalls[0]).toMatchObject({ stable_identity: "7c2e-uany", staging_identity: "7c2e-uany-staging-123", step: "streaming_archive", status: "running" });
+    expect(insertCalls[0]).toMatchObject({ stable_identity: "7c2e-uany", staging_identity: "7c2e-uany-staging-123", step: "streaming_archive", status: "running", dry_run: false });
+  });
+
+  it("records dry_run: true when explicitly requested", async () => {
+    const { client, insertCalls } = makeMockClient([]);
+    await startRebuildRun(client, { stableIdentity: "7c2e-uany", stagingIdentity: "7c2e-uany-staging-123", startedAt: new Date("2026-10-08T00:00:00Z"), dryRun: true });
+    expect(insertCalls[0]).toMatchObject({ dry_run: true });
   });
 
   it("supports starting a resumed run directly at 'reconciling' with its backupIdentity recorded", async () => {
@@ -108,6 +114,12 @@ describe("startRebuildRun / advanceRebuildRunStep / finishRebuildRun", () => {
     expect(updateCalls[0]).toEqual({ values: { status: "succeeded", completed_at: "2026-10-08T02:00:00.000Z", step: "done" }, id: "run-1" });
   });
 
+  it("finishRebuildRun records a dry run's own terminal step when explicitly given", async () => {
+    const { client, updateCalls } = makeMockClient([]);
+    await finishRebuildRun(client, "run-1", { status: "succeeded", step: "dry_run_complete" }, new Date("2026-10-08T02:00:00Z"));
+    expect(updateCalls[0]).toEqual({ values: { status: "succeeded", completed_at: "2026-10-08T02:00:00.000Z", step: "dry_run_complete" }, id: "run-1" });
+  });
+
   it("finishRebuildRun records a real failure reason, without forcing step to done", async () => {
     const { client, updateCalls } = makeMockClient([]);
     await finishRebuildRun(client, "run-1", { status: "failed", failureReason: "gap detected" }, new Date("2026-10-08T02:00:00Z"));
@@ -127,6 +139,7 @@ function run(overrides: Partial<RebuildRun>): RebuildRun {
     status: "succeeded",
     gapDetected: false,
     failureReason: null,
+    dryRun: false,
     ...overrides,
   };
 }

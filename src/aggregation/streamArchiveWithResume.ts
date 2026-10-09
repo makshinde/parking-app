@@ -799,12 +799,26 @@ export async function streamArchiveWithResume(clients: ArchiveStreamClients, opt
   let totalChunksProcessed = 0;
 
   while (true) {
+    // Per-chunk timing, logged unconditionally -- deliberately not gated
+    // behind a verbosity flag. This is the direct, always-on instrument
+    // for the real, documented, still-unexplained Socrata slowdown (see
+    // CLAUDE.md's Known open questions: a --max-chunks=50 run took 45+
+    // minutes against an ~8-minute expectation, root cause unconfirmed).
+    // Separating fetchMs from foldMs tells apart a slow Socrata response
+    // from slow local folding -- the two have very different causes and
+    // fixes, and previous investigation of this slowdown never had this
+    // breakdown available at the time.
+    const fetchStartedAt = Date.now();
     const page = await fetchArchivePage(options.archiveDatasetId, cursorId, chunkSize);
+    const fetchMs = Date.now() - fetchStartedAt;
     if (page.length === 0) {
       break;
     }
 
+    const foldStartedAt = Date.now();
     accumulatorState = await options.onChunk(page);
+    const foldMs = Date.now() - foldStartedAt;
+    console.log(`Chunk ${totalChunksProcessed + 1} timing: fetch=${fetchMs}ms, fold=${foldMs}ms, rows=${page.length}`);
 
     cursorId = getRecordId(page[page.length - 1] as SocrataRecord);
     readingsProcessedCount += page.length;
