@@ -12,7 +12,13 @@ export type RebuildStep =
   | "promoting"
   | "reconciling"
   | "verifying"
-  | "done";
+  | "done"
+  // A dry run's own distinct terminal step (migrations/029) -- stopped on
+  // purpose right after the integrity check, with promotion never
+  // attempted. Deliberately not reused with "done": "done" means a real
+  // promotion genuinely happened, which must never be conflated with a
+  // dry run that only checked.
+  | "dry_run_complete";
 
 export type RebuildStatus = "running" | "succeeded" | "failed";
 
@@ -27,6 +33,7 @@ export interface RebuildRun {
   status: RebuildStatus;
   gapDetected: boolean | null;
   failureReason: string | null;
+  dryRun: boolean;
 }
 
 interface RawRebuildRunRow {
@@ -40,6 +47,7 @@ interface RawRebuildRunRow {
   status: RebuildStatus;
   gap_detected: boolean | null;
   failure_reason: string | null;
+  dry_run: boolean;
 }
 
 function fromRow(row: RawRebuildRunRow): RebuildRun {
@@ -54,6 +62,7 @@ function fromRow(row: RawRebuildRunRow): RebuildRun {
     status: row.status,
     gapDetected: row.gap_detected,
     failureReason: row.failure_reason,
+    dryRun: row.dry_run,
   };
 }
 
@@ -86,7 +95,7 @@ export interface ScheduledRebuildRunsSupabaseClient {
 export async function fetchLatestRebuildRun(client: ScheduledRebuildRunsSupabaseClient, stableIdentity: string): Promise<RebuildRun | null> {
   const { data, error } = await client
     .from("scheduled_rebuild_runs")
-    .select("id, started_at, completed_at, stable_identity, staging_identity, backup_identity, step, status, gap_detected, failure_reason")
+    .select("id, started_at, completed_at, stable_identity, staging_identity, backup_identity, step, status, gap_detected, failure_reason, dry_run")
     .eq("stable_identity", stableIdentity)
     .order("started_at", { ascending: false })
     .limit(1);
@@ -111,6 +120,10 @@ export async function startRebuildRun(
     // never re-streams or re-promotes.
     startStep?: RebuildStep;
     backupIdentity?: string;
+    // Defaults to false (a real, promotion-eligible attempt) -- a dry run
+    // sets this true for the whole lifetime of the row, so the audit
+    // trail never has to infer dry-run-ness from step alone.
+    dryRun?: boolean;
   },
 ): Promise<string> {
   const { data, error } = await client
@@ -122,6 +135,7 @@ export async function startRebuildRun(
       backup_identity: params.backupIdentity ?? null,
       step: params.startStep ?? "streaming_archive",
       status: "running",
+      dry_run: params.dryRun ?? false,
     })
     .select("id")
     .single();
@@ -157,7 +171,10 @@ export async function advanceRebuildRunStep(
 export async function finishRebuildRun(
   client: ScheduledRebuildRunsSupabaseClient,
   runId: string,
-  outcome: { status: "succeeded" } | { status: "failed"; failureReason: string },
+  // step defaults to "done" for a real success -- pass "dry_run_complete"
+  // explicitly for a dry run's own terminal state, so it's never confused
+  // with a genuine promotion.
+  outcome: { status: "succeeded"; step?: RebuildStep } | { status: "failed"; failureReason: string },
   completedAt: Date,
 ): Promise<void> {
   const values: Record<string, unknown> = {
@@ -168,7 +185,7 @@ export async function finishRebuildRun(
     values.failure_reason = outcome.failureReason;
   }
   if (outcome.status === "succeeded") {
-    values.step = "done";
+    values.step = outcome.step ?? "done";
   }
 
   const { error } = await client.from("scheduled_rebuild_runs").update(values).eq("id", runId);

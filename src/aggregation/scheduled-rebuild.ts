@@ -60,6 +60,17 @@ export interface ScheduledRebuildResult {
   outcome: "succeeded" | "failed";
   failureReason: string | null;
   promoted: boolean;
+  dryRun: boolean;
+}
+
+export interface ScheduledRebuildOptions {
+  // Defaults to false: streams, gap-checks, and integrity-checks exactly
+  // as a real run would, then stops BEFORE calling the promote RPC at
+  // all. Both the manual CLI (--allow-promotion) and the (not yet added)
+  // scheduled trigger must default this to false -- promotion is only
+  // ever attempted when something explicitly, deliberately turns it on
+  // for that one run.
+  allowPromotion: boolean;
 }
 
 async function callPromoteAccumulatorIdentity(
@@ -108,19 +119,24 @@ async function reconcileAndVerify(
   if (staleReport.staleCount > 0) {
     const reason = `${staleReport.staleCount} stale occupancy_stats row(s) remain after reconcile -- samples: ${JSON.stringify(staleReport.staleSamples.slice(0, 5))}`;
     await finishRebuildRun(clients.runsLogClient, runId, { status: "failed", failureReason: reason }, now);
-    return { runId, outcome: "failed", failureReason: reason, promoted: true };
+    return { runId, outcome: "failed", failureReason: reason, promoted: true, dryRun: false };
   }
 
   await finishRebuildRun(clients.runsLogClient, runId, { status: "succeeded" }, now);
-  return { runId, outcome: "succeeded", failureReason: null, promoted: true };
+  return { runId, outcome: "succeeded", failureReason: null, promoted: true, dryRun: false };
 }
 
-export async function runScheduledRebuild(clients: ScheduledRebuildClients, now: Date): Promise<ScheduledRebuildResult> {
+export async function runScheduledRebuild(clients: ScheduledRebuildClients, now: Date, options: ScheduledRebuildOptions = { allowPromotion: false }): Promise<ScheduledRebuildResult> {
   const stableIdentity = resolveYearlyArchiveDatasetId(getPriorYear(now));
   const previousRun = await fetchLatestRebuildRun(clients.runsLogClient, stableIdentity);
   const resumeDecision = decideResumeAction(previousRun);
 
   if (resumeDecision.action === "resume_from_reconcile") {
+    // Not gated by options.allowPromotion -- promotion already genuinely
+    // happened on the earlier run; finishing reconcile/verify here is
+    // mandatory regardless, or occupancy_stats is left permanently out of
+    // sync with the already-promoted accumulator. A resumed run is never
+    // itself a dry run.
     console.log(`Previous run already promoted (backup identity "${resumeDecision.backupIdentity}") but didn't finish -- resuming from reconcile against "${stableIdentity}", no re-streaming or re-promoting.`);
     const runId = await startRebuildRun(clients.runsLogClient, {
       stableIdentity,
@@ -128,12 +144,13 @@ export async function runScheduledRebuild(clients: ScheduledRebuildClients, now:
       backupIdentity: resumeDecision.backupIdentity,
       startedAt: now,
       startStep: "reconciling",
+      dryRun: false,
     });
     return reconcileAndVerify(clients, runId, stableIdentity, now);
   }
 
   const stagingIdentity = `${stableIdentity}-staging-${now.getTime()}`;
-  const runId = await startRebuildRun(clients.runsLogClient, { stableIdentity, stagingIdentity, startedAt: now });
+  const runId = await startRebuildRun(clients.runsLogClient, { stableIdentity, stagingIdentity, startedAt: now, dryRun: !options.allowPromotion });
 
   try {
     console.log(`Building blockface lookup...`);
@@ -168,7 +185,7 @@ export async function runScheduledRebuild(clients: ScheduledRebuildClients, now:
     if (gapResult.gapDetected) {
       const reason = gapResult.gapDetail ?? "gap detected";
       await finishRebuildRun(clients.runsLogClient, runId, { status: "failed", failureReason: reason }, now);
-      return { runId, outcome: "failed", failureReason: reason, promoted: false };
+      return { runId, outcome: "failed", failureReason: reason, promoted: false, dryRun: !options.allowPromotion };
     }
 
     await advanceRebuildRunStep(clients.runsLogClient, runId, "integrity_check", { gapDetected: false });
@@ -177,7 +194,13 @@ export async function runScheduledRebuild(clients: ScheduledRebuildClients, now:
     if (!integrity.ok) {
       const reason = `integrity check failed (${integrity.problems.length} problem(s)): ${integrity.problems.slice(0, 5).map((p) => `${p.bucketKey}: ${p.reason}`).join("; ")}`;
       await finishRebuildRun(clients.runsLogClient, runId, { status: "failed", failureReason: reason }, now);
-      return { runId, outcome: "failed", failureReason: reason, promoted: false };
+      return { runId, outcome: "failed", failureReason: reason, promoted: false, dryRun: !options.allowPromotion };
+    }
+
+    if (!options.allowPromotion) {
+      console.log(`Dry run (--allow-promotion not passed): streaming, gap check, and integrity check all passed. Stopping here -- "${stagingIdentity}" was never promoted, "${stableIdentity}" was never touched.`);
+      await finishRebuildRun(clients.runsLogClient, runId, { status: "succeeded", step: "dry_run_complete" }, now);
+      return { runId, outcome: "succeeded", failureReason: null, promoted: false, dryRun: true };
     }
 
     const backupIdentity = `${stableIdentity}-backup-${now.getTime()}`;
@@ -191,7 +214,7 @@ export async function runScheduledRebuild(clients: ScheduledRebuildClients, now:
     await finishRebuildRun(clients.runsLogClient, runId, { status: "failed", failureReason: message }, now).catch((logErr: unknown) => {
       console.error(`scheduled-rebuild: additionally failed to record this run's failure: ${logErr instanceof Error ? logErr.message : String(logErr)}`);
     });
-    return { runId, outcome: "failed", failureReason: message, promoted: false };
+    return { runId, outcome: "failed", failureReason: message, promoted: false, dryRun: !options.allowPromotion };
   }
 }
 
@@ -204,6 +227,7 @@ async function reportFailure(result: ScheduledRebuildResult, githubToken: string
     body: [
       "The weekly scheduled rolling-window refresh (src/aggregation/scheduled-rebuild.ts) failed.",
       "",
+      `**Dry run:** ${result.dryRun ? "yes -- promotion was never attempted on this run regardless of this failure" : "no -- this was a real, promotion-eligible attempt"}`,
       `**Promoted:** ${result.promoted ? "yes -- the live accumulator identity WAS already renamed before this failure" : "no -- the live accumulator identity was never touched"}`,
       "",
       `**Failure reason:**`,
@@ -219,6 +243,12 @@ async function reportFailure(result: ScheduledRebuildResult, githubToken: string
 
 // --- CLI glue ---------------------------------------------------------------
 
+// Absent means dry-run, the same "the safe behavior needs no flag" default
+// used by fit-and-write-area-corrections.ts's own --write.
+export function parseCliOptions(argv: readonly string[]): ScheduledRebuildOptions {
+  return { allowPromotion: argv.includes("--allow-promotion") };
+}
+
 function getRequiredEnvVar(name: string): string {
   const value = process.env[name];
   if (value === undefined || value.trim() === "") {
@@ -228,6 +258,9 @@ function getRequiredEnvVar(name: string): string {
 }
 
 export async function main(): Promise<void> {
+  const options = parseCliOptions(process.argv.slice(2));
+  console.log(options.allowPromotion ? "--allow-promotion passed: this run MAY actually promote if every check passes." : "Dry run (default, no --allow-promotion): will check everything but never promote.");
+
   const supabaseUrl = getRequiredEnvVar("SUPABASE_URL");
   const supabaseServiceRoleKey = getRequiredEnvVar("SUPABASE_SERVICE_ROLE_KEY");
   getRequiredEnvVar("SOCRATA_APP_TOKEN");
@@ -245,10 +278,11 @@ export async function main(): Promise<void> {
     promoteRpcClient: rawSupabaseClient as unknown as PromoteAccumulatorIdentityRpcClient,
   };
 
-  const result = await runScheduledRebuild(clients, new Date());
+  const result = await runScheduledRebuild(clients, new Date(), options);
 
   console.log("\n=== scheduled-rebuild summary ===");
   console.log(`Run id:    ${result.runId}`);
+  console.log(`Dry run:   ${result.dryRun}`);
   console.log(`Outcome:   ${result.outcome}`);
   console.log(`Promoted:  ${result.promoted}`);
   if (result.failureReason !== null) {
